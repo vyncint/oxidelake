@@ -115,8 +115,13 @@ jobs:
       # lives for minutes. Trusted Publishing is configured per crate, so it
       # cannot CREATE a crate: the very first publish of each crate uses the
       # maintainer's temporary token (docs/RELEASING.md), which is then deleted.
+      # Until at least one crate has a Trusted Publishing config, crates.io
+      # answers the exchange with 400 "No Trusted Publishing config found" —
+      # that is expected on the first release, so the step may fail and the
+      # publish loop falls back to the registry token below.
       - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
         id: auth
+        continue-on-error: true
       - name: Publish every crate, in dependency order
         env:
           OIDC_TOKEN: ${{ steps.auth.outputs.token }}
@@ -142,7 +147,14 @@ jobs:
               continue
             fi
             if curl -sf -A "$ua" "https://crates.io/api/v1/crates/$crate" > /dev/null; then
-              tok="$OIDC_TOKEN"; echo "$crate exists — Trusted Publishing"
+              if [ -n "$OIDC_TOKEN" ]; then
+                tok="$OIDC_TOKEN"; echo "$crate exists — Trusted Publishing"
+              elif [ -n "$NEW_CRATE_TOKEN" ]; then
+                tok="$NEW_CRATE_TOKEN"; echo "$crate exists but no OIDC token was minted — using the registry token"
+              else
+                echo "::error::$crate exists, no OIDC token was minted and no CARGO_REGISTRY_TOKEN secret is set — configure Trusted Publishing for it (docs/RELEASING.md)"
+                exit 1
+              fi
             else
               tok="$NEW_CRATE_TOKEN"
               if [ -z "$tok" ]; then

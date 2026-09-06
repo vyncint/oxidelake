@@ -16,7 +16,10 @@ Trusted Publishing.
   `CARGO_REGISTRY_TOKEN` repository secret holding a maintainer token scoped
   to `publish-new`; `release.yml` uses it only for crates that do not yet
   exist and OIDC for the rest. Delete the secret and revoke the token as soon
-  as all nine crates exist, then configure their trusted publishers.
+  as all nine crates exist, then configure their trusted publishers. On that
+  first run the OIDC exchange itself fails with `400 No Trusted Publishing
+  config found for repository` — expected, and non-fatal: the step is
+  `continue-on-error` and the loop uses the registry token instead.
 - A **`release` GitHub environment** whose deployment branches are restricted
   to `v*` tags, so an OIDC publish token can never be minted from a branch.
 - **`v*` tags protected by a ruleset**, so only a repository admin can create
