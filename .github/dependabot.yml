@@ -1,0 +1,29 @@
+# Weekly dependency updates. The data-plane chain (Ballista → DataFusion →
+# arrow/parquet/object_store) must move as one unit (docs/dependencies.md), so
+# its major bumps are excluded here and handled deliberately by hand.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      minor-and-patch:
+        update-types: ["minor", "patch"]
+    ignore:
+      - dependency-name: "ballista*"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "datafusion*"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "arrow*"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "parquet"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "object_store"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly

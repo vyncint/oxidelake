@@ -1,0 +1,119 @@
+# Prebuilt binaries for every release, so that running an `oxide` cluster does
+# not require a Rust toolchain on every node.
+#
+# Separate from release.yml on purpose: publishing to crates.io happens once
+# and cannot be repeated, while building an artifact can fail for reasons that
+# have nothing to do with the release. This workflow is re-runnable against
+# any existing tag and only ever fills in assets that are missing.
+#
+# Linux targets are musl, so the binaries are statically linked and run on any
+# distribution regardless of its glibc. Windows is out of scope (docs/roadmap.md).
+name: binaries
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: the release tag to build binaries for, e.g. v0.1.0
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: the release tag to build binaries for, e.g. v0.1.0
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: binaries-${{ inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  TAG: ${{ inputs.tag }}
+
+jobs:
+  binaries:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write # upload release assets
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          # Cross-compiled from Apple silicon: the Xcode SDK is universal, so an
+          # arm64 Mac produces an x86-64 binary with only `rustup target add`.
+          - target: x86_64-apple-darwin
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          ref: ${{ env.TAG }}
+      - name: Add the target's standard library
+        env:
+          TARGET: ${{ matrix.target }}
+        run: rustup target add "$TARGET"
+      - name: musl linker (Linux)
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update -q && sudo apt-get install -y -q musl-tools
+      - name: Build
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --release --locked -p oxidelake-runtime --target "$TARGET"
+      - name: Package
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          stage="oxidelake-${version}-${TARGET}"
+          mkdir "$stage"
+          for binary in oxide oxide-scheduler oxide-worker; do
+            cp "target/${TARGET}/release/${binary}" "$stage/"
+          done
+          cp README.md LICENSE CHANGELOG.md "$stage/"
+          tar czf "${stage}.tar.gz" "$stage"
+          archive="${stage}.tar.gz"
+          sums() { if command -v sha256sum > /dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi; }
+          sums "$archive" > "${archive}.sha256"
+          # A second copy without the version, so `releases/latest/download/…`
+          # is a URL that stays valid across releases.
+          alias="${archive/-${version}-/-}"
+          cp "$archive" "$alias"
+          sums "$alias" > "${alias}.sha256"
+          # Ask the file what it is: a cross-build that is quietly the host's
+          # architecture would pass every other check here.
+          case "$TARGET" in
+            x86_64-*)  want="x86" ;;
+            aarch64-*) want="arm64|aarch64|ARM aarch64" ;;
+          esac
+          got=$(file -b "target/${TARGET}/release/oxide")
+          if ! printf '%s' "$got" | grep -qE "$want"; then
+            echo "::error::built for $TARGET but the binary is: $got"; exit 1
+          fi
+          echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
+          echo "ALIAS=$alias" >> "$GITHUB_ENV"
+      # Uploaded only if absent, never clobbered: a published archive is
+      # immutable, and rebuilding a tag yields a different checksum.
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          published="$(gh release view "$TAG" --json assets --jq '.assets[].name')"
+          for file in "$ARCHIVE" "${ARCHIVE}.sha256" "$ALIAS" "${ALIAS}.sha256"; do
+            if printf '%s\n' "$published" | grep -qxF "$file"; then
+              echo "already published, left alone: $file"
+            else
+              gh release upload "$TAG" "$file"; echo "uploaded: $file"
+            fi
+          done

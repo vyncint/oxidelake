@@ -1,0 +1,5 @@
+# Stable rustfmt options only. The 2024 style edition is what the workspace
+# has always been formatted with; pinning it keeps `cargo fmt` stable across
+# toolchain updates.
+style_edition = "2024"
+newline_style = "Unix"

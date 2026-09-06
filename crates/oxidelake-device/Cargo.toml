@@ -1,0 +1,32 @@
+[package]
+name = "oxidelake-device"
+description = "OxideLake hardware abstraction: GpuBackend trait, CPU/CUDA/Metal backends, hardware detector"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+features = ["cuda"]
+
+[features]
+default = []
+cuda = ["dep:cudarc", "oxidelake-memory/cuda"]
+metal = ["dep:objc2", "dep:objc2-metal", "dep:objc2-foundation", "oxidelake-memory/metal"]
+
+[dependencies]
+oxidelake-core.workspace = true
+oxidelake-memory.workspace = true
+arrow.workspace = true
+rayon.workspace = true
+tracing.workspace = true
+cudarc = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { workspace = true, optional = true }
+objc2-metal = { workspace = true, optional = true }
+objc2-foundation = { workspace = true, optional = true }

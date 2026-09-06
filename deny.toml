@@ -1,0 +1,73 @@
+# cargo-deny configuration (https://embarkstudios.github.io/cargo-deny/).
+# Run with `cargo deny check` (or `make deny`); CI runs the same check.
+
+[graph]
+# Check the targets we actually build; cfg-gated dependencies of other
+# platforms (e.g. embedded-only crates behind `heapless`) are not our graph.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+]
+all-features = false
+no-default-features = false
+
+[advisories]
+version = 2
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+# Every ignore must say why it is safe for THIS project and be revisited when
+# the dependency chain moves (see docs/dependencies.md).
+ignore = [
+    # quick-xml is reached only through object_store's S3 / Azure / GCS
+    # backends. OxideLake registers the local filesystem store exclusively
+    # (oxidelake_storage::store), so the vulnerable XML parser is never invoked.
+    # object_store is pinned to 0.13 by DataFusion 54; revisit on the next
+    # DataFusion/Ballista bump.
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml is only used by object_store's cloud backends, which OxideLake never registers" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml is only used by object_store's cloud backends, which OxideLake never registers" },
+    # `paste` is an unmaintained compile-time proc-macro pulled by arrow-flight
+    # (via Ballista). No runtime exposure; tracked upstream by arrow-rs.
+    { id = "RUSTSEC-2024-0436", reason = "compile-time proc-macro dependency of arrow-flight; no runtime code" },
+]
+
+[licenses]
+version = 2
+# Permissive licenses only; anything copyleft or unknown fails the check.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "0BSD",
+    "BSL-1.0",
+    # The bzip2 crate (via parquet's compression codecs): BSD-style.
+    "bzip2-1.0.6",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Duplicate *majors* of the data-plane chain are caught by the dedicated gate
+# step (`cargo tree -d`); minor duplicates deep in the graph are tolerated.
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true
+deny = [
+    # Two async-runtime ecosystems in one binary is a mistake, not a choice.
+    { crate = "async-std", reason = "tokio is the workspace runtime" },
+    # OpenSSL brings a system dependency; rustls/aws-lc come with Ballista.
+    { crate = "openssl-sys", reason = "no system OpenSSL; TLS comes via rustls" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

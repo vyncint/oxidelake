@@ -1,0 +1,107 @@
+# Changelog
+
+All notable changes to this project are documented here. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html). Until 1.0, minor
+versions (0.x) may contain breaking changes; they are always listed under a
+**Changed** or **Removed** heading. The nine crates version together.
+
+## [Unreleased]
+
+The first public release. OxideLake was developed privately from 2026-08-25 as
+`vyncint/oxidelake` (now `vyncint/oxidelake-old`); this repository starts from
+one commit carrying the whole tree, not from that history. What follows is what
+that tree contains and what changed on the way over.
+
+### Changed
+
+- **Crates renamed `oxide-*` → `oxidelake-*`.** `oxide-core` and `oxide-api`
+  were already taken on crates.io by unrelated projects, so nothing could have
+  published under the old names. Binary names are unchanged: `oxide`,
+  `oxide-scheduler`, `oxide-worker`.
+- **GPU kernel sources moved into `oxidelake-device/kernels/`.** They were at
+  the repository root and reached by `include_str!("../../../../kernels/…")`,
+  outside the crate directory — a published `oxidelake-device` would not have
+  compiled, and no CI could see it because CI has the whole repository. The
+  install workflow now exists to catch exactly this class.
+- **The specification is `docs/SPEC.md`**, reframed from the implementation
+  prompt it started as: the same normative content and section numbers that
+  source comments cite, without the prompt framing or the local path.
+- **Every crate is publishable.** `publish = false` is gone; the workspace
+  carries the crates.io metadata; the release pipeline publishes all nine in
+  dependency order through Trusted Publishing.
+
+### Added
+
+- **The vyncint contributor pattern**: DCO sign-off and no-AI-attribution
+  enforced by `commit-policy` on every commit, generated `AGENTS.md` and
+  `CONTRIBUTING.md`, `CODEOWNERS`, form-based issue templates.
+- **A full release pipeline**: tag-guarded, changelog-gated, `cargo-semver-checks`,
+  ordered multi-crate publish, GitHub Release, static binaries for four
+  targets, and a fresh-machine install check.
+- **CI shape**: one job per concern, every action pinned to a commit SHA,
+  `zizmor` at pedantic, a `required-green` aggregate for branch protection, no
+  build cache. The `predict` and `cuda` features are linted on every run; the
+  PTY suite runs on macOS as well as Linux.
+- **`predict` SQL UDF** — in-database inference over safetensors models via
+  `oxmera`, behind the `predict` feature (ADR-0015).
+
+### Fixed
+
+- `predict`'s module documentation linked a private item, which `cargo doc
+  --all-features` rejects. Never seen before because no job built the feature
+  with docs — the gap the new CI closes.
+
+### Security
+- CUDA aggregation kernel: the slot-claim spin-wait now reads through a
+  `volatile` pointer; the previous plain load could be hoisted into an infinite
+  loop (GPU hang). Compile-verified only — see `STATUS.md`.
+- `GpuFilterExec` predicates are capped at 64 comparison leaves so a plan
+  payload cannot drive the recursive evaluators arbitrarily deep.
+- The dashboard quotes table identifiers before using them in generated SQL.
+- `TelemetryHub` keeps at most 4096 operator registrations (oldest evicted), so
+  long-lived sessions no longer grow without bound.
+- `cargo deny` (advisories, licenses, bans, sources) runs in CI; `SECURITY.md`
+  documents the trust model.
+
+### Changed
+- Operators upload only the columns a kernel reads; projected columns of types
+  the device cannot hold (`Utf8`, …) stay on the host and are gathered at the
+  compacted row ids. A string column in a projection no longer forces the
+  whole batch onto the CPU path.
+- Backends declare supported operations up front (`supports_predicate`,
+  `supports_hash_join`, `supports_aggregate`) so unsupported work is never
+  uploaded.
+- Hash join build sides are hashed once (`JoinBuild`) and uploaded once per
+  operator; probes gather only projected columns.
+- Column transfers are zero-copy where the transport allows (`Buffer`-based
+  `ColumnBytes`; Metal downloads alias the shared `MTLBuffer`).
+- Metal: cached compute pipelines, one command buffer per phase, pooled command
+  queues, command-buffer errors surfaced.
+- GPU-targeted sessions use 65 536-row batches.
+- `oxide gen-data` streams chunks to the writer (bounded memory for any `--rows`).
+- `rust-version` is the lockfile's real floor (1.94.1) and is verified in CI.
+- Repository hygiene: `Makefile` gate, `deny.toml`, `rustfmt.toml`,
+  `clippy.toml`, `.editorconfig`, contribution/security/conduct documents,
+  Dependabot, issue and PR templates.
+
+### Fixed
+- STATUS.md over-claimed that the Metal conformance suite had executed on the
+  device; the fixtures had taken the CPU fallback. The suite now asserts device
+  execution through the operator transfer counters.
+
+## [0.1.0] — 2026-09-01
+
+First complete version (spec phases 0–7): the nine-crate workspace on
+DataFusion 54 / Ballista 54 / arrow 58; CPU reference kernels with CUDA (NVRTC)
+and Metal (MSL) backends behind one object-safe `GpuBackend`; the four
+`Gpu*Exec` operators with per-batch CPU fallback; Parquet storage with proven
+pruning and Arrow IPC spill; the `HardwarePlacementRule` and `OxidePhysicalCodec`
+for Ballista cluster mode; the terminal dashboard with PTY tests; the
+`oxide` / `oxide-scheduler` / `oxide-worker` binaries; the `OxideFrame`
+DataFrame API and `l2_distance` / `cosine_distance` SQL UDFs with GPU lowering.
+Metal executes on Apple silicon (verified on an M4 Pro and on GitHub's macOS
+runners); CUDA compiles and lints without a CUDA installation but has not yet
+run on a CUDA machine.
+
+[Unreleased]: https://github.com/vyncint/oxidelake/commits/main

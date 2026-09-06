@@ -1,0 +1,47 @@
+name: Bug report
+description: A query, a plan, a device path or the dashboard did something wrong
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Most reports come down to *which backend actually executed*. `oxide explain`
+        shows the placement; the operator telemetry (`oxide tui`) shows whether the
+        device path ran or fell back to the CPU reference. Please include both.
+  - type: input
+    id: version
+    attributes:
+      label: OxideLake version
+      description: "`oxide --version`, or the commit."
+      placeholder: 0.1.0
+    validations:
+      required: true
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Backend involved
+      options: [cpu (default build), cuda, metal, cluster (Ballista), tui, storage]
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: The SQL or DataFrame call, the table shape, and the exact command. `oxide gen-data` output is ideal because anyone can regenerate it.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs actual
+      description: For wrong results, the stock DataFusion answer for the same query is the reference.
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: OS, GPU and driver (or "none"), `rustc --version`, and for cluster bugs the scheduler/worker topology.
+    validations:
+      required: true

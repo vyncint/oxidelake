@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/vyncint/oxidelake/security/advisories/new
+    about: Please report anything exploitable privately, not as an issue. SECURITY.md has the trust model.
+  - name: Question / usage help
+    url: https://github.com/vyncint/oxidelake/issues/new?labels=question&template=bug_report.yml&title=%5Bquestion%5D%3A+
+    about: For usage questions, open a bug report and delete the sections that don't apply.

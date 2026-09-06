@@ -1,0 +1,38 @@
+[package]
+name = "oxidelake-compute"
+description = "OxideLake physical operators: Gpu*Exec DataFusion ExecutionPlans with CPU reference paths"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+features = ["cuda", "predict"]
+
+[features]
+default = []
+cuda = ["oxidelake-device/cuda", "oxidelake-memory/cuda"]
+metal = ["oxidelake-device/metal", "oxidelake-memory/metal"]
+# In-database inference: the `predict` SQL UDF. Off by default, like every
+# other optional capability here (ADR-0006) — it pulls a tensor library in.
+predict = ["dep:oxmera", "dep:safetensors"]
+
+[dependencies]
+oxidelake-core.workspace = true
+oxidelake-memory.workspace = true
+oxidelake-device.workspace = true
+arrow.workspace = true
+datafusion.workspace = true
+futures.workspace = true
+tracing.workspace = true
+oxmera = { workspace = true, optional = true }
+safetensors = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio.workspace = true
+rand.workspace = true
+tempfile.workspace = true

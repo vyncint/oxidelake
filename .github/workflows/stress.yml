@@ -1,0 +1,58 @@
+# Flake hunter for the PTY suite: the dashboard tests, many times, on both
+# OSes, at several concurrency levels. A flaky harness teaches contributors to
+# re-run CI rather than read it. Run before a release and whenever anything
+# touching frames, waits or the event loop changes.
+name: stress
+
+on:
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: Iterations per OS, split across the shards
+        required: false
+        default: "100"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stress-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  stress:
+    name: stress (${{ matrix.os }}, ${{ matrix.threads }} threads)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        threads: [1, 4, 16]
+        include:
+          - { threads: 1,  weight: 20 }
+          - { threads: 4,  weight: 40 }
+          - { threads: 16, weight: 40 }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
+      - name: Build once
+        run: cargo build --release -p oxidelake-tui --all-targets
+      - name: Run the PTY suite repeatedly
+        env:
+          ITERS: ${{ inputs.iterations || '100' }}
+          THREADS: ${{ matrix.threads }}
+          WEIGHT: ${{ matrix.weight }}
+        run: |
+          per=$(( WEIGHT * ITERS / 100 )); [ "$per" -lt 1 ] && per=1
+          echo "${THREADS} thread(s): ${per} iterations of ${ITERS}"
+          for i in $(seq "$per"); do
+            echo "::group::${THREADS} threads, iteration ${i}/${per}"
+            cargo test --release -p oxidelake-tui -- --test-threads="$THREADS" \
+              || { echo "::error::suite flaked at ${THREADS} thread(s), iteration ${i}/${per}"; exit 1; }
+            echo "::endgroup::"
+          done

@@ -1,0 +1,108 @@
+# Enforces one commit policy on every commit in a PR (and on pushes to main,
+# for direct pushes while the project is solo-maintained):
+#
+#   DCO sign-off: every commit carries Signed-off-by matching its author
+#   (.github/scripts/check-dco.sh), and
+#   No AI attribution: no AI co-author trailers, "Generated with" watermarks,
+#   or bot identities (.github/scripts/check-no-ai-attribution.sh).
+#
+# AI assistance is welcome here; AI attribution is not. Whoever opens the pull
+# request is the author of record, and the history should say so.
+#
+# Why CI and not a git hook: hooks do not survive `git clone`, so a local
+# commit-msg hook only ever protects the maintainer's own machine. CI is the
+# enforceable boundary for outside contributors. (`.claude/settings.json` in
+# the repository is a soft guard for agent users; this workflow is the hard
+# one.)
+#
+# Both scripts are generated from vyncint/ecosystem's `standards/` and are
+# byte-identical across every repository that runs this policy. Do not edit
+# them here: the next sync overwrites the edit, and n hand-maintained copies
+# are how n projects end up with n different rules.
+name: commit-policy
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: commit-policy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  commit-policy:
+    name: commit-policy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write # one-time failure comment on PRs
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0 # need full history to walk the commit range
+
+      - name: Determine commit range
+        id: range
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+        run: |
+          if [ "$EVENT" = "pull_request" ]; then
+            range="${BASE}..${HEAD}"
+          elif [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ] \
+               || ! git cat-file -e "$BEFORE" 2>/dev/null; then
+            # First push to the branch (or a force push whose old tip is gone):
+            # inspect the pushed head's full history.
+            range="$AFTER"
+          else
+            range="${BEFORE}..${AFTER}"
+          fi
+          echo "Checking range: $range"
+          echo "range=$range" >> "$GITHUB_OUTPUT"
+
+      - name: DCO sign-off
+        env:
+          RANGE: ${{ steps.range.outputs.range }}
+          # On a push to main, the tip is the commit GitHub composed by
+          # squash-merging a pull request. Naming it lets the check tell that
+          # one commit apart from anything else with a web-flow committer, so
+          # a message GitHub wrote without the trailers it squashed does not
+          # fail a pull request that was, in fact, signed off. Empty on
+          # pull_request runs, where nothing is exempt.
+          COMPOSED: ${{ github.event_name == 'push' && github.event.after || '' }}
+        run: .github/scripts/check-dco.sh "$RANGE" "$COMPOSED"
+
+      - name: No AI attribution
+        env:
+          RANGE: ${{ steps.range.outputs.range }}
+        run: .github/scripts/check-no-ai-attribution.sh "$RANGE"
+
+      - name: Comment on PR (policy failed)
+        if: failure() && github.event_name == 'pull_request'
+        # Forks get a read-only token; never let the courtesy comment itself
+        # flip the job's outcome.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          marker="<!-- oxidelake-commit-policy -->"
+          if gh api "repos/${REPO}/issues/${PR}/comments" --jq '.[].body' | grep -qF "$marker"; then
+            echo "Policy comment already posted; skipping."
+            exit 0
+          fi
+          body="$(printf '%s\n\n%s\n\n%s' \
+            "$marker" \
+            "**Commit policy check failed.** AI assistance is welcome; AI attribution is not. Remove the trailer and recommit — you are the author of record." \
+            "Fix a branch with \`git rebase -i\` (or \`git commit --amend\`) to drop the trailer, then force-push. The offending commits are listed in the [job log](${RUN_URL}).")"
+          gh pr comment "$PR" --repo "$REPO" --body "$body"

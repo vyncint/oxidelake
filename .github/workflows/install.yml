@@ -1,0 +1,97 @@
+# What crates.io actually serves, installed the way a user installs it.
+#
+# CI tests the working tree and `cargo publish` checks that each archive
+# builds. Neither answers this question: does `cargo install oxidelake-runtime`
+# work for somebody who has only cargo? Two failures live only in that gap —
+# a file the build needs that the package excluded (the kernels were once
+# outside the crate, exactly this), and a fresh dependency resolution that a
+# dependency's own release breaks days later. So nothing here checks the
+# repository out.
+name: install
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: "Version to verify (default: the newest published)"
+        required: false
+        type: string
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to verify (default: the newest published)"
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: install-${{ inputs.version || 'latest' }}
+  cancel-in-progress: false
+
+jobs:
+  install:
+    name: install (${{ matrix.os }}, ${{ matrix.toolchain }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        toolchain: [stable, msrv]
+        include:
+          # Stable resolves fresh — what a user gets.
+          - toolchain: stable
+            locked: ""
+          # The MSRV promise is made against the lockfile shipped in the crate.
+          - toolchain: msrv
+            locked: "--locked"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - name: Ask the registry what was published
+        id: crate
+        env:
+          WANTED: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          api="https://crates.io/api/v1/crates/oxidelake-runtime"
+          agent="oxidelake-install-check (github actions)"
+          version="${WANTED#v}"
+          if [ -z "$version" ]; then
+            version=$(curl -sSf -H "User-Agent: $agent" "$api" | jq -r .crate.max_stable_version)
+          fi
+          # The index can trail a publish by seconds; wait rather than fail.
+          for attempt in $(seq 30); do
+            body=$(curl -sS -H "User-Agent: $agent" "$api/$version") || body=""
+            [ "$(printf '%s' "$body" | jq -r '.version.num // empty')" = "$version" ] && break
+            echo "waiting for $version to appear on crates.io (${attempt}/30)"; sleep 10
+          done
+          [ "$(printf '%s' "$body" | jq -r '.version.num // empty')" = "$version" ] \
+            || { echo "::error::$version never appeared on crates.io"; exit 1; }
+          [ "$(printf '%s' "$body" | jq -r .version.yanked)" = "false" ] \
+            || { echo "::error::$version is yanked"; exit 1; }
+          msrv=$(printf '%s' "$body" | jq -r '.version.rust_version // empty')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "msrv=$msrv" >> "$GITHUB_OUTPUT"
+          echo "installing $version (declared MSRV: ${msrv:-none})"
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          # Falls back to stable if the registry reports no rust-version: an
+          # empty toolchain string would otherwise install nothing and fail
+          # a step later with a message about the wrong thing.
+          toolchain: ${{ (matrix.toolchain == 'msrv' && steps.crate.outputs.msrv != '') && steps.crate.outputs.msrv || 'stable' }}
+      - name: cargo install from the registry
+        env:
+          VERSION: ${{ steps.crate.outputs.version }}
+          LOCKED: ${{ matrix.locked }}
+        run: cargo install oxidelake-runtime --version "$VERSION" $LOCKED
+      - name: The installed binaries run
+        env:
+          VERSION: ${{ steps.crate.outputs.version }}
+        run: |
+          set -euo pipefail
+          oxide --version | tee /dev/stderr | grep -qF "$VERSION"
+          oxide-scheduler --help > /dev/null
+          oxide-worker --help > /dev/null
+          # A whole round trip, on a machine that has never seen the repo.
+          oxide gen-data --rows 1000 --out "$RUNNER_TEMP/data/"
+          oxide sql -q "SELECT k, COUNT(*) FROM t GROUP BY k ORDER BY k LIMIT 3" --table "t=$RUNNER_TEMP/data/"

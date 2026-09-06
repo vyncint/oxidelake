@@ -1,0 +1,24 @@
+[package]
+name = "oxidelake-tui"
+description = "OxideLake terminal dashboard: plan DAG, inspector, telemetry and describe panels"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+oxidelake-core.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+
+[dev-dependencies]
+insta.workspace = true
+termlens.workspace = true
+
+[[bin]]
+name = "oxidelake-tui-demo"
+path = "src/bin/oxidelake_tui_demo.rs"

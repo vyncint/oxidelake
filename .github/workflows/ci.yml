@@ -1,0 +1,222 @@
+# The quality gate from docs/verification.md, as CI. `make gate` runs the same
+# list locally; keep the Makefile, that page and this file in sync.
+#
+# Job shape follows the other vyncint projects: one job per concern, a single
+# `required-green` that branch protection requires, and every action pinned to
+# a full commit SHA. No build cache: a cache that serves a stale artifact is a
+# green run that proves nothing, and the workspace builds in minutes.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  # Reused by release.yml so a release re-runs the exact same gates.
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTDOCFLAGS: -D warnings
+  # Without this the debug target dir (arrow + datafusion + ballista test
+  # binaries with full debuginfo) exceeds the hosted runners' free disk and
+  # rust-lld dies with SIGBUS mid-link. Debuginfo adds nothing to the gate.
+  CARGO_PROFILE_DEV_DEBUG: "false"
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  # Default features are pure CPU (ADR-0006). Every optional capability is a
+  # feature, and a feature no job builds is a feature that is already broken —
+  # so each one is linted here, on a runner that has none of the hardware.
+  clippy:
+    name: clippy (${{ matrix.features.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - { name: default, args: "--workspace --all-targets" }
+          - { name: cuda,    args: "-p oxidelake-runtime --all-targets --features cuda" }
+          - { name: predict, args: "-p oxidelake-runtime --all-targets --features predict" }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
+          components: clippy
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /usr/local/share/powershell 2>/dev/null || true
+      - name: clippy
+        env:
+          ARGS: ${{ matrix.features.args }}
+        # Through the environment, never interpolated into the script:
+        # a matrix value is data, and data does not get to be shell.
+        run: cargo clippy $ARGS -- -D warnings
+
+  test:
+    name: test (linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /usr/local/share/powershell 2>/dev/null || true
+      - name: default features
+        run: cargo test --workspace --locked
+      - name: storage with io-uring (Linux only)
+        run: cargo test -p oxidelake-storage --features io-uring --locked
+      - name: predict against the model it loaded
+        run: cargo test -p oxidelake-compute --features predict --test predict --locked
+      - name: predict adds no second CUDA stack
+        run: make check-predict-no-second-cuda
+      - name: cuda feature compiles with no CUDA installed
+        run: cargo check -p oxidelake-runtime --features cuda --locked
+      - name: dependency chain is coherent
+        run: make coherence
+
+  # The Metal lane. Device-independent tests always; the on-device conformance
+  # suite only when the runner exposes a Metal device (asked of the Metal API
+  # itself, not system_profiler — virtualised runners lie to the latter).
+  metal:
+    name: metal (macos)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
+          components: clippy
+      - run: cargo clippy -p oxidelake-runtime --all-targets --features metal -- -D warnings
+      - run: cargo test -p oxidelake-memory -p oxidelake-device -p oxidelake-compute -p oxidelake-runtime --features metal --locked
+      # The PTY suite runs here too. Terminal behaviour is one of the few
+      # things that genuinely differs between Linux and macOS, and until this
+      # line the corrected resize snapshot had only ever been checked on Linux.
+      - run: cargo test -p oxidelake-tui --locked
+      - name: Detect a Metal device
+        id: metal
+        run: |
+          if swift -e 'import Metal; exit(MTLCreateSystemDefaultDevice() == nil ? 1 : 0)' 2>/dev/null; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "No Metal device on this runner — on-device conformance skipped."
+          fi
+      - name: conformance suite on the Metal device
+        if: steps.metal.outputs.present == 'true'
+        run: cargo test -p oxidelake-compute --features metal --locked -- --ignored
+
+  # The declared rust-version must actually build the workspace against the
+  # committed lockfile. This is what makes `rust-version` a verified claim.
+  msrv:
+    name: msrv
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Read MSRV from Cargo.toml
+        id: msrv
+        run: |
+          msrv="$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml)"
+          echo "MSRV: ${msrv}"
+          echo "msrv=${msrv}" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ steps.msrv.outputs.msrv }}
+      - run: cargo check --workspace --all-targets --locked
+
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
+      - run: cargo doc --workspace --no-deps --all-features
+
+  # Supply chain: RustSec advisories, license allow-list, banned crates and
+  # registry sources — exactly what `make deny` runs locally (deny.toml).
+  deny:
+    name: deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          command: check
+          arguments: --all-features
+
+  # The release path's one otherwise-untested script: it turns CHANGELOG.md
+  # into release notes, and an empty section must fail before publish.
+  release-scripts:
+    name: release scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - run: ./.github/scripts/test-extract-changelog.sh
+
+  # Workflow security audit: unpinned actions, credential persistence,
+  # template injection. Accepted findings live in .github/zizmor.yml.
+  zizmor:
+    name: zizmor
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Audit workflows at pedantic level
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: pipx run zizmor==1.29.0 --persona=pedantic .github/workflows/
+
+  # Single stable job name for branch protection: require this one check and
+  # matrix or job changes never break the required-checks configuration.
+  required-green:
+    name: required-green
+    if: always()
+    needs: [fmt, clippy, test, metal, msrv, docs, deny, release-scripts, zizmor]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify every needed job succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS" | jq .
+          echo "$NEEDS" | jq -e 'to_entries | all(.value.result == "success")' > /dev/null

@@ -1,0 +1,173 @@
+# OxideLake
+
+[![CI](https://github.com/vyncint/oxidelake/actions/workflows/ci.yml/badge.svg)](https://github.com/vyncint/oxidelake/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/oxidelake-runtime?label=crates.io)](https://crates.io/crates/oxidelake-runtime)
+[![docs.rs](https://img.shields.io/docsrs/oxidelake-runtime)](https://docs.rs/oxidelake-runtime)
+![license](https://img.shields.io/badge/license-Apache--2.0-blue)
+![MSRV](https://img.shields.io/badge/MSRV-1.94.1-orange)
+
+A GPU-accelerated, Arrow-native distributed analytical query engine and columnar lakehouse, written in Rust.
+
+**Status: v1 complete.** The default build is pure CPU and the whole gate is green on Linux x86_64 and macOS arm64; the **Metal backend executes for real** on Apple silicon (conformance-tested against stock DataFusion on an M4 Pro); the **CUDA backend compiles and lints** with no CUDA installed but has not yet run on a CUDA machine — see [STATUS.md](STATUS.md) for the precise verification matrix. The specification the engine was built to is [docs/SPEC.md](docs/SPEC.md).
+
+## Install
+
+```bash
+cargo install oxidelake-runtime          # the oxide, oxide-scheduler and oxide-worker binaries
+```
+
+Or download a static archive for Linux (x86_64, aarch64, musl) or macOS
+(Apple silicon, Intel) from the [latest release](https://github.com/vyncint/oxidelake/releases/latest),
+verify it against the `.sha256` beside it, and put the three binaries on your
+`PATH`. Using the engine as a library is `cargo add oxidelake-api`.
+
+## What OxideLake is
+
+OxideLake runs the same plans in two modes over the Apache Arrow columnar memory model:
+
+- **Embedded mode** (DuckDB-like) — in-process DataFusion; operators exchange `Arc<RecordBatch>` over bounded async channels with no serialization.
+- **Cluster mode** (Spark-like) — Apache DataFusion Ballista schedules stages across executors and streams shuffle partitions over Arrow Flight; OxideLake supplies the GPU operators, the placement rule and the plan codec that ships them to executors.
+
+Acceleration backends: **CPU** (always available, the correctness reference), **NVIDIA CUDA** (opt-in feature, NVRTC-JIT at runtime), **Apple Metal** on unified memory (opt-in, macOS only, MSL compiled at runtime).
+
+The differentiator is the operator layer: `GpuFilterExec` (fused filter + projection), `GpuHashJoinExec`, `GpuAggregateExec` and `GpuVectorDistanceExec` are DataFusion `ExecutionPlan`s with their own CUDA and Metal kernels behind one object-safe hardware abstraction. A placement rule rewrites eligible plan nodes for the target backend — `EXPLAIN` shows `GpuFilterExec[metal]` — and every operator still selects the *real* local backend at execution time and falls back per batch to the CPU reference, which is what keeps a heterogeneous cluster correct. Storage is Parquet pruned by DataFusion's statistics, page index and Bloom filters, with Arrow IPC for zero-decode spill and caches.
+
+## Quickstart
+
+Everything below runs as written (Rust 1.98 via `rust-toolchain.toml`; the workspace builds on 1.94.1 and up — or just `make quickstart`):
+
+```bash
+cargo build --release -p oxidelake-runtime          # or `cargo install oxidelake-runtime`
+
+# 1M-row demo table: Parquet with Bloom filters on id and k, page statistics on
+./target/release/oxide gen-data --rows 1000000 --out data/
+
+# embedded SQL over it
+./target/release/oxide sql -q "SELECT k, SUM(v) FROM t GROUP BY k ORDER BY k" --table t=data/
+
+# vector search: l2_distance / cosine_distance are built-in SQL UDFs
+./target/release/oxide sql -q "SELECT id, l2_distance(emb, [1.0,0.0,2.0,0.5,-1.0,0.25,3.0,0.0]) AS d \
+  FROM t ORDER BY d LIMIT 5" --table t=data/
+
+# what the plan looks like for a GPU cluster: placement tags without needing the GPU
+./target/release/oxide explain -q "SELECT k, SUM(v) FROM t WHERE k >= 2 AND v < 4.0 GROUP BY k" \
+  --table t=data/ --target cuda
+
+# the terminal dashboard over a real query: plan DAG, per-operator telemetry, column profiles
+./target/release/oxide tui -q "SELECT k, SUM(v) FROM t WHERE k >= 2 GROUP BY k" --table t=data/ --target cuda
+```
+
+### In-database inference (optional, `--features predict`)
+
+Score a row against a trained model without leaving SQL. Off by default; it
+pulls in a tensor library.
+
+```bash
+cargo build --release -p oxidelake-runtime --features predict
+
+# an oxmera Sequential/Linear model saved with safetensors
+./target/release/oxide sql --table t=data/ \
+  -q "SELECT id, predict('scorer.safetensors', emb) AS logits FROM t LIMIT 5"
+```
+
+```
++----+--------------------------+
+| id | logits                   |
++----+--------------------------+
+| 0  | [-31.006792, 3.9050333]  |
+| 1  | [7.2003703, -4.237343]   |
++----+--------------------------+
+```
+
+It composes with everything else — including the vector search that was
+already here, which is the point: OxideLake could find the nearest rows and
+could not score them.
+
+```bash
+./target/release/oxide sql --table t=data/ -q \
+  "SELECT id, l2_distance(emb, [1.0,0.0,2.0,0.5,-1.0,0.25,3.0,0.0]) AS dist,
+          predict('scorer.safetensors', emb)[2] AS score
+   FROM t ORDER BY dist LIMIT 5"
+```
+
+The model file is read for its architecture, not just its weights: `predict`
+rebuilds an `oxmera::nn::Sequential` of `Linear` layers from the `0.weight`,
+`1.weight`, … naming, with ReLU between them. That assumption, the CPU-only
+execution, and why this is a UDF rather than an operator are recorded in
+[ADR-0015](docs/decisions/ADR-0015-in-database-inference-at-the-udf-layer.md).
+
+`--target cpu|cuda|metal` picks the *placement* target; execution always uses the hardware that is present (operators planned for an absent GPU take the per-batch CPU path — exactly what cluster executors do with a scheduler's plan).
+
+### Cluster mode
+
+```bash
+# OXIDE_CLUSTER_BACKEND declares the cluster's placement capability (default: cpu, no rewrites)
+OXIDE_CLUSTER_BACKEND=cuda ./target/release/oxide-scheduler --port 50050 &
+./target/release/oxide-worker --scheduler-port 50050 --port 50051 --grpc-port 50052 &
+./target/release/oxide sql --cluster df://127.0.0.1:50050 \
+  -q "SELECT k, SUM(v) FROM t GROUP BY k ORDER BY k" --table t=data/
+```
+
+The end-to-end test in `crates/oxidelake-runtime/tests/cli.rs` spawns exactly this topology on ephemeral ports and asserts the cluster output is byte-identical to embedded mode.
+
+### DataFrame API
+
+```rust
+use oxidelake_api::prelude::*;
+
+let session = OxideSession::local()?;
+session.register_parquet("t", "data/").await?;
+let nearest = session
+    .table("t").await?
+    .filter(col("k").gt_eq(lit(2)))?
+    .vector_distance("emb", &[0.0; 8], DistanceMetric::L2, "d")?
+    .sort(vec![col("d").sort(true, false)])?
+    .limit(10)?
+    .collect().await?;
+```
+
+The fluent verbs build ordinary DataFusion plans, so the placement rule lowers them the same way it lowers SQL — `.vector_distance(…)` plans `GpuVectorDistanceExec[metal]` on a Metal target.
+
+### GPU backends
+
+```bash
+# CUDA: compiles and lints with no CUDA installed (cudarc dynamic loading + NVRTC)
+cargo check -p oxidelake-runtime --features cuda
+
+# Metal (macOS): the conformance suite executes on the device
+cargo test -p oxidelake-compute --features metal -- --ignored
+
+# On a CUDA machine (not yet run anywhere — reports welcome):
+OXIDE_BACKEND=cuda cargo test -p oxidelake-compute --features cuda -- --ignored
+```
+
+## Repository map
+
+| Path | Purpose |
+|---|---|
+| [`crates/oxidelake-core`](crates/oxidelake-core) | `EngineError`, `BackendKind`, operator parameter types, `TelemetryHub` |
+| [`crates/oxidelake-memory`](crates/oxidelake-memory) | 64/128-byte-aligned buffers, pinned/UMA allocators, 3-tier `SpillManager`, Arrow IPC codec |
+| [`crates/oxidelake-device`](crates/oxidelake-device) | object-safe `GpuBackend`; CPU reference, CUDA (NVRTC) and Metal (MSL) backends; `HardwareDetector` |
+| [`crates/oxidelake-compute`](crates/oxidelake-compute) | the four `Gpu*Exec` operators, per-batch CPU fallback, `l2_distance`/`cosine_distance` UDFs, conformance suite |
+| [`crates/oxidelake-storage`](crates/oxidelake-storage) | Parquet writer/pruning config with *proofs*, Arrow IPC spill files, io_uring `ObjectStore` (Linux), `gen-data` generator |
+| [`crates/oxidelake-planner`](crates/oxidelake-planner) | `HardwarePlacementRule` (+ vector-distance lowering before projection pushdown), `OxidePhysicalCodec` |
+| [`crates/oxidelake-runtime`](crates/oxidelake-runtime) | `OxideSession` (embedded + Ballista cluster), scheduler/worker wrappers, the `oxide` CLI, dashboard builder |
+| [`crates/oxidelake-tui`](crates/oxidelake-tui) | ratatui dashboard, `TestBackend` snapshots and termlens PTY tests |
+| [`crates/oxidelake-api`](crates/oxidelake-api) | `OxideFrame` fluent DataFrame API and prelude |
+| [`kernels/`](kernels) | CUDA C (`.cu`, NVRTC at runtime) and MSL (`.metal`, `newLibraryWithSource`) sources |
+| [`docs/`](docs) | [roadmap](docs/roadmap.md) · [architecture](docs/architecture.md) · [dependencies](docs/dependencies.md) · [verification](docs/verification.md) · [ADRs](docs/decisions/README.md) |
+| [`docs/SPEC.md`](docs/SPEC.md) | The executable spec the build agent executed, phase by phase |
+| [`STATUS.md`](STATUS.md) | What is done, how it was verified, what was deferred — the honesty ledger |
+| [`Makefile`](Makefile) · [`deny.toml`](deny.toml) | `make gate` and friends; supply-chain policy for `cargo deny` |
+
+## Verification
+
+Every change lands behind the same gate — `make gate`: fmt, clippy `-D warnings` on the default/cuda/metal features, the full test suite, doc build, dependency-coherence check and `cargo deny` — run locally and in [CI](.github/workflows/ci.yml) as four jobs: the Linux gate, `cargo deny`, an MSRV build with the declared `rust-version`, and a macOS job that executes the Metal conformance suite on the runner's GPU (asserting device execution through the operator transfer counters). The honesty rule from [docs/verification.md](docs/verification.md) applies throughout: nothing is claimed as working unless it ran; GPU paths that only compiled are recorded as exactly that in [STATUS.md](STATUS.md). The 2026-09-02 security and performance audit, with every finding's status, is in [docs/audit-2026-09-02.md](docs/audit-2026-09-02.md).
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the workflow (`make help` lists every target), [SECURITY.md](SECURITY.md) for the trust model and how to report vulnerabilities, and [CHANGELOG.md](CHANGELOG.md) for what changed.
+
+## License
+
+Apache-2.0 — see [LICENSE](LICENSE).

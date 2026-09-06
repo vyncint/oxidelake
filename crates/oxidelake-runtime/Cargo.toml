@@ -1,0 +1,59 @@
+[package]
+name = "oxidelake-runtime"
+description = "OxideLake runtime: OxideSession, Ballista scheduler/executor wrappers and the oxide CLI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+features = ["cuda", "predict"]
+
+[features]
+default = []
+cuda = ["oxidelake-device/cuda", "oxidelake-memory/cuda", "oxidelake-compute/cuda"]
+metal = ["oxidelake-device/metal", "oxidelake-memory/metal", "oxidelake-compute/metal"]
+io-uring = ["oxidelake-storage/io-uring"]
+predict = ["oxidelake-compute/predict"]
+
+[dependencies]
+oxidelake-core.workspace = true
+oxidelake-memory.workspace = true
+oxidelake-device.workspace = true
+oxidelake-compute.workspace = true
+oxidelake-storage.workspace = true
+oxidelake-planner.workspace = true
+oxidelake-tui.workspace = true
+datafusion.workspace = true
+datafusion-proto.workspace = true
+ballista.workspace = true
+ballista-core.workspace = true
+ballista-scheduler.workspace = true
+ballista-executor.workspace = true
+tokio.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+arrow.workspace = true
+assert_cmd.workspace = true
+parquet.workspace = true
+tempfile.workspace = true
+
+[[bin]]
+name = "oxide"
+path = "src/bin/oxide.rs"
+
+[[bin]]
+name = "oxide-scheduler"
+path = "src/bin/oxide_scheduler.rs"
+
+[[bin]]
+name = "oxide-worker"
+path = "src/bin/oxide_worker.rs"

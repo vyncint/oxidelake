@@ -1,0 +1,16 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# insta: pending (unaccepted) snapshots
+*.snap.new
+
+# generated datasets and spill directories
+/data/
+/spill/
+
+# editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

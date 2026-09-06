@@ -1,0 +1,15 @@
+# zizmor configuration — accepted findings, each with a rationale.
+# The CI `zizmor` job runs at --persona=pedantic, so anything not listed
+# here fails the build.
+
+rules:
+  # dtolnay/rust-toolchain is deliberate, not superfluous: it pins the
+  # toolchain by commit SHA, installs components reproducibly, and honours
+  # rust-toolchain.toml — the preinstalled runner toolchain drifts with the
+  # image, and the msrv/install jobs need a specific version.
+  superfluous-actions:
+    ignore:
+      - ci.yml
+      - stress.yml
+      - release.yml
+      - install.yml

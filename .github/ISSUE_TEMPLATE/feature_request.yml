@@ -1,0 +1,23 @@
+name: Feature request
+description: An operator, a storage capability, a backend or an API surface OxideLake should have
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The query or workload this is for
+      description: What you are trying to run, and what happens today (CPU fallback, unsupported error, wrong plan).
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: Which layer it belongs in — operator (`oxidelake-compute`), planner rule, storage, a UDF, the TUI — and why there. `docs/architecture.md` has the map.
+    validations:
+      required: true
+  - type: textarea
+    id: verification
+    attributes:
+      label: How it would be verified
+      description: The conformance suite compares every operator against stock DataFusion; say what the reference for this feature is, and whether it needs a GPU to test.

@@ -1,0 +1,5 @@
+# Clippy's MSRV-aware lints follow the workspace rust-version (Cargo.toml);
+# keep the two in sync.
+msrv = "1.94.1"
+# Every `unsafe` block must carry a `// SAFETY:` comment (docs/SPEC.md §1).
+accept-comment-above-statement = true
