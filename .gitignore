@@ -14,3 +14,6 @@
 .idea/
 .vscode/
 *.swp
+
+# GPU verification evidence written by the aws/gpu box tooling (kept local)
+/.gpu-evidence/

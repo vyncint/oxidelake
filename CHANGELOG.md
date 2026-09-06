@@ -8,6 +8,20 @@ versions (0.x) may contain breaking changes; they are always listed under a
 
 ## [Unreleased]
 
+### Fixed
+
+- **CUDA grouped aggregation could emit a duplicate group.** A thread that
+  lost the race for a group-table slot compared the slot's key through a
+  plain load, which the SM's non-coherent L1 could serve from a stale line;
+  the mismatch made it probe on and insert the same key a second time, and
+  the extra slot surfaced as a duplicate group with `COUNT` 0 and `NULL`
+  aggregates. The key is now read through a `volatile` load behind a fence
+  that pairs with the publisher's. Found by the first run of the CUDA suites
+  on real hardware (Tesla T4): `oxidelake-runtime/tests/embedded.rs` failed
+  8 of 8 runs before the fix. A device-layer regression test with the same
+  key distribution (`aggregate_matches_host_on_the_demo_distribution`,
+  `#[ignore]`, needs a GPU) is red on the old kernel and green on the fix.
+
 ### Security
 - **thrift < 0.23.0 (CVE-2026-43868) accepted with a written reason**, reached
   through `parquet 58`. The fix is `parquet 59`, which drops thrift entirely

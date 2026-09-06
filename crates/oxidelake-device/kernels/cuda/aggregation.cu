@@ -28,12 +28,31 @@ extern "C" __device__ __forceinline__ unsigned int oxide_ag_hash(long long key, 
 
 // Finds the slot holding `key` (inserting it when `insert` != 0). Returns
 // 0xFFFFFFFF when the key is absent (lookup) or the table is full (insert).
-// A thread that loses the CAS for a slot spins until the winner publishes
-// (state 1 -> 2). The spin reads through a `volatile` pointer so the compiler
-// re-loads the word on every iteration instead of hoisting one load out of the
-// loop (which would turn the wait into an infinite loop). Lanes of one warp
-// may wait on each other here, which requires independent thread scheduling
-// (compute capability >= 7.0, Volta); the CUDA backend targets no older GPUs.
+//
+// Publication protocol: the winner of the CAS stores the key, fences, then
+// stores state 2. A thread that loses the CAS for a slot (or finds it in
+// state 1) spins until the winner publishes, then compares the key. Both the
+// spin and the key comparison read through `volatile` pointers: a plain load
+// may be served from this SM's L1, which is not coherent, and a neighbouring
+// probe can have cached the line while the slot was still empty. Comparing a
+// stale key makes the loser probe on and insert the same key a second time,
+// which surfaces as a duplicate group with count 0. The fence between the
+// state load and the key load pairs with the writer's fence, so the key
+// store is visible once state 2 is observed. Lookups (`insert` == 0) run in
+// a later kernel launch, after every publication is complete, so they need
+// neither the spin nor the fence.
+//
+// Lanes of one warp may wait on each other here, which requires independent
+// thread scheduling (compute capability >= 7.0, Volta); the CUDA backend
+// targets no older GPUs.
+extern "C" __device__ __forceinline__ unsigned int oxide_ag_load_state(const unsigned int* p) {
+    return *((volatile const unsigned int*)p);
+}
+
+extern "C" __device__ __forceinline__ long long oxide_ag_load_key(const long long* p) {
+    return *((volatile const long long*)p);
+}
+
 extern "C" __device__ unsigned int oxide_ag_slot(long long key,
                                                  long long* g_keys,
                                                  unsigned int* g_state,
@@ -41,8 +60,7 @@ extern "C" __device__ unsigned int oxide_ag_slot(long long key,
                                                  int insert) {
     unsigned int slot = oxide_ag_hash(key, capacity);
     for (unsigned int probes = 0; probes < capacity; ++probes) {
-        unsigned int state = g_state[slot];
-        if (state == 2u && g_keys[slot] == key) return slot;
+        unsigned int state = oxide_ag_load_state(&g_state[slot]);
         if (state == 0u) {
             if (!insert) return 0xFFFFFFFFu;
             if (atomicCAS(&g_state[slot], 0u, 1u) == 0u) {
@@ -51,13 +69,14 @@ extern "C" __device__ unsigned int oxide_ag_slot(long long key,
                 g_state[slot] = 2u;
                 return slot;
             }
-            // Lost the race: fall through and re-examine this slot.
-            while (*((volatile unsigned int*)&g_state[slot]) == 1u) { }
-            if (g_keys[slot] == key) return slot;
-        } else if (state == 1u) {
-            while (*((volatile unsigned int*)&g_state[slot]) == 1u) { }
-            if (g_keys[slot] == key) return slot;
+            // Lost the race: another thread owns this slot; wait for its key.
+            state = 1u;
         }
+        if (state == 1u) {
+            while (oxide_ag_load_state(&g_state[slot]) == 1u) { }
+        }
+        if (insert) __threadfence();
+        if (oxide_ag_load_key(&g_keys[slot]) == key) return slot;
         slot = (slot + 1u) & (capacity - 1u);
     }
     return 0xFFFFFFFFu;
