@@ -5,7 +5,8 @@
 # (GitHub OIDC), from a `release` environment that deploys from v* tags alone,
 # so no registry credential exists on the repository. The publish loop is
 # resumable: versions already on the registry are skipped, so a rate-limited
-# run can be finished later with `workflow_dispatch`.
+# run can be finished later with `workflow_dispatch` — dispatched at the tag
+# (`--ref vX.Y.Z`): the environment rejects any other ref, by design.
 name: release
 
 on:
@@ -185,7 +186,7 @@ jobs:
                 # through the whole window when the slot may already be free.
                 # Twenty attempts keeps the per-crate budget at an hour.
                 if [ "$attempt" -ge 20 ]; then
-                  echo "::error::$crate: still rate-limited after $attempt attempts (~1h); resume with workflow_dispatch"; exit 1
+                  echo "::error::$crate: still rate-limited after $attempt attempts (~1h); resume with workflow_dispatch at the tag (--ref $TAG)"; exit 1
                 fi
                 echo "rate-limited; waiting ${RATE_LIMIT_PAUSE:-180}s before retrying $crate"; sleep "${RATE_LIMIT_PAUSE:-180}"
                 attempt=$((attempt + 1)); continue

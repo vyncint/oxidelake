@@ -86,5 +86,17 @@ Nine crates version together; a bump anywhere is a bump everywhere.
 - **After publish**: crates.io releases are permanent. Yank the affected crates
   (`cargo yank --version X.Y.Z -p <crate>`) and ship a patch. Do not delete the
   tag — the published crates point at it.
-- **Partway through the nine**: nothing to fix. Re-run with
-  `gh workflow run release.yml -f tag=vX.Y.Z`; published crates are skipped.
+- **Partway through the nine**: nothing to fix. Re-run the failed jobs of the
+  same run (`gh run rerun <run-id> --failed`) or dispatch the workflow **at the
+  tag**: `gh workflow run release.yml --ref vX.Y.Z -f tag=vX.Y.Z`. Published
+  crates are skipped. The `--ref` matters: the `release` environment deploys
+  from `v*` tags alone, so a dispatch from `main` is rejected by environment
+  protection before the publish job starts (`Branch "main" is not allowed to
+  deploy to release`) — and that is the point, not a bug.
+- **The workflow itself is what failed**: a dispatch runs the workflow file
+  *at the ref it is dispatched from*, so a fix merged to `main` is not picked
+  up by re-running the tag. Before anything is published, fix on `main`, then
+  move the tag onto the fixed commit (`git tag -f vX.Y.Z origin/main`, push
+  the deletion, push the tag). After anything is published the tag stays;
+  finish the remaining crates from a fixed *new* tag only if their versions
+  match, otherwise ship a patch release.
