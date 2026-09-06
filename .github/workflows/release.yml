@@ -130,6 +130,12 @@ jobs:
           # needs memory; planner needs compute; tui needs core; runtime needs
           # planner, storage and tui; api needs runtime.
           crates="oxidelake-core oxidelake-memory oxidelake-device oxidelake-compute oxidelake-storage oxidelake-planner oxidelake-tui oxidelake-runtime oxidelake-api"
+          # crates.io throttles NEW-crate creation hard: a short burst, then one
+          # every ten minutes. Reacting to the 429 costs a ten-minute wait per
+          # crate; pacing proactively is cheaper. Existing crates are not
+          # throttled the same way, so the pause applies only to first publishes.
+          NEW_CRATE_PAUSE="${NEW_CRATE_PAUSE:-180}"
+          published_new=0
           for crate in $crates; do
             if curl -sf -A "$ua" "https://crates.io/api/v1/crates/$crate/$version" > /dev/null; then
               echo "$crate $version is already on crates.io — skipping"
@@ -143,6 +149,11 @@ jobs:
                 echo "::error::$crate is a NEW crate and no CARGO_REGISTRY_TOKEN secret is set (docs/RELEASING.md)"
                 exit 1
               fi
+              if [ "$published_new" -gt 0 ]; then
+                echo "$crate is new — pausing ${NEW_CRATE_PAUSE}s before the next first-publish (crates.io new-crate throttle)"
+                sleep "$NEW_CRATE_PAUSE"
+              fi
+              published_new=$((published_new + 1))
               echo "$crate is new — publishing with the temporary token"
             fi
             attempt=1
@@ -156,10 +167,15 @@ jobs:
                 echo "$crate $version: already uploaded — treating as success"; break
               fi
               if printf '%s' "$out" | grep -qiE "429|too many requests|rate limit"; then
-                if [ "$attempt" -ge 8 ]; then
-                  echo "::error::$crate: still rate-limited after $attempt attempts; resume with workflow_dispatch"; exit 1
+                # Three minutes, not ten: the new-crate throttle admits one per
+                # ten minutes after the burst, so a shorter wait just retries a
+                # couple of times before it clears — cheaper than sleeping
+                # through the whole window when the slot may already be free.
+                # Twenty attempts keeps the per-crate budget at an hour.
+                if [ "$attempt" -ge 20 ]; then
+                  echo "::error::$crate: still rate-limited after $attempt attempts (~1h); resume with workflow_dispatch"; exit 1
                 fi
-                echo "rate-limited; waiting 10 minutes before retrying $crate"; sleep 600
+                echo "rate-limited; waiting ${RATE_LIMIT_PAUSE:-180}s before retrying $crate"; sleep "${RATE_LIMIT_PAUSE:-180}"
                 attempt=$((attempt + 1)); continue
               fi
               if [ "$tok" = "$OIDC_TOKEN" ] && [ -n "$NEW_CRATE_TOKEN" ] \
