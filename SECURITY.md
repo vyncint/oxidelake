@@ -43,6 +43,26 @@ What the project does continuously, enforced by required CI on every change:
   device execution through transfer counters so a silent CPU fallback cannot
   pass as a GPU result.
 
+## Known, accepted advisories
+
+Each is a dependency advisory that cannot be fixed inside the pinned
+DataFusion/Ballista chain, accepted with a written reason in `deny.toml` and
+re-examined at every chain bump. None is silent: they are listed here, in
+`deny.toml`, and in `STATUS.md`.
+
+- **thrift < 0.23.0 — excessive allocation from a size field during decode**
+  (CVE-2026-43868, GHSA-2f9f-gq7v-9h6m, medium). Reached through `parquet 58 →
+  thrift ^0.17`. The fix is not a thrift bump: `parquet 59` removed the thrift
+  dependency altogether, but it needs DataFusion 55, and the newest Ballista
+  (54.1.0) still requires DataFusion ^54. **Exposure is decoding the footer of
+  a Parquet file** — so until the chain bump lands, do not point this engine at
+  Parquet produced by a party you do not trust; the trust model above already
+  scopes input files to infrastructure you control. Tracked in issue #4.
+- **quick-xml** (RUSTSEC-2026-0194/0195) — reached only by `object_store`'s
+  cloud backends, which OxideLake never registers.
+- **paste** (RUSTSEC-2024-0436) — a compile-time proc-macro dependency of
+  `arrow-flight`; no runtime code.
+
 ## Supported versions
 
 Only the `main` branch (and the most recent tagged release, if any) receives

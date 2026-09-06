@@ -8,6 +8,14 @@ versions (0.x) may contain breaking changes; they are always listed under a
 
 ## [Unreleased]
 
+### Security
+- **thrift < 0.23.0 (CVE-2026-43868) accepted with a written reason**, reached
+  through `parquet 58`. The fix is `parquet 59`, which drops thrift entirely
+  but needs DataFusion 55 — blocked on Ballista, still on ^54. Exposure is
+  Parquet footer decode; `SECURITY.md` says what that means for what you feed
+  the engine. Recorded in `deny.toml` before RustSec carries the advisory, so
+  the gate stays green with the reason on file. Tracked in #4.
+
 ## [0.1.0] - 2026-09-06
 
 The first public release. OxideLake was developed privately from 2026-08-25 as
