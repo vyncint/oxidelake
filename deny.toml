@@ -21,6 +21,20 @@ yanked = "deny"
 # Every ignore must say why it is safe for THIS project and be revisited when
 # the dependency chain moves (see docs/dependencies.md).
 ignore = [
+    # thrift < 0.23.0: excessive allocation from a size field while decoding
+    # (CVE-2026-43868). Reached only through parquet 58 -> thrift ^0.17, and
+    # the fix is not a thrift bump: parquet 59 removed the thrift dependency
+    # entirely. parquet 59 needs DataFusion 55, and the newest Ballista
+    # (54.1.0) still requires DataFusion ^54 -- so this cannot be fixed inside
+    # the pinned chain until Ballista moves (docs/dependencies.md, rule 5).
+    # Exposure: decoding the footer of a Parquet file. SECURITY.md's trust
+    # model already scopes input files to infrastructure you control; do not
+    # point this engine at Parquet from a party you do not trust until the
+    # chain bump lands. Recorded before RustSec carries the advisory (GitHub's
+    # database has it first), so `deny` stays green with the reason written
+    # down rather than going red on every PR the day RustSec catches up.
+    # Re-examine at every chain bump; remove when parquet >= 59 is in the lock.
+    { id = "GHSA-2f9f-gq7v-9h6m", reason = "thrift 0.17 via parquet 58; fix is parquet 59 (drops thrift), blocked on Ballista > 54; exposure is Parquet footer decode of trusted files" },
     # quick-xml is reached only through object_store's S3 / Azure / GCS
     # backends. OxideLake registers the local filesystem store exclusively
     # (oxidelake_storage::store), so the vulnerable XML parser is never invoked.
