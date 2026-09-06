@@ -79,7 +79,7 @@ clap = { version = "4", features = ["derive"] }
 # load time, beside the one OxideLake creates itself, even for a pure-CPU
 # query. oxmera 0.4.0 made that a feature; this is the reason to use it.
 oxmera = { version = "0.4", default-features = false }
-safetensors = "0.6"                  # reading a model's header to recover its shape
+safetensors = "0.8"                  # reading a model's header to recover its shape
 
 # test-only
 insta = "1"
