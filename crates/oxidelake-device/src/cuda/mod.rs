@@ -474,9 +474,10 @@ impl GpuBackend for CudaBackend {
 mod tests {
     use std::sync::Arc;
 
-    use arrow::array::{Float64Array, Int64Array};
+    use arrow::array::{Array, Float64Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use cudarc::driver::{LaunchConfig, PushKernelArg};
+    use oxidelake_core::params::{AggregateFunction, AggregateSpec};
     use oxidelake_memory::MemoryClass;
 
     use super::*;
@@ -541,6 +542,107 @@ mod tests {
         let resident = backend.upload(&stream, &batch).unwrap();
         assert_eq!(resident.backend(), BackendKind::Cuda);
         assert_eq!(backend.download(&stream, &resident).unwrap(), batch);
+    }
+
+    /// The shape that failed on hardware first: the demo table's key
+    /// distribution (100 keys, 1-in-50 NULL) and value distribution (1-in-40
+    /// NULL), 4000 rows in one batch, as `oxidelake-runtime/tests/embedded.rs`
+    /// hands it to the kernel after `concat_batches`. Before the fix the
+    /// aggregate produced a duplicate group here on 8 of 8 runs on a Tesla T4.
+    #[test]
+    #[ignore = "requires an NVIDIA GPU and driver"]
+    fn aggregate_matches_host_on_the_demo_distribution() {
+        const ROWS: usize = 4000;
+        const KEYS: i64 = 100;
+        fn splitmix64(state: &mut u64) -> u64 {
+            *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = *state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        let backend = CudaBackend::new(0).unwrap();
+        let stream = backend.create_stream().unwrap();
+
+        let mut state = 11u64;
+        let mut keys: Vec<Option<i64>> = Vec::with_capacity(ROWS);
+        let mut values: Vec<Option<f64>> = Vec::with_capacity(ROWS);
+        for _ in 0..ROWS {
+            let r = splitmix64(&mut state);
+            keys.push((!r.is_multiple_of(50)).then_some((r >> 8) as i64 % KEYS));
+            let r = splitmix64(&mut state);
+            values.push((!r.is_multiple_of(40)).then(|| f64::from((r >> 8) as u32 % 100) / 4.0));
+        }
+        // Host reference: (key, sum, count) per group, NULL key as -1.
+        let mut expected: std::collections::BTreeMap<i64, (f64, i64)> = Default::default();
+        for (k, v) in keys.iter().zip(&values) {
+            let e = expected.entry(k.unwrap_or(-1)).or_insert((0.0, 0));
+            if let Some(v) = v {
+                e.0 += v;
+                e.1 += 1;
+            }
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("v", DataType::Float64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(keys)),
+                Arc::new(Float64Array::from(values)),
+            ],
+        )
+        .unwrap();
+        let resident = backend.upload(&stream, &batch).unwrap();
+        let spec = AggregateSpec {
+            group_by: 0,
+            aggregates: vec![(AggregateFunction::Sum, 1), (AggregateFunction::Count, 1)],
+        };
+        for round in 0..8 {
+            let out = backend
+                .aggregate(
+                    &stream,
+                    AggregateArgs {
+                        input: &resident,
+                        spec: &spec,
+                    },
+                )
+                .unwrap();
+            let host = backend.download(&stream, &out).unwrap();
+            let groups = host
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let sums = host
+                .column(1)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap();
+            let counts = host
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let mut seen: std::collections::BTreeMap<i64, (f64, i64)> = Default::default();
+            for i in 0..host.num_rows() {
+                let k = if groups.is_null(i) {
+                    -1
+                } else {
+                    groups.value(i)
+                };
+                let dup = seen.insert(
+                    k,
+                    (
+                        if sums.is_null(i) { 0.0 } else { sums.value(i) },
+                        counts.value(i),
+                    ),
+                );
+                assert!(dup.is_none(), "round {round}: group {k} emitted twice");
+            }
+            assert_eq!(seen, expected, "round {round}");
+        }
     }
 
     #[test]
