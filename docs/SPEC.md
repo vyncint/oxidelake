@@ -20,8 +20,8 @@ The differentiator is the operator layer — Rust host code with its own CUDA an
 Verified facts about the development machine (2026-08-25): Linux 7.0 x86_64, 20 cores, 61 GiB RAM; Rust **1.98.0 stable**, cargo 1.98, git 2.53; **no NVIDIA GPU, no `nvcc`, no `nvidia-smi`, no `/dev/nvidia*`; not macOS**; crates.io reachable. Everything you claim as done must be provable on this machine.
 
 1. **Default features = pure CPU.** `cargo check --workspace` and `cargo test --workspace` with default features must be green with zero GPU or OS-specific dependencies.
-2. **`cuda` feature** (in `oxidelake-memory`, `oxidelake-device`, `oxidelake-compute`; forwarded by `oxidelake-runtime` and `oxidelake-api`) uses `cudarc` in **`dynamic-loading`** mode: the driver and NVRTC libraries are `dlopen`ed at runtime, so the feature **builds on this GPU-less box** and degrades to CPU at startup when no driver is found. Because `cuda-version-from-build-system` needs a toolkit, pin one CUDA API version feature explicitly (`cuda-12080`); cudarc's `cuda-*` features are alternatives, so never enable two. CUDA kernels are `.cu` **source files** in `kernels/cuda/`, embedded with `include_str!` and JIT-compiled with **NVRTC** on first use, PTX cached per device. There is **no `nvcc` build step**.
-3. **`metal` feature**: all Metal code is additionally `#[cfg(target_os = "macos")]`, and its dependencies (`objc2`, `objc2-metal`, `objc2-foundation`) are declared only under `[target.'cfg(target_os = "macos")'.dependencies]`. Enabling `metal` on Linux must be a compiling no-op. MSL kernels in `kernels/metal/` are embedded via `include_str!` and compiled at runtime with `MTLDevice::newLibraryWithSource`. No Xcode build step.
+2. **`cuda` feature** (in `oxidelake-memory`, `oxidelake-device`, `oxidelake-compute`; forwarded by `oxidelake-runtime` and `oxidelake-api`) uses `cudarc` in **`dynamic-loading`** mode: the driver and NVRTC libraries are `dlopen`ed at runtime, so the feature **builds on this GPU-less box** and degrades to CPU at startup when no driver is found. Because `cuda-version-from-build-system` needs a toolkit, pin one CUDA API version feature explicitly (`cuda-12080`); cudarc's `cuda-*` features are alternatives, so never enable two. CUDA kernels are `.cu` **source files** in `oxidelake-device/kernels/cuda/`, embedded with `include_str!` and JIT-compiled with **NVRTC** on first use, PTX cached per device. There is **no `nvcc` build step**.
+3. **`metal` feature**: all Metal code is additionally `#[cfg(target_os = "macos")]`, and its dependencies (`objc2`, `objc2-metal`, `objc2-foundation`) are declared only under `[target.'cfg(target_os = "macos")'.dependencies]`. Enabling `metal` on Linux must be a compiling no-op. MSL kernels in `oxidelake-device/kernels/metal/` are embedded via `include_str!` and compiled at runtime with `MTLDevice::newLibraryWithSource`. No Xcode build step.
 4. **`io-uring` feature** (Linux-only, target-gated): an `object_store::ObjectStore` implementation for local files built on the low-level `io-uring` crate, driven from a dedicated storage thread. The default path is `object_store::local::LocalFileSystem` and both must behave identically (shared conformance test). If `io_uring_setup` is denied by a sandbox (EPERM/ENOSYS), tests skip with a logged reason instead of failing.
 5. **Honesty rule.** GPU code cannot *execute* here. Verify what is verifiable — compilation and clippy under `--features cuda`, and a shared conformance suite that runs every operator against the CPU backend, and against CUDA/Metal only when a device is detected (`#[ignore]` by default, with a documented `-- --ignored` invocation for GPU machines). Record in `STATUS.md` exactly what ran and what only compiled. Never fabricate benchmark numbers or "works on GPU" claims. `README.md` may describe design intent; anything phrased as achieved must have run.
 6. **Stub policy.** `todo!()`, `unimplemented!()`, and panicking placeholders are forbidden everywhere, features included. A genuinely unimplemented path returns `Err(EngineError::Unsupported { feature, detail })`.
@@ -94,7 +94,7 @@ pub trait GpuBackend: Send + Sync + std::fmt::Debug {
 - `MetalBackend` (`metal`, macOS) — objc2-metal; runtime-compiles MSL.
 - `HardwareDetector::select()` — probe CUDA (device count > 0) → Metal → CPU; overridable with `OXIDE_BACKEND=cpu|cuda|metal` (an unavailable choice is a clean startup error, not a silent fallback).
 
-### 2.3 Operators & kernels — `kernels/`, `oxidelake-compute`
+### 2.3 Operators & kernels — `oxidelake-device/kernels/`, `oxidelake-compute`
 
 DataFusion `ExecutionPlan` implementations: `GpuFilterExec` (fused filter + projection), `GpuHashJoinExec`, `GpuAggregateExec`, `GpuVectorDistanceExec`. Each one:
 
@@ -161,21 +161,21 @@ oxidelake/
 ├── LICENSE                    # Apache-2.0
 ├── README.md                  # what it is, quickstart (only commands that actually run)
 ├── STATUS.md                  # phase table: done / verified how / deferred
-├── .github/workflows/ci.yml   # the §5 gate as CI (skips until Cargo.toml exists)
-├── docs/                      # roadmap checklists, architecture, dependency evidence, verification, ADRs
-├── kernels/
-│   ├── cuda/                  # NVRTC-compiled at runtime; no nvcc anywhere
-│   │   ├── filter_project.cu
-│   │   ├── hash_join.cu
-│   │   ├── aggregation.cu
-│   │   └── vector_distance.cu
-│   └── metal/                 # newLibraryWithSource at runtime; no Xcode step
-│       ├── filter_project.metal
-│       └── vector_distance.metal
+├── .github/workflows/         # ci.yml (the §5 gate, one job per concern), release.yml, binaries.yml, install.yml, stress.yml, commit-policy.yml
+├── docs/                      # this spec, roadmap checklists, architecture, dependency evidence, verification, releasing, ADRs
 └── crates/
     ├── oxidelake-core/            # EngineError, DeviceId, BackendKind, BufferLayout, BatchStream, TelemetryHub
     ├── oxidelake-memory/          # AlignedBuf, pinned/UMA allocators, SpillManager
     ├── oxidelake-device/          # GpuBackend trait, Cpu/Cuda/Metal backends, HardwareDetector
+    │   └── kernels/               # INSIDE the crate: `cargo publish` packages only the crate directory (ADR-0016)
+    │       ├── cuda/              # NVRTC-compiled at runtime; no nvcc anywhere
+    │       │   ├── filter_project.cu
+    │       │   ├── hash_join.cu
+    │       │   ├── aggregation.cu
+    │       │   └── vector_distance.cu
+    │       └── metal/             # newLibraryWithSource at runtime; no Xcode step
+    │           ├── filter_project.metal
+    │           └── vector_distance.metal
     ├── oxidelake-compute/         # Gpu*Exec ExecutionPlans, CPU reference paths, conformance suite
     ├── oxidelake-storage/         # Parquet writer/pruning config, Arrow IPC spill files, io_uring ObjectStore
     ├── oxidelake-planner/         # HardwarePlacementRule, OxidePhysicalCodec
@@ -299,7 +299,7 @@ On a GPU or macOS machine (not available here; document, don't claim): `cargo te
 
 **Phase 0 — bootstrap.** The repository already exists with `origin` on GitHub and `LICENSE`, `.gitignore`, `README.md`, `STATUS.md`, `docs/` and `.github/workflows/ci.yml` committed — do not recreate or overwrite them. Add `rust-toolchain.toml` (`channel = "1.98.0"`, `components = ["rustfmt", "clippy"]`), confirm `git status` is clean and `origin` is reachable, and update the Phase 0 row in `STATUS.md`. Commit `phase 0: bootstrap`.
 
-**Phase 1 — workspace scaffold.** Root manifest exactly per §4; `cargo update` and the coherence check; all nine crates with real minimal exports (crate docs, error types, feature wiring — no placeholder types that exist only to compile); `kernels/cuda/` and `kernels/metal/` with a README each. Record the resolved set (`cargo tree` majors for arrow, parquet, datafusion, ballista, tonic, prost, object_store) in `STATUS.md`. Gate → commit.
+**Phase 1 — workspace scaffold.** Root manifest exactly per §4; `cargo update` and the coherence check; all nine crates with real minimal exports (crate docs, error types, feature wiring — no placeholder types that exist only to compile); `oxidelake-device/kernels/cuda/` and `oxidelake-device/kernels/metal/` with a README each. Record the resolved set (`cargo tree` majors for arrow, parquet, datafusion, ballista, tonic, prost, object_store) in `STATUS.md`. Gate → commit.
 
 **Phase 2 — core, memory, device** (§2.1–2.2).
 Acceptance: alignment tests (`ptr % 64 == 0`; device buffers `% 128 == 0`); pinned-vs-pageable path observable and tested; `SpillManager` with kilobyte budgets demotes cold batches host → disk (Arrow IPC through the default object store) and promotes them back byte-identical (`tempfile`); metrics counters move; `HardwareDetector` yields `CpuSimd` here and honors `OXIDE_BACKEND` (unavailable choice → typed error); `CudaBackend`/`MetalBackend` compile under their features with the NVRTC/MSL compile pipelines wired end to end. Gate → commit.
