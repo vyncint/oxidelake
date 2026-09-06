@@ -17,7 +17,7 @@ Deliverables
 - [x] Root `Cargo.toml` exactly per PROMPT §4 (members glob, workspace deps rooted at Ballista 54, lints, profiles)
 - [x] `cargo update`; coherence check `cargo tree --workspace -d -e normal` shows no duplicate `arrow-*` / `parquet` / `datafusion*` / `object_store` / `tonic` / `prost`
 - [x] Nine crates with real minimal exports — crate docs, error types, feature wiring (`cuda`, `metal`, `io-uring` forwarded by `oxidelake-runtime` and `oxidelake-api`); no placeholder types that exist only to compile
-- [x] `kernels/cuda/README.md`, `kernels/metal/README.md`
+- [x] `crates/oxidelake-device/kernels/{cuda,metal}/README.md`
 - [x] Resolved dependency majors recorded in `STATUS.md`
 
 Acceptance
@@ -40,8 +40,8 @@ Acceptance
 ## Phase 3 — kernels + operators
 
 Deliverables
-- [x] `kernels/cuda/{filter_project,hash_join,aggregation,vector_distance}.cu` — `extern "C"` entry points, explicit grid math, bounds checks on every global access
-- [x] `kernels/metal/{filter_project,vector_distance}.metal`
+- [x] `crates/oxidelake-device/kernels/cuda/{filter_project,hash_join,aggregation,vector_distance}.cu` — `extern "C"` entry points, explicit grid math, bounds checks on every global access
+- [x] `crates/oxidelake-device/kernels/metal/{filter_project,vector_distance}.metal`
 - [x] `GpuFilterExec`, `GpuHashJoinExec`, `GpuAggregateExec`, `GpuVectorDistanceExec` with double-buffered stream pipelines, execute-time backend selection and per-batch CPU fallback
 - [x] Conformance suite vs stock DataFusion operators (seeded random batches; nulls, empty, 0/1/odd rows); GPU variants `#[ignore]`
 

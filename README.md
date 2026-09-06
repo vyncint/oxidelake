@@ -154,7 +154,7 @@ OXIDE_BACKEND=cuda cargo test -p oxidelake-compute --features cuda -- --ignored
 | [`crates/oxidelake-runtime`](crates/oxidelake-runtime) | `OxideSession` (embedded + Ballista cluster), scheduler/worker wrappers, the `oxide` CLI, dashboard builder |
 | [`crates/oxidelake-tui`](crates/oxidelake-tui) | ratatui dashboard, `TestBackend` snapshots and termlens PTY tests |
 | [`crates/oxidelake-api`](crates/oxidelake-api) | `OxideFrame` fluent DataFrame API and prelude |
-| [`kernels/`](kernels) | CUDA C (`.cu`, NVRTC at runtime) and MSL (`.metal`, `newLibraryWithSource`) sources |
+| [`crates/oxidelake-device/kernels/`](crates/oxidelake-device/kernels) | CUDA C (`.cu`, NVRTC at runtime) and MSL (`.metal`, `newLibraryWithSource`) sources — inside the device crate so the published crate is self-contained (`include_str!` cannot reach outside a crate's directory at publish time; ADR-0016) |
 | [`docs/`](docs) | [roadmap](docs/roadmap.md) · [architecture](docs/architecture.md) · [dependencies](docs/dependencies.md) · [verification](docs/verification.md) · [ADRs](docs/decisions/README.md) |
 | [`docs/SPEC.md`](docs/SPEC.md) | The executable spec the build agent executed, phase by phase |
 | [`STATUS.md`](STATUS.md) | What is done, how it was verified, what was deferred — the honesty ledger |
