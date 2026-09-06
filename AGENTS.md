@@ -128,7 +128,4 @@ pull request, including releases.
 
 ## Releasing
 
-Tag `vX.Y.Z` on `main`; `release.yml` verifies the tag against the workspace
-version and the changelog, re-runs the gate, publishes nine crates in
-dependency order via Trusted Publishing, and cuts the GitHub Release with
-binaries. See `docs/RELEASING.md`.
+Tag `vX.Y.Z` on `main`; `release.yml` verifies the tag against the workspace version and the changelog, re-runs the gate, publishes nine crates in dependency order via Trusted Publishing, and cuts the GitHub Release with binaries. See `docs/RELEASING.md`.

@@ -149,7 +149,7 @@ allowlist is a list on purpose, so that widening it is a visible decision.
 - Branch from `main`; name branches `feat/…`, `fix/…`, `docs/…`, `ci/…`.
 - PRs are **squash-merged** — keep the PR title in Conventional Commit form,
   since it becomes the commit subject on `main`. Branches are deleted on merge.
-- Required checks: `gate`, `metal`, `msrv` and `deny`, plus `commit-policy` (DCO + attribution). All
+- Required checks: `required-green` (fmt, clippy on default/cuda/predict, test, metal, msrv, docs, deny, release-scripts, zizmor), plus `commit-policy` (DCO + attribution). All
   must pass before merge; direct pushes to `main` are blocked by a ruleset.
 - **Every change lands with a test, and the test must be able to fail.** If
   you add a guard, break it once and watch it go red before you commit.

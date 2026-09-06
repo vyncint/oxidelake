@@ -8,6 +8,8 @@ versions (0.x) may contain breaking changes; they are always listed under a
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-09-06
+
 The first public release. OxideLake was developed privately from 2026-08-25 as
 `vyncint/oxidelake` (now `vyncint/oxidelake-old`); this repository starts from
 one commit carrying the whole tree, not from that history. What follows is what
@@ -104,4 +106,5 @@ Metal executes on Apple silicon (verified on an M4 Pro and on GitHub's macOS
 runners); CUDA compiles and lints without a CUDA installation but has not yet
 run on a CUDA machine.
 
-[Unreleased]: https://github.com/vyncint/oxidelake/commits/main
+[Unreleased]: https://github.com/vyncint/oxidelake/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/vyncint/oxidelake/releases/tag/v0.1.0
