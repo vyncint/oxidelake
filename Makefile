@@ -83,13 +83,16 @@ coherence: ## no duplicate arrow / parquet / datafusion / object_store / tonic /
 release-scripts: ## the changelog extractor's own tests (release.yml depends on it)
 	./.github/scripts/test-extract-changelog.sh
 
+crate-metadata: ## every published crate carries README, repository, keywords, categories, docs.rs link
+	./.github/scripts/check-crate-metadata.sh
+
 zizmor: ## workflow security audit at the level CI enforces (cargo install --locked zizmor --version 1.29.0)
 	zizmor --persona=pedantic --offline .github/workflows/
 
 deny: ## advisories, licenses, bans and sources (cargo-deny)
 	$(CARGO) deny check
 
-gate: fmt-check lint lint-cuda lint-predict test test-predict check-cuda check-predict-no-second-cuda doc coherence deny release-scripts zizmor ## the whole quality gate — the same list CI runs
+gate: fmt-check lint lint-cuda lint-predict test test-predict check-cuda check-predict-no-second-cuda doc coherence deny release-scripts crate-metadata zizmor ## the whole quality gate — the same list CI runs
 ifeq ($(UNAME),Linux)
 	$(MAKE) test-io-uring
 endif

@@ -10,6 +10,17 @@ versions (0.x) may contain breaking changes; they are always listed under a
 
 ### Fixed
 
+- **crates.io showed the nine crates with no README, repository, homepage,
+  keywords or categories.** `[workspace.package]` declared all of them, but a
+  workspace field reaches a crate only when its manifest opts in with
+  `field.workspace = true`, and the manifests inherited only
+  version/edition/rust-version/license/authors. Every crate now inherits the
+  rest and carries its own `documentation = "https://docs.rs/<crate>"`;
+  `make crate-metadata` (also in CI) fails if any published crate is missing
+  what crates.io shows, or if `README.md` is not in its packaged file list.
+
+### Fixed
+
 - **CUDA grouped aggregation could emit a duplicate group.** A thread that
   lost the race for a group-table slot compared the slot's key through a
   plain load, which the SM's non-coherent L1 could serve from a stale line;
