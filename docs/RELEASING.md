@@ -20,6 +20,13 @@ Trusted Publishing.
   first run the OIDC exchange itself fails with `400 No Trusted Publishing
   config found for repository` — expected, and non-fatal: the step is
   `continue-on-error` and the loop uses the registry token instead.
+- **`HOMEBREW_TAP_TOKEN`** repository secret (optional): a fine-grained PAT with
+  `contents: write` on `vyncint/homebrew-tap` and nothing else. `binaries.yml`
+  regenerates `Formula/oxidelake.rb` in the tap from the uploaded archives'
+  checksums; without the secret the job says so and the tap keeps the previous
+  version. To refresh the formula for a tag whose release already ran (or ran
+  from an older workflow): `gh workflow run binaries.yml --ref main -f tag=vX.Y.Z`
+  — archives already on the release are left alone, only the formula moves.
 - A **`release` GitHub environment** whose deployment branches are restricted
   to `v*` tags, so an OIDC publish token can never be minted from a branch.
 - **`v*` tags protected by a ruleset**, so only a repository admin can create
