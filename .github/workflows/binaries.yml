@@ -45,6 +45,9 @@ jobs:
   binaries:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    # A link that swaps runs for hours, not minutes: v0.1.0's macOS jobs took
+    # 4h11m and 4h37m under fat LTO. Fail loudly instead of holding a slot.
+    timeout-minutes: 90
     permissions:
       contents: write # upload release assets
     strategy:
@@ -92,14 +95,14 @@ jobs:
       - name: musl linker (Linux)
         if: steps.published.outputs.present != 'true' && contains(matrix.target, 'musl')
         run: sudo apt-get update -q && sudo apt-get install -y -q musl-tools
-      # One binary per invocation, on purpose. The release profile is fat LTO
-      # with a single codegen unit, so linking a binary is a whole-program LLVM
-      # pass over Arrow, DataFusion and Ballista. Cargo schedules the three
-      # binaries' links in parallel, and three of those do not fit in a 16 GB
-      # Linux runner that has no swap: the VM is torn down and the job ends
-      # with "The runner has received a shutdown signal", exit 143, at exactly
-      # this point — v0.1.0 (both musl targets) and v0.1.2 (aarch64 musl).
-      # macOS survives only by swapping, which is where its hours go. The
+      # One binary per invocation, on purpose. Linking a binary is an LTO pass
+      # over Arrow, DataFusion and Ballista that peaks at 7.4 GB under the thin
+      # profile (13.6 GB when it was fat), and Cargo schedules the three
+      # binaries' links in parallel. Three at once do not fit in a 16 GB Linux
+      # runner that has no swap: the VM is torn down and the job ends with
+      # "The runner has received a shutdown signal", exit 143, at exactly this
+      # point — v0.1.0 (both musl targets) and v0.1.2 (aarch64 musl). macOS
+      # survives only by swapping, which is where its hours went. The
       # dependencies still compile in parallel during the first invocation;
       # the second and third only link.
       - name: Build

@@ -264,7 +264,7 @@ rand = "0.10"
 
 [profile.release]
 opt-level = 3
-lto = "fat"
+lto = "thin"       # fat LTO's 13.6 GB links did not fit the release runners; see Cargo.toml
 codegen-units = 1
 strip = "symbols"
 # Deliberately no `panic = "abort"`: unwinding must stay sound across PyO3/FFI
