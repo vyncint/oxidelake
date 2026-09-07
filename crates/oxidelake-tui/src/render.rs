@@ -243,6 +243,67 @@ fn render_telemetry(state: &AppState, model: &DashboardModel, frame: &mut Frame<
     );
 }
 
+/// Describe's column widths, in header order. Named because the cell
+/// formatters below have to agree with the layout: ratatui clips a cell that
+/// overflows its column, and for a number that silently changes its value.
+const DESCRIBE_WIDTHS: [u16; 8] = [8, 8, 7, 7, 7, 6, 6, 6];
+
+/// Drops a decimal fraction's trailing zeros, and the point left behind.
+fn trim_zeros(rendered: &str) -> String {
+    if !rendered.contains('.') {
+        return rendered.to_owned();
+    }
+    rendered
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_owned()
+}
+
+/// Text that cannot fit, marked as shortened rather than quietly cut.
+fn fit_text(raw: &str, width: usize) -> String {
+    if raw.chars().count() <= width {
+        return raw.to_owned();
+    }
+    match width {
+        0 => String::new(),
+        _ => raw.chars().take(width - 1).chain(['…']).collect(),
+    }
+}
+
+/// Fits a rendered number into `width` columns without ever cutting a digit.
+///
+/// `approx_percentile_cont` renders full precision — the 2M-row demo table's
+/// P99 of `id` arrives as `1979969.2416513609`. Clipped to the six columns
+/// Describe has, that printed `197999`: an order of magnitude low, and below
+/// the median displayed above it, with nothing to show it had been cut. So a
+/// value that already fits is kept exactly as the query rendered it, and
+/// anything longer is *rounded* to the most decimals that fit, falling back to
+/// an exponent form when even the integer part is too wide.
+fn fit_number(raw: &str, width: usize) -> String {
+    if raw.chars().count() <= width {
+        return raw.to_owned();
+    }
+    let Ok(value) = raw.parse::<f64>() else {
+        return fit_text(raw, width);
+    };
+    if !value.is_finite() {
+        return fit_text(raw, width);
+    }
+    for precision in (0..=3).rev() {
+        let candidate = trim_zeros(&format!("{value:.precision$}"));
+        if candidate.chars().count() <= width {
+            return candidate;
+        }
+    }
+    for precision in (0..=2).rev() {
+        let candidate = format!("{value:.precision$e}");
+        if candidate.chars().count() <= width {
+            return candidate;
+        }
+    }
+    fit_text(raw, width)
+}
+
 fn render_describe(state: &AppState, model: &DashboardModel, frame: &mut Frame<'_>, area: Rect) {
     let header =
         Row::new(["column", "type", "min", "max", "nulls", "p25", "p50", "p99"].map(Cell::from))
@@ -251,28 +312,20 @@ fn render_describe(state: &AppState, model: &DashboardModel, frame: &mut Frame<'
         .profiles
         .iter()
         .map(|p| {
+            let w = DESCRIBE_WIDTHS.map(usize::from);
             Row::new(vec![
-                Cell::from(p.name.clone()),
-                Cell::from(p.data_type.clone()),
-                Cell::from(p.min.clone()),
-                Cell::from(p.max.clone()),
-                Cell::from(p.null_count.to_string()),
-                Cell::from(p.p25.clone()),
-                Cell::from(p.p50.clone()),
-                Cell::from(p.p99.clone()),
+                Cell::from(fit_text(&p.name, w[0])),
+                Cell::from(fit_text(&p.data_type, w[1])),
+                Cell::from(fit_number(&p.min, w[2])),
+                Cell::from(fit_number(&p.max, w[3])),
+                Cell::from(fit_number(&p.null_count.to_string(), w[4])),
+                Cell::from(fit_number(&p.p25, w[5])),
+                Cell::from(fit_number(&p.p50, w[6])),
+                Cell::from(fit_number(&p.p99, w[7])),
             ])
         })
         .collect();
-    let widths = [
-        Constraint::Length(8),
-        Constraint::Length(8),
-        Constraint::Length(7),
-        Constraint::Length(7),
-        Constraint::Length(7),
-        Constraint::Length(6),
-        Constraint::Length(6),
-        Constraint::Length(6),
-    ];
+    let widths = DESCRIBE_WIDTHS.map(Constraint::Length);
     frame.render_widget(
         Table::new(rows, widths).header(header).block(panel_block(
             "Describe",
@@ -293,6 +346,84 @@ mod tests {
         assert_eq!(human_bytes(1023), "1023 B");
         assert_eq!(human_bytes(1024), "1.0 KiB");
         assert_eq!(human_bytes(6 * 1024 * 1024 * 1024), "6.0 GiB");
+    }
+
+    /// A percentile parses back to the number it stands for.
+    fn num(rendered: &str) -> f64 {
+        rendered.parse().unwrap_or(f64::NAN)
+    }
+
+    #[test]
+    fn a_value_that_fits_is_left_exactly_as_the_query_rendered_it() {
+        for raw in ["0", "0.0", "99", "24.75", "1999999", "", "s0"] {
+            assert_eq!(fit_number(raw, 7), raw);
+        }
+        assert_eq!(fit_text("Int64", 8), "Int64");
+    }
+
+    /// The bug: `id`'s P99 on the 2M-row demo table arrives as
+    /// `1979969.2416513609`, and six columns of hard clipping printed
+    /// `197999` — ten times too small, and below the median above it.
+    #[test]
+    fn wide_percentiles_round_instead_of_losing_a_digit() {
+        let (p25, p50, p99) = (
+            fit_number("505700.81345880596", 6),
+            fit_number("996257.6842335836", 6),
+            fit_number("1979969.2416513609", 6),
+        );
+        assert_ne!(p99, "197999", "P99 was clipped mid-integer");
+        assert!(
+            num(&p25) < num(&p50) && num(&p50) < num(&p99),
+            "percentiles out of order: {p25} {p50} {p99}"
+        );
+        for (rendered, want) in [(&p25, 505_700.81), (&p50, 996_257.68), (&p99, 1_979_969.24)] {
+            let error = (num(rendered) - want).abs() / want;
+            assert!(error < 0.01, "{rendered} is not within 1% of {want}");
+        }
+    }
+
+    #[test]
+    fn no_cell_can_overflow_its_column() {
+        let samples = [
+            "1979969.2416513609",
+            "-1979969.2416513609",
+            "0.000012345678",
+            "123456789012345",
+            "1e300",
+            "-1e-300",
+            "6.122512376708984",
+            "not a number at all",
+            "",
+        ];
+        for raw in samples {
+            for width in 1..=8 {
+                let cell = fit_number(raw, width);
+                assert!(
+                    cell.chars().count() <= width,
+                    "{raw:?} rendered {cell:?}, wider than {width}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn text_too_long_is_marked_as_shortened() {
+        assert_eq!(fit_text("FixedSizeList(8 x Float32)", 8), "FixedSi…");
+        assert_eq!(fit_text("Float64", 1), "…");
+        assert_eq!(fit_text("abc", 0), "");
+    }
+
+    #[test]
+    fn trailing_zeros_go_but_the_value_stays() {
+        assert_eq!(trim_zeros("24.750"), "24.75");
+        assert_eq!(trim_zeros("0.000"), "0");
+        assert_eq!(trim_zeros("996258"), "996258");
+        assert_eq!(trim_zeros("100"), "100");
+    }
+
+    #[test]
+    fn every_describe_column_has_a_width() {
+        assert_eq!(DESCRIBE_WIDTHS.len(), 8, "one width per Describe column");
     }
 
     #[test]

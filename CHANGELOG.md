@@ -8,6 +8,19 @@ versions (0.x) may contain breaking changes; they are always listed under a
 
 ## [Unreleased]
 
+### Fixed
+
+- **The dashboard's Describe panel no longer prints a truncated percentile as
+  if it were the value.** `approx_percentile_cont` renders full precision, and
+  the panel's six-character columns were clipped from the right, so the 2M-row
+  demo table's P99 of `id` (1979969.24) displayed as `197999` — ten times too
+  small and below the median in the same row. Numeric cells that do not fit
+  are now rounded to the most decimals that fit, falling back to an exponent
+  form (`1.98e6`); a value that already fits is left exactly as the query
+  rendered it. Over-long text cells are marked with an ellipsis rather than
+  cut silently, and the column widths now live in one constant the cell
+  formatters and the layout share.
+
 ## [0.1.3] - 2026-09-07
 
 Release-build changes only; no crate code changed since 0.1.1. This is the
