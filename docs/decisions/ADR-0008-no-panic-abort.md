@@ -9,7 +9,7 @@ The draft set `panic = "abort"` for release. `oxidelake-api` may expose PyO3 bin
 
 ## Decision
 
-Keep the default `panic = "unwind"`. The release profile is `opt-level = 3`, `lto = "fat"`, `codegen-units = 1`, `strip = "symbols"`.
+Keep the default `panic = "unwind"`. The release profile is `opt-level = 3`, `lto = "thin"` (fat until 0.1.3; its links did not fit the release runners), `codegen-units = 1`, `strip = "symbols"`.
 
 ## Consequences
 

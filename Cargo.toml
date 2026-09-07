@@ -101,7 +101,15 @@ dbg_macro = "deny"
 
 [profile.release]
 opt-level = 3
-lto = "fat"
+# Thin, not fat. With fat LTO each binary's link was a 13.6 GB whole-program
+# pass (measured 2026-09-07, Apple Silicon): Cargo links the three binaries
+# in parallel, which killed the 16 GB Linux release runners (exit 143 on
+# v0.1.0 and v0.1.2) and left the 7 GB macOS runners swapping for four hours
+# per target. Thin LTO with one codegen unit peaks at 7.4 GB and links in
+# half the time for 9% more binary; a 10M-row aggregate ran in the same
+# 40 ms under both. Sixteen codegen units would peak at 2.6 GB but cost 75%
+# in size, so the single unit stays.
+lto = "thin"
 codegen-units = 1
 strip = "symbols"
 # Deliberately no `panic = "abort"`: unwinding must stay sound across PyO3/FFI

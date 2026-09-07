@@ -8,6 +8,17 @@ versions (0.x) may contain breaking changes; they are always listed under a
 
 ## [Unreleased]
 
+### Changed
+
+- **Release profile: thin LTO instead of fat.** Fat LTO with one codegen unit
+  made each binary's link a 13.6 GB whole-program pass; three in parallel
+  killed the 16 GB Linux release runners and left the 7 GB macOS runners
+  swapping for four hours per target. Thin LTO with one codegen unit peaks
+  at 7.4 GB and links in half the time; binaries grow about 9% (`oxide`
+  68 → 74 MB) and a 10M-row aggregate ran in the same 40 ms under both.
+  `binaries.yml` also gains a 90-minute timeout so a swapping link fails
+  loudly instead of holding a macOS slot.
+
 ### Fixed
 
 - **Linux release binaries build again.** `binaries.yml` links the three
