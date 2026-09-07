@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 # The lockfile's floor (Ballista's bundled AWS SDK crates need 1.94.1), not
 # the 1.88 of the direct dependencies; verified by `make msrv` / the CI job.
@@ -24,15 +24,15 @@ exclude = [".github/*", ".claude/*", "docs/*", "target/*"]
 
 [workspace.dependencies]
 # internal crates
-oxidelake-core = { path = "crates/oxidelake-core", version = "0.1.2" }
-oxidelake-memory = { path = "crates/oxidelake-memory", version = "0.1.2" }
-oxidelake-device = { path = "crates/oxidelake-device", version = "0.1.2" }
-oxidelake-compute = { path = "crates/oxidelake-compute", version = "0.1.2" }
-oxidelake-storage = { path = "crates/oxidelake-storage", version = "0.1.2" }
-oxidelake-planner = { path = "crates/oxidelake-planner", version = "0.1.2" }
-oxidelake-runtime = { path = "crates/oxidelake-runtime", version = "0.1.2" }
-oxidelake-tui = { path = "crates/oxidelake-tui", version = "0.1.2" }
-oxidelake-api = { path = "crates/oxidelake-api", version = "0.1.2" }
+oxidelake-core = { path = "crates/oxidelake-core", version = "0.1.3" }
+oxidelake-memory = { path = "crates/oxidelake-memory", version = "0.1.3" }
+oxidelake-device = { path = "crates/oxidelake-device", version = "0.1.3" }
+oxidelake-compute = { path = "crates/oxidelake-compute", version = "0.1.3" }
+oxidelake-storage = { path = "crates/oxidelake-storage", version = "0.1.3" }
+oxidelake-planner = { path = "crates/oxidelake-planner", version = "0.1.3" }
+oxidelake-runtime = { path = "crates/oxidelake-runtime", version = "0.1.3" }
+oxidelake-tui = { path = "crates/oxidelake-tui", version = "0.1.3" }
+oxidelake-api = { path = "crates/oxidelake-api", version = "0.1.3" }
 
 # data plane — Ballista 54 is the root of this chain
 ballista = "54"                      # client: SessionContext::remote / standalone
