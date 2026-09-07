@@ -8,6 +8,10 @@ versions (0.x) may contain breaking changes; they are always listed under a
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-09-07
+
+CI and build-gate changes only; no crate code changed since 0.1.1.
+
 ### Changed
 
 - **CI dependency reuse and shorter queues.** Linux default/io-uring/predict
@@ -161,6 +165,7 @@ Metal executes on Apple silicon (verified on an M4 Pro and on GitHub's macOS
 runners); CUDA compiles and lints without a CUDA installation but has not yet
 run on a CUDA machine.
 
-[Unreleased]: https://github.com/vyncint/oxidelake/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/vyncint/oxidelake/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/vyncint/oxidelake/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/vyncint/oxidelake/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/vyncint/oxidelake/releases/tag/v0.1.0
