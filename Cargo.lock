@@ -4039,7 +4039,7 @@ checksum = "1a80800c0488c3a21695ea981a54918fbb37abf04f4d0720c453632255e2ff0e"
 
 [[package]]
 name = "oxidelake-api"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "datafusion",
  "oxidelake-core",
@@ -4051,7 +4051,7 @@ dependencies = [
 
 [[package]]
 name = "oxidelake-compute"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arrow",
  "datafusion",
@@ -4069,7 +4069,7 @@ dependencies = [
 
 [[package]]
 name = "oxidelake-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "datafusion",
  "serde",
@@ -4078,7 +4078,7 @@ dependencies = [
 
 [[package]]
 name = "oxidelake-device"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arrow",
  "cudarc",
@@ -4093,7 +4093,7 @@ dependencies = [
 
 [[package]]
 name = "oxidelake-memory"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arrow",
  "bytes",
@@ -4110,7 +4110,7 @@ dependencies = [
 
 [[package]]
 name = "oxidelake-planner"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arrow",
  "datafusion",
@@ -4125,7 +4125,7 @@ dependencies = [
 
 [[package]]
 name = "oxidelake-runtime"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "arrow",
@@ -4153,7 +4153,7 @@ dependencies = [
 
 [[package]]
 name = "oxidelake-storage"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4172,7 +4172,7 @@ dependencies = [
 
 [[package]]
 name = "oxidelake-tui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "crossterm",
  "insta",

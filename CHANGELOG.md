@@ -8,6 +8,11 @@ versions (0.x) may contain breaking changes; they are always listed under a
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-07
+
+Metadata-only for the published crates; no code changed since 0.1.0 beyond
+what this section lists.
+
 ### Fixed
 
 - **crates.io showed the nine crates with no README, repository, homepage,
@@ -18,28 +23,6 @@ versions (0.x) may contain breaking changes; they are always listed under a
   rest and carries its own `documentation = "https://docs.rs/<crate>"`;
   `make crate-metadata` (also in CI) fails if any published crate is missing
   what crates.io shows, or if `README.md` is not in its packaged file list.
-
-### Fixed
-
-- **CUDA grouped aggregation could emit a duplicate group.** A thread that
-  lost the race for a group-table slot compared the slot's key through a
-  plain load, which the SM's non-coherent L1 could serve from a stale line;
-  the mismatch made it probe on and insert the same key a second time, and
-  the extra slot surfaced as a duplicate group with `COUNT` 0 and `NULL`
-  aggregates. The key is now read through a `volatile` load behind a fence
-  that pairs with the publisher's. Found by the first run of the CUDA suites
-  on real hardware (Tesla T4): `oxidelake-runtime/tests/embedded.rs` failed
-  8 of 8 runs before the fix. A device-layer regression test with the same
-  key distribution (`aggregate_matches_host_on_the_demo_distribution`,
-  `#[ignore]`, needs a GPU) is red on the old kernel and green on the fix.
-
-### Security
-- **thrift < 0.23.0 (CVE-2026-43868) accepted with a written reason**, reached
-  through `parquet 58`. The fix is `parquet 59`, which drops thrift entirely
-  but needs DataFusion 55 — blocked on Ballista, still on ^54. Exposure is
-  Parquet footer decode; `SECURITY.md` says what that means for what you feed
-  the engine. Recorded in `deny.toml` before RustSec carries the advisory, so
-  the gate stays green with the reason on file. Tracked in #4.
 
 ## [0.1.0] - 2026-09-06
 
@@ -66,6 +49,26 @@ that tree contains and what changed on the way over.
   carries the crates.io metadata; the release pipeline publishes all nine in
   dependency order through Trusted Publishing.
 
+- Operators upload only the columns a kernel reads; projected columns of types
+  the device cannot hold (`Utf8`, …) stay on the host and are gathered at the
+  compacted row ids. A string column in a projection no longer forces the
+  whole batch onto the CPU path.
+- Backends declare supported operations up front (`supports_predicate`,
+  `supports_hash_join`, `supports_aggregate`) so unsupported work is never
+  uploaded.
+- Hash join build sides are hashed once (`JoinBuild`) and uploaded once per
+  operator; probes gather only projected columns.
+- Column transfers are zero-copy where the transport allows (`Buffer`-based
+  `ColumnBytes`; Metal downloads alias the shared `MTLBuffer`).
+- Metal: cached compute pipelines, one command buffer per phase, pooled command
+  queues, command-buffer errors surfaced.
+- GPU-targeted sessions use 65 536-row batches.
+- `oxide gen-data` streams chunks to the writer (bounded memory for any `--rows`).
+- `rust-version` is the lockfile's real floor (1.94.1) and is verified in CI.
+- Repository hygiene: `Makefile` gate, `deny.toml`, `rustfmt.toml`,
+  `clippy.toml`, `.editorconfig`, contribution/security/conduct documents,
+  Dependabot, issue and PR templates.
+
 ### Added
 
 - **The vyncint contributor pattern**: DCO sign-off and no-AI-attribution
@@ -87,7 +90,32 @@ that tree contains and what changed on the way over.
   --all-features` rejects. Never seen before because no job built the feature
   with docs — the gap the new CI closes.
 
+- **(merged before the tag was cut, so it is in 0.1.0 — the entry was filed under
+  Unreleased at the time.)** **CUDA grouped aggregation could emit a duplicate group.** A thread that
+  lost the race for a group-table slot compared the slot's key through a
+  plain load, which the SM's non-coherent L1 could serve from a stale line;
+  the mismatch made it probe on and insert the same key a second time, and
+  the extra slot surfaced as a duplicate group with `COUNT` 0 and `NULL`
+  aggregates. The key is now read through a `volatile` load behind a fence
+  that pairs with the publisher's. Found by the first run of the CUDA suites
+  on real hardware (Tesla T4): `oxidelake-runtime/tests/embedded.rs` failed
+  8 of 8 runs before the fix. A device-layer regression test with the same
+  key distribution (`aggregate_matches_host_on_the_demo_distribution`,
+  `#[ignore]`, needs a GPU) is red on the old kernel and green on the fix.
+
+- STATUS.md over-claimed that the Metal conformance suite had executed on the
+  device; the fixtures had taken the CPU fallback. The suite now asserts device
+  execution through the operator transfer counters.
+
 ### Security
+
+- **thrift < 0.23.0 (CVE-2026-43868) accepted with a written reason**, reached
+  through `parquet 58`. The fix is `parquet 59`, which drops thrift entirely
+  but needs DataFusion 55 — blocked on Ballista, still on ^54. Exposure is
+  Parquet footer decode; `SECURITY.md` says what that means for what you feed
+  the engine. Recorded in `deny.toml` before RustSec carries the advisory, so
+  the gate stays green with the reason on file. Tracked in #4.
+
 - CUDA aggregation kernel: the slot-claim spin-wait now reads through a
   `volatile` pointer; the previous plain load could be hoisted into an infinite
   loop (GPU hang). Compile-verified only — see `STATUS.md`.
@@ -98,32 +126,6 @@ that tree contains and what changed on the way over.
   long-lived sessions no longer grow without bound.
 - `cargo deny` (advisories, licenses, bans, sources) runs in CI; `SECURITY.md`
   documents the trust model.
-
-### Changed
-- Operators upload only the columns a kernel reads; projected columns of types
-  the device cannot hold (`Utf8`, …) stay on the host and are gathered at the
-  compacted row ids. A string column in a projection no longer forces the
-  whole batch onto the CPU path.
-- Backends declare supported operations up front (`supports_predicate`,
-  `supports_hash_join`, `supports_aggregate`) so unsupported work is never
-  uploaded.
-- Hash join build sides are hashed once (`JoinBuild`) and uploaded once per
-  operator; probes gather only projected columns.
-- Column transfers are zero-copy where the transport allows (`Buffer`-based
-  `ColumnBytes`; Metal downloads alias the shared `MTLBuffer`).
-- Metal: cached compute pipelines, one command buffer per phase, pooled command
-  queues, command-buffer errors surfaced.
-- GPU-targeted sessions use 65 536-row batches.
-- `oxide gen-data` streams chunks to the writer (bounded memory for any `--rows`).
-- `rust-version` is the lockfile's real floor (1.94.1) and is verified in CI.
-- Repository hygiene: `Makefile` gate, `deny.toml`, `rustfmt.toml`,
-  `clippy.toml`, `.editorconfig`, contribution/security/conduct documents,
-  Dependabot, issue and PR templates.
-
-### Fixed
-- STATUS.md over-claimed that the Metal conformance suite had executed on the
-  device; the fixtures had taken the CPU fallback. The suite now asserts device
-  execution through the operator transfer counters.
 
 ## [0.1.0] — 2026-09-01
 
@@ -139,5 +141,6 @@ Metal executes on Apple silicon (verified on an M4 Pro and on GitHub's macOS
 runners); CUDA compiles and lints without a CUDA installation but has not yet
 run on a CUDA machine.
 
-[Unreleased]: https://github.com/vyncint/oxidelake/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/vyncint/oxidelake/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/vyncint/oxidelake/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/vyncint/oxidelake/releases/tag/v0.1.0
