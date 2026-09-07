@@ -66,18 +66,53 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ env.TAG }}
+      # A re-run against an existing tag (docs/RELEASING.md) must not rebuild
+      # what is already published: an archive is immutable once uploaded, and
+      # a macOS build of this graph is measured in hours.
+      - name: Already on the release?
+        id: published
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          archive="oxidelake-${TAG#v}-${TARGET}.tar.gz"
+          assets="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' 2>/dev/null || true)"
+          if printf '%s\n' "$assets" | grep -qxF "$archive"; then
+            echo "$archive is already attached to $TAG — nothing to build"
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Add the target's standard library
+        if: steps.published.outputs.present != 'true'
         env:
           TARGET: ${{ matrix.target }}
         run: rustup target add "$TARGET"
       - name: musl linker (Linux)
-        if: contains(matrix.target, 'musl')
+        if: steps.published.outputs.present != 'true' && contains(matrix.target, 'musl')
         run: sudo apt-get update -q && sudo apt-get install -y -q musl-tools
+      # One binary per invocation, on purpose. The release profile is fat LTO
+      # with a single codegen unit, so linking a binary is a whole-program LLVM
+      # pass over Arrow, DataFusion and Ballista. Cargo schedules the three
+      # binaries' links in parallel, and three of those do not fit in a 16 GB
+      # Linux runner that has no swap: the VM is torn down and the job ends
+      # with "The runner has received a shutdown signal", exit 143, at exactly
+      # this point — v0.1.0 (both musl targets) and v0.1.2 (aarch64 musl).
+      # macOS survives only by swapping, which is where its hours go. The
+      # dependencies still compile in parallel during the first invocation;
+      # the second and third only link.
       - name: Build
+        if: steps.published.outputs.present != 'true'
         env:
           TARGET: ${{ matrix.target }}
-        run: cargo build --release --locked -p oxidelake-runtime --target "$TARGET"
+        run: |
+          set -euo pipefail
+          for binary in oxide oxide-scheduler oxide-worker; do
+            cargo build --release --locked -p oxidelake-runtime --bin "$binary" --target "$TARGET"
+          done
       - name: Package
+        if: steps.published.outputs.present != 'true'
         env:
           TARGET: ${{ matrix.target }}
         run: |
@@ -113,6 +148,7 @@ jobs:
       # Uploaded only if absent, never clobbered: a published archive is
       # immutable, and rebuilding a tag yields a different checksum.
       - name: Attach to the release
+        if: steps.published.outputs.present != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

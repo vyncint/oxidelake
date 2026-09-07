@@ -8,6 +8,15 @@ versions (0.x) may contain breaking changes; they are always listed under a
 
 ## [Unreleased]
 
+### Fixed
+
+- **Linux release binaries build again.** `binaries.yml` links the three
+  binaries one at a time: the release profile's fat LTO made Cargo run three
+  whole-program links in parallel, which exhausted the 16 GB Linux runners
+  and ended every musl job with exit 143 (v0.1.0 and v0.1.2 both shipped
+  without Linux archives). A re-run against an existing tag now skips targets
+  whose archive is already attached instead of rebuilding them.
+
 ## [0.1.2] - 2026-09-07
 
 CI and build-gate changes only; no crate code changed since 0.1.1.
