@@ -232,6 +232,8 @@ jobs:
     uses: ./.github/workflows/binaries.yml
     permissions:
       contents: write # upload the archives to the release
+    secrets:
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
     with:
       tag: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 

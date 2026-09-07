@@ -17,6 +17,14 @@ on:
         description: the release tag to build binaries for, e.g. v0.1.0
         required: true
         type: string
+    secrets:
+      HOMEBREW_TAP_TOKEN:
+        description: >-
+          PAT with contents:write on vyncint/homebrew-tap. Named rather than
+          inherited: a called workflow with `secrets: inherit` gets every
+          secret this repository has, and this one needs exactly one. Absent
+          is fine — the formula job says so and the tap keeps what it has.
+        required: false
   workflow_dispatch:
     inputs:
       tag:
@@ -117,3 +125,144 @@ jobs:
               gh release upload "$TAG" "$file"; echo "uploaded: $file"
             fi
           done
+
+  # Regenerate the Homebrew formula from the archives just uploaded, the way
+  # mossaic's release does: generated rather than hand-edited, because a
+  # hand-edit in the tap is overwritten by the next release, silently. The
+  # checksums come from the `.sha256` files the matrix produced, so the
+  # formula cannot describe an archive that was never built.
+  #
+  # Best-effort: it needs a token with write access to the tap, and without
+  # one it says so and exits clean — a formula one version behind is a smaller
+  # problem than a release that fails after the crates are on crates.io.
+  formula:
+    name: homebrew formula
+    needs: binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # The token is checked before anything uses it, and reported on without
+      # being revealed: its kind (a published prefix, not entropy) and length.
+      # A value pasted with a trailing newline looks normal in the secrets UI
+      # and fails at first use with a message about URLs.
+      - name: Check the token is usable
+        id: token
+        env:
+          TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -uo pipefail
+          if [ -z "${TOKEN:-}" ]; then
+            echo "::notice::HOMEBREW_TAP_TOKEN is not set; the tap keeps its current formula"
+            echo "usable=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          case "$TOKEN" in
+            github_pat_*) kind="fine-grained PAT" ;;
+            ghp_*)        kind="classic PAT" ;;
+            gho_*|ghu_*|ghs_*|ghr_*) kind="a GitHub token, but not a PAT" ;;
+            *)            kind="UNRECOGNISED - no GitHub token prefix" ;;
+          esac
+          trimmed="$(printf '%s' "$TOKEN" | tr -d '[:space:]')"
+          echo "looks like: $kind"
+          echo "length: ${#TOKEN} (${#trimmed} once whitespace is removed)"
+          if [ "${#trimmed}" -ne "${#TOKEN}" ]; then
+            echo "::warning::HOMEBREW_TAP_TOKEN carries whitespace. Using the trimmed value; worth setting it again cleanly."
+          fi
+          case "$trimmed" in
+            *[!A-Za-z0-9_]*)
+              echo "::error::HOMEBREW_TAP_TOKEN does not look like a GitHub token: $kind, ${#trimmed} characters, holding characters a token cannot. Re-set it with: gh secret set HOMEBREW_TAP_TOKEN --repo vyncint/oxidelake"
+              exit 1
+              ;;
+          esac
+          echo "::add-mask::$trimmed"
+          echo "token=$trimmed" >> "$GITHUB_OUTPUT"
+          echo "usable=true" >> "$GITHUB_OUTPUT"
+
+      # Checkout does the authentication rather than the token being spliced
+      # into a remote URL by hand. The credential is scoped to one repository
+      # and pushing back is this job's whole business.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: steps.token.outputs.usable == 'true'
+        with:
+          repository: vyncint/homebrew-tap
+          token: ${{ steps.token.outputs.token }}
+          path: tap
+          persist-credentials: true # zizmor: ignore[artipacked]
+
+      - name: Generate and push
+        if: steps.token.outputs.usable == 'true'
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          base="https://github.com/vyncint/oxidelake/releases/download/${TAG}"
+
+          # One checksum per platform the formula serves. Windows has no
+          # Homebrew, and this project has no Windows build anyway.
+          declare -A sums
+          for target in aarch64-apple-darwin x86_64-apple-darwin \
+                        aarch64-unknown-linux-musl x86_64-unknown-linux-musl; do
+            url="${base}/oxidelake-${version}-${target}.tar.gz.sha256"
+            sum="$(curl -fsSL "$url" | awk '{print $1}')"
+            if [ -z "$sum" ]; then
+              echo "::error::no checksum for ${target}; the archive did not upload"
+              exit 1
+            fi
+            sums[$target]="$sum"
+          done
+
+          block() {
+            printf '      url "%s/oxidelake-%s-%s.tar.gz"\n      sha256 "%s"\n' \
+              "$base" "$version" "$1" "${sums[$1]}"
+          }
+
+          mkdir -p tap/Formula
+          {
+            echo "# This file is generated by oxidelake's release workflow. DO NOT EDIT."
+            echo "# https://github.com/vyncint/oxidelake/blob/main/.github/workflows/binaries.yml"
+            echo "class Oxidelake < Formula"
+            echo '  desc "GPU-accelerated analytical engine on DataFusion and Ballista: SQL and vector search over Parquet"'
+            echo '  homepage "https://github.com/vyncint/oxidelake"'
+            echo '  license "Apache-2.0"'
+            echo
+            echo "  livecheck do"
+            echo '    skip "Auto-generated on release."'
+            echo "  end"
+            echo
+            echo "  on_macos do"
+            echo "    on_arm do";   block aarch64-apple-darwin;  echo "    end"
+            echo "    on_intel do"; block x86_64-apple-darwin;   echo "    end"
+            echo "  end"
+            echo
+            echo "  on_linux do"
+            echo "    on_arm do";   block aarch64-unknown-linux-musl; echo "    end"
+            echo "    on_intel do"; block x86_64-unknown-linux-musl;  echo "    end"
+            echo "  end"
+            echo
+            echo "  def install"
+            echo '    bin.install "oxide", "oxide-scheduler", "oxide-worker"'
+            echo '    doc.install "README.md", "CHANGELOG.md"'
+            echo "  end"
+            echo
+            echo "  test do"
+            echo '    assert_match version.to_s, shell_output("#{bin}/oxide --version")'
+            echo "    # Generate a table and query it: the embedded engine works with no"
+            echo "    # cluster, no network and no GPU."
+            echo '    system bin/"oxide", "gen-data", "--rows", "100", "--out", testpath/"data"'
+            echo '    out = shell_output("#{bin}/oxide sql -q \"SELECT count(*) AS n FROM t\" --table t=#{testpath}/data")'
+            echo '    assert_match "100", out'
+            echo "  end"
+            echo "end"
+          } > tap/Formula/oxidelake.rb
+
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/oxidelake.rb
+          if git diff --cached --quiet; then
+            echo "the formula already describes ${TAG}"
+            exit 0
+          fi
+          git commit -q -s -m "chore: oxidelake ${version}"
+          git push -q origin HEAD:main
+          echo "tap updated to ${version}"
