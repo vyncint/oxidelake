@@ -4,15 +4,27 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use oxidelake_tui::{AppState, KeyInput, Panel, Transition, demo_model, render};
+use oxidelake_tui::DashboardModel;
+use oxidelake_tui::{AppState, ColumnProfile, KeyInput, Panel, Transition, demo_model, render};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
 fn frame(width: u16, height: u16, state: &AppState) -> String {
+    frame_of(width, height, state, &demo_model())
+}
+
+fn frame_of(width: u16, height: u16, state: &AppState, model: &DashboardModel) -> String {
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-    let model = demo_model();
-    terminal.draw(|f| render(state, &model, f)).unwrap();
+    terminal.draw(|f| render(state, model, f)).unwrap();
     terminal.backend().to_string()
+}
+
+/// The row of a rendered frame that profiles `column`.
+fn describe_row<'a>(frame: &'a str, column: &str) -> &'a str {
+    frame
+        .lines()
+        .find(|line| line.contains(&format!("{column} ")) && line.contains("Int64"))
+        .unwrap_or_else(|| panic!("no Describe row for {column}:\n{frame}"))
 }
 
 #[test]
@@ -73,4 +85,54 @@ fn rendering_is_deterministic_and_stable_across_sizes() {
             assert!(text.contains(needle), "{w}x{h} missing {needle}:\n{text}");
         }
     }
+}
+
+/// Describe renders what `approx_percentile_cont` actually returns: full
+/// precision. The 2M-row demo table's P99 of `id` is `1979969.2416513609`,
+/// and clipping it to the column's six characters printed `197999` — below
+/// the median in the same row, with nothing to mark the cut.
+#[test]
+fn wide_percentiles_render_in_order_in_the_panel() {
+    let mut model = demo_model();
+    model.profiles = vec![ColumnProfile {
+        name: "id".into(),
+        data_type: "Int64".into(),
+        min: "0".into(),
+        max: "1999999".into(),
+        null_count: 0,
+        p25: "505700.81345880596".into(),
+        p50: "996257.6842335836".into(),
+        p99: "1979969.2416513609".into(),
+    }];
+    let text = frame_of(160, 40, &AppState::new(3), &model);
+    let row = describe_row(&text, "id");
+    assert!(
+        !row.contains("197999 ") && !row.contains("197999|"),
+        "P99 was clipped mid-integer: {row}"
+    );
+    let numbers: Vec<f64> = row
+        .split_whitespace()
+        .filter_map(|cell| cell.parse::<f64>().ok())
+        .collect();
+    let (p25, p50, p99) = (505_700.81, 996_257.68, 1_979_969.24);
+    for want in [p25, p50, p99] {
+        assert!(
+            numbers.iter().any(|got| (got - want).abs() / want < 0.01),
+            "no cell within 1% of {want} in: {row}\nparsed {numbers:?}"
+        );
+    }
+    let p99_cell = numbers
+        .iter()
+        .copied()
+        .find(|got| (got - p99).abs() / p99 < 0.01)
+        .unwrap_or(f64::NAN);
+    let p50_cell = numbers
+        .iter()
+        .copied()
+        .find(|got| (got - p50).abs() / p50 < 0.01)
+        .unwrap_or(f64::NAN);
+    assert!(
+        p99_cell > p50_cell,
+        "P99 {p99_cell} not above P50 {p50_cell}"
+    );
 }
