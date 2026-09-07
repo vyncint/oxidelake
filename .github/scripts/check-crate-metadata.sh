@@ -18,7 +18,11 @@ meta="$(cargo metadata --no-deps --format-version 1 --locked)"
 for pkg in $(printf '%s' "$meta" | jq -r '.packages[] | select(.publish == null) | .name' | sort); do
   # One field per line: a tab-separated read would collapse empty fields,
   # and an empty field is exactly what this script is looking for.
-  mapfile -t f < <(printf '%s' "$meta" | jq -r --arg n "$pkg" '
+  # macOS ships Bash 3.2, before mapfile; preserve empty lines in an array.
+  f=()
+  while IFS= read -r value; do
+    f+=("$value")
+  done < <(printf '%s' "$meta" | jq -r --arg n "$pkg" '
     .packages[] | select(.name == $n) |
     (.readme // ""), (.repository // ""), (.homepage // ""), (.documentation // ""),
     (.keywords | length), (.categories | length), (.description // "")')

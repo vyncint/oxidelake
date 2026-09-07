@@ -20,3 +20,4 @@ Each record: Status · Date · Context · Decision · Consequences. New decision
 | [ADR-0014](ADR-0014-parquet-and-arrow-ipc-not-a-custom-format.md) | Parquet and Arrow IPC instead of a custom `.oxide` file format |
 | [ADR-0015](ADR-0015-in-database-inference-at-the-udf-layer.md) | In-database inference (`predict`) at the UDF layer, not the operator layer; `oxmera` with `default-features = false` |
 | [ADR-0016](ADR-0016-public-repository-and-crate-rename.md) | Public repository from one commit; crates renamed `oxidelake-*`; kernels inside the device crate |
+| [ADR-0017](ADR-0017-ci-dependency-reuse.md) | Dependency caching, shared Metal builds, independent Linux feature gates and tested documentation skips |

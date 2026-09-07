@@ -11,8 +11,11 @@ SHELL := /bin/sh
 CARGO ?= cargo
 MSRV := $(shell sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)
 UNAME := $(shell uname -s)
+# The normal and ignored passes must resolve identical dependency features;
+# selecting compute alone rebuilt Arrow/DataFusion for the second pass in CI.
+METAL_TEST_ARGS := -p oxidelake-memory -p oxidelake-device -p oxidelake-compute -p oxidelake-runtime -p oxidelake-tui --features oxidelake-runtime/metal --locked --timings
 
-.PHONY: help fmt fmt-check lint lint-cuda lint-metal test test-io-uring check-cuda doc coherence deny gate metal msrv quickstart clean-data
+.PHONY: help fmt fmt-check lint lint-cuda lint-metal lint-predict test test-predict test-io-uring test-metal test-metal-device check-cuda check-predict-no-second-cuda doc coherence deny gate metal msrv quickstart clean-data release-scripts crate-metadata zizmor ci-scripts stress-tui
 
 help: ## list targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-14s %s\n", $$1, $$2}'
@@ -24,19 +27,19 @@ fmt-check: ## fail on unformatted code
 	$(CARGO) fmt --all -- --check
 
 lint: ## clippy, default features (pure CPU), warnings are errors
-	$(CARGO) clippy --workspace --all-targets -- -D warnings
+	$(CARGO) clippy --workspace --all-targets --locked -- -D warnings
 
 lint-cuda: ## clippy with the cuda feature (builds without CUDA installed)
-	$(CARGO) clippy -p oxidelake-runtime --all-targets --features cuda -- -D warnings
+	$(CARGO) clippy -p oxidelake-runtime --all-targets --features cuda --locked -- -D warnings
 
 lint-metal: ## clippy with the metal feature (macOS)
-	$(CARGO) clippy -p oxidelake-runtime --all-targets --features metal -- -D warnings
+	$(CARGO) clippy -p oxidelake-runtime --all-targets --features metal --locked -- -D warnings
 
 lint-predict: ## clippy with the predict feature (in-database inference)
-	$(CARGO) clippy -p oxidelake-runtime --all-targets --features predict -- -D warnings
+	$(CARGO) clippy -p oxidelake-runtime --all-targets --features predict --locked -- -D warnings
 
 test-predict: ## the `predict` UDF against the model it loaded
-	$(CARGO) test -p oxidelake-compute --features predict --test predict
+	$(CARGO) test -p oxidelake-compute --features predict --test predict --locked --timings
 
 # `cargo tree` prints an already-shown node again as `name ver (*)`, so a
 # bare `grep -c` counts tree references rather than crates and reports two
@@ -65,16 +68,26 @@ check-predict-no-second-cuda: ## oxmera must never bring a CUDA stack of its own
 	echo "one cudarc (OxideLake's own), no oxmera-cuda, no pre-main ctor"
 
 test: ## the full default-feature test suite
-	$(CARGO) test --workspace
+	$(CARGO) test --workspace --locked --timings
 
 test-io-uring: ## io_uring object store tests (Linux; skips with a reason where io_uring is denied)
-	$(CARGO) test -p oxidelake-storage --features io-uring
+	$(CARGO) test -p oxidelake-storage --features io-uring --locked --timings
+
+test-metal: ## Metal package tests and macOS PTY tests with one dependency graph
+	$(CARGO) test $(METAL_TEST_ARGS)
+
+test-metal-device: ## reuse the Metal test graph for on-device conformance
+	@if swift -e 'import Metal; exit(MTLCreateSystemDefaultDevice() == nil ? 1 : 0)' 2>/dev/null; then \
+	  OXIDE_BACKEND=metal $(CARGO) test $(METAL_TEST_ARGS) -- --ignored; \
+	else \
+	  echo "No Metal device on this runner — on-device conformance skipped."; \
+	fi
 
 check-cuda: ## the GPU compile gate: cuda code builds with no CUDA installed
-	$(CARGO) check -p oxidelake-runtime --features cuda
+	$(CARGO) check -p oxidelake-runtime --features cuda --locked
 
 doc: ## rustdoc for the workspace, warnings are errors
-	RUSTDOCFLAGS="-D warnings" $(CARGO) doc --workspace --no-deps
+	RUSTDOCFLAGS="-D warnings" $(CARGO) doc --workspace --no-deps --all-features --locked
 
 coherence: ## no duplicate arrow / parquet / datafusion / object_store / tonic / prost majors
 	@dups=$$($(CARGO) tree --workspace -d -e normal | grep -E '^(arrow|parquet|datafusion|object_store|tonic|prost)' || true); \
@@ -86,29 +99,32 @@ release-scripts: ## the changelog extractor's own tests (release.yml depends on 
 crate-metadata: ## every published crate carries README, repository, keywords, categories, docs.rs link
 	./.github/scripts/check-crate-metadata.sh
 
+ci-scripts: ## CI change detection, required results, Metal build reuse and stress coverage
+	python3 -B -m unittest discover -s .github/scripts -p test_ci.py -v
+
+stress-tui: ## build once and stress all three thread counts (ITERS defaults to 100)
+	python3 .github/scripts/stress-tui.py
+
 zizmor: ## workflow security audit at the level CI enforces (cargo install --locked zizmor --version 1.29.0)
 	zizmor --persona=pedantic --offline .github/workflows/
 
 deny: ## advisories, licenses, bans and sources (cargo-deny)
-	$(CARGO) deny check
+	$(CARGO) deny --all-features check
 
-gate: fmt-check lint lint-cuda lint-predict test test-predict check-cuda check-predict-no-second-cuda doc coherence deny release-scripts crate-metadata zizmor ## the whole quality gate — the same list CI runs
+gate: fmt-check lint lint-cuda lint-predict test test-predict check-cuda check-predict-no-second-cuda doc coherence deny release-scripts crate-metadata ci-scripts zizmor msrv ## the whole quality gate — the same list CI runs
 ifeq ($(UNAME),Linux)
 	$(MAKE) test-io-uring
 endif
 ifeq ($(UNAME),Darwin)
-	$(MAKE) lint-metal
+	$(MAKE) metal
 endif
 	@echo "gate green"
 
-metal: ## Metal lane: lint, device-independent tests, conformance ON the device (macOS)
-	$(CARGO) clippy -p oxidelake-runtime --all-targets --features metal -- -D warnings
-	$(CARGO) test -p oxidelake-memory -p oxidelake-device -p oxidelake-compute -p oxidelake-runtime --features metal
-	$(CARGO) test -p oxidelake-compute --features metal -- --ignored
+metal: lint-metal test-metal test-metal-device ## Metal lane: lint, tests and conformance when a device is present
 
 msrv: ## build the workspace with the declared rust-version
-	rustup toolchain install $(MSRV) --profile minimal
-	CARGO_TARGET_DIR=target/msrv $(CARGO) +$(MSRV) check --workspace --all-targets
+	rustup toolchain install $(MSRV) --profile minimal --no-self-update
+	CARGO_TARGET_DIR=target/msrv rustup run $(MSRV) $(CARGO) check --workspace --all-targets --locked
 
 quickstart: ## release build, 1M-row demo table, one query
 	$(CARGO) build --release -p oxidelake-runtime

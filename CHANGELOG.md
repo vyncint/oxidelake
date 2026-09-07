@@ -8,6 +8,26 @@ versions (0.x) may contain breaking changes; they are always listed under a
 
 ## [Unreleased]
 
+### Changed
+
+- **CI dependency reuse and shorter queues.** Linux default/io-uring/predict
+  tests run independently; the Metal and PTY tests share a dependency graph
+  with the conformance pass. External dependency caches accelerate ordinary
+  test jobs while release CI keeps a clean full gate. Superseded ordinary
+  main CI is cancelled; known documentation-only changes can skip Rust jobs
+  under a tested required-check policy. Stress builds once per OS and retains
+  all three thread counts and their iteration weights. Cargo timing artifacts
+  make compilation costs inspectable; no benchmarked speedup is claimed yet.
+- `make gate` includes MSRV, the complete macOS Metal lane, and all-feature
+  documentation and dependency-policy checks to match the CI requirements.
+
+### Fixed
+
+- The crate-metadata gate runs under macOS's bundled Bash 3.2, preserving
+  empty-field validation without the unavailable `mapfile` builtin.
+- The MSRV target invokes Rustup explicitly, so a standalone Cargo earlier
+  on `PATH` cannot bypass the declared compiler selection.
+
 ## [0.1.1] - 2026-09-07
 
 Metadata-only for the published crates; no code changed since 0.1.0 beyond

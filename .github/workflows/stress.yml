@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       iterations:
-        description: Iterations per OS, split across the shards
+        description: Iterations per OS, split across thread counts 1, 4 and 16
         required: false
         default: "100"
 
@@ -21,16 +21,11 @@ concurrency:
 
 jobs:
   stress:
-    name: stress (${{ matrix.os }}, ${{ matrix.threads }} threads)
+    name: stress (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        threads: [1, 4, 16]
-        include:
-          - { threads: 1,  weight: 20 }
-          - { threads: 4,  weight: 40 }
-          - { threads: 16, weight: 40 }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
@@ -40,19 +35,20 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: stable
-      - name: Build once
-        run: cargo build --release -p oxidelake-tui --all-targets
-      - name: Run the PTY suite repeatedly
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: ${{ runner.os }}-${{ runner.arch }}-stress-release
+          cache-bin: false
+          cache-workspace-crates: false
+      - name: Build once and exercise every thread count
         env:
           ITERS: ${{ inputs.iterations || '100' }}
-          THREADS: ${{ matrix.threads }}
-          WEIGHT: ${{ matrix.weight }}
-        run: |
-          per=$(( WEIGHT * ITERS / 100 )); [ "$per" -lt 1 ] && per=1
-          echo "${THREADS} thread(s): ${per} iterations of ${ITERS}"
-          for i in $(seq "$per"); do
-            echo "::group::${THREADS} threads, iteration ${i}/${per}"
-            cargo test --release -p oxidelake-tui -- --test-threads="$THREADS" \
-              || { echo "::error::suite flaked at ${THREADS} thread(s), iteration ${i}/${per}"; exit 1; }
-            echo "::endgroup::"
-          done
+        run: make stress-tui
+      - name: Upload Cargo build timings
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: timings-stress-${{ matrix.os }}
+          path: target/cargo-timings/*.html
+          retention-days: 7
+          if-no-files-found: ignore

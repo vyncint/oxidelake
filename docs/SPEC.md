@@ -283,16 +283,10 @@ Feature wiring:
 
 ## 5. Phase plan with acceptance gates
 
-Run the **gate** after every phase; every command must pass before that phase's commit. `.github/workflows/ci.yml` runs the same commands on every push — keep the two in sync.
+Run the **gate** after every phase; every command must pass before that phase's commit. `.github/workflows/ci.yml` uses the Make targets documented in [verification.md](verification.md), with independent feature jobs, dependency reuse, and conservative documentation-only skips per [ADR-0017](decisions/ADR-0017-ci-dependency-reuse.md). Release calls always run the full gate without build caches.
 
 ```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo clippy -p oxidelake-runtime --all-targets --features cuda -- -D warnings   # from Phase 2
-cargo test --workspace
-cargo test -p oxidelake-storage --features io-uring                              # from Phase 4 (Linux)
-cargo check -p oxidelake-runtime --features cuda                                 # GPU code builds with no CUDA installed
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+make gate
 ```
 
 On a GPU or macOS machine (not available here; document, don't claim): `cargo test -p oxidelake-compute --features cuda -- --ignored` and `cargo test -p oxidelake-compute --features metal -- --ignored`.
