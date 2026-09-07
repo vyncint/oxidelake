@@ -8,6 +8,11 @@ versions (0.x) may contain breaking changes; they are always listed under a
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-09-07
+
+Release-build changes only; no crate code changed since 0.1.1. This is the
+first release whose binaries were built under thin LTO.
+
 ### Changed
 
 - **Release profile: thin LTO instead of fat.** Fat LTO with one codegen unit
@@ -185,7 +190,8 @@ Metal executes on Apple silicon (verified on an M4 Pro and on GitHub's macOS
 runners); CUDA compiles and lints without a CUDA installation but has not yet
 run on a CUDA machine.
 
-[Unreleased]: https://github.com/vyncint/oxidelake/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/vyncint/oxidelake/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/vyncint/oxidelake/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/vyncint/oxidelake/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/vyncint/oxidelake/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/vyncint/oxidelake/releases/tag/v0.1.0
