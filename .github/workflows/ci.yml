@@ -3,8 +3,8 @@
 #
 # Job shape follows the other vyncint projects: one job per concern, a single
 # `required-green` that branch protection requires, and every action pinned to
-# a full commit SHA. No build cache: a cache that serves a stale artifact is a
-# green run that proves nothing, and the workspace builds in minutes.
+# a full commit SHA. Dependency caches accelerate ordinary CI; release calls
+# keep a clean full gate. Test execution is never conditional on a cache hit.
 name: CI
 
 on:
@@ -13,13 +13,25 @@ on:
     branches: [main]
   # Reused by release.yml so a release re-runs the exact same gates.
   workflow_call:
+    inputs:
+      clean:
+        description: Bypass dependency caches
+        type: boolean
+        default: true
+  workflow_dispatch:
+    inputs:
+      clean:
+        description: Run the full gate without dependency caches
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  # A newer main tip replaces ordinary CI, but never a caller's release gate.
+  cancel-in-progress: ${{ github.workflow == 'CI' && (github.event_name == 'push' || github.event_name == 'pull_request') }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -30,8 +42,30 @@ env:
   CARGO_PROFILE_DEV_DEBUG: "false"
 
 jobs:
+  changes:
+    name: CI policy and changes
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.changes.outputs.rust }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - run: make ci-scripts
+      - name: Classify the actual checkout against its base
+        id: changes
+        env:
+          EVENT: ${{ github.event_name }}
+          WORKFLOW: ${{ github.workflow }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: python3 .github/scripts/ci-policy.py changes >> "$GITHUB_OUTPUT"
+
   fmt:
     name: fmt
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -41,21 +75,23 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt
-      - run: cargo fmt --all --check
+      - run: make fmt-check
 
   # Default features are pure CPU (ADR-0006). Every optional capability is a
   # feature, and a feature no job builds is a feature that is already broken —
   # so each one is linted here, on a runner that has none of the hardware.
   clippy:
     name: clippy (${{ matrix.features.name }})
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         features:
-          - { name: default, args: "--workspace --all-targets" }
-          - { name: cuda,    args: "-p oxidelake-runtime --all-targets --features cuda" }
-          - { name: predict, args: "-p oxidelake-runtime --all-targets --features predict" }
+          - { name: default, target: lint }
+          - { name: cuda, target: lint-cuda }
+          - { name: predict, target: lint-predict }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -70,14 +106,23 @@ jobs:
             /usr/local/.ghcup /usr/local/share/powershell 2>/dev/null || true
       - name: clippy
         env:
-          ARGS: ${{ matrix.features.args }}
+          TARGET: ${{ matrix.features.target }}
         # Through the environment, never interpolated into the script:
         # a matrix value is data, and data does not get to be shell.
-        run: cargo clippy $ARGS -- -D warnings
+        run: make "$TARGET"
 
   test:
-    name: test (linux)
+    name: test (linux, ${{ matrix.lane.name }})
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        lane:
+          - { name: default, target: test }
+          - { name: io-uring, target: test-io-uring }
+          - { name: predict, target: test-predict }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -89,24 +134,41 @@ jobs:
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
             /usr/local/.ghcup /usr/local/share/powershell 2>/dev/null || true
-      - name: default features
-        run: cargo test --workspace --locked
-      - name: storage with io-uring (Linux only)
-        run: cargo test -p oxidelake-storage --features io-uring --locked
-      - name: predict against the model it loaded
-        run: cargo test -p oxidelake-compute --features predict --test predict --locked
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: github.workflow == 'CI' && !inputs.clean
+        with:
+          key: ${{ runner.os }}-${{ runner.arch }}-test-${{ matrix.lane.name }}
+          cache-bin: false
+          cache-workspace-crates: false
+      - name: Test the selected feature configuration
+        env:
+          TARGET: ${{ matrix.lane.target }}
+        run: make "$TARGET"
       - name: predict adds no second CUDA stack
+        if: matrix.lane.name == 'predict'
         run: make check-predict-no-second-cuda
       - name: cuda feature compiles with no CUDA installed
-        run: cargo check -p oxidelake-runtime --features cuda --locked
+        if: matrix.lane.name == 'default'
+        run: make check-cuda
       - name: dependency chain is coherent
+        if: matrix.lane.name == 'default'
         run: make coherence
+      - name: Upload Cargo build timings
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: timings-linux-${{ matrix.lane.name }}
+          path: target/cargo-timings/*.html
+          retention-days: 7
+          if-no-files-found: ignore
 
   # The Metal lane. Device-independent tests always; the on-device conformance
   # suite only when the runner exposes a Metal device (asked of the Metal API
   # itself, not system_profiler — virtualised runners lie to the latter).
   metal:
     name: metal (macos)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -116,29 +178,32 @@ jobs:
         with:
           toolchain: stable
           components: clippy
-      - run: cargo clippy -p oxidelake-runtime --all-targets --features metal -- -D warnings
-      - run: cargo test -p oxidelake-memory -p oxidelake-device -p oxidelake-compute -p oxidelake-runtime --features metal --locked
-      # The PTY suite runs here too. Terminal behaviour is one of the few
-      # things that genuinely differs between Linux and macOS, and until this
-      # line the corrected resize snapshot had only ever been checked on Linux.
-      - run: cargo test -p oxidelake-tui --locked
-      - name: Detect a Metal device
-        id: metal
-        run: |
-          if swift -e 'import Metal; exit(MTLCreateSystemDefaultDevice() == nil ? 1 : 0)' 2>/dev/null; then
-            echo "present=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "present=false" >> "$GITHUB_OUTPUT"
-            echo "No Metal device on this runner — on-device conformance skipped."
-          fi
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: github.workflow == 'CI' && !inputs.clean
+        with:
+          key: ${{ runner.os }}-${{ runner.arch }}-metal
+          cache-bin: false
+          cache-workspace-crates: false
+      - run: make lint-metal
+      - name: Metal package tests and macOS PTY suite
+        run: make test-metal
       - name: conformance suite on the Metal device
-        if: steps.metal.outputs.present == 'true'
-        run: cargo test -p oxidelake-compute --features metal --locked -- --ignored
+        run: make test-metal-device
+      - name: Upload Cargo build timings
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: timings-metal
+          path: target/cargo-timings/*.html
+          retention-days: 7
+          if-no-files-found: ignore
 
   # The declared rust-version must actually build the workspace against the
   # committed lockfile. This is what makes `rust-version` a verified claim.
   msrv:
     name: msrv
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -157,6 +222,8 @@ jobs:
 
   docs:
     name: docs
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -165,12 +232,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: stable
-      - run: cargo doc --workspace --no-deps --all-features
+      - run: make doc
 
   # Supply chain: RustSec advisories, license allow-list, banned crates and
   # registry sources — exactly what `make deny` runs locally (deny.toml).
   deny:
     name: deny
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -218,12 +287,13 @@ jobs:
   required-green:
     name: required-green
     if: always()
-    needs: [fmt, clippy, test, metal, msrv, docs, deny, release-scripts, zizmor]
+    needs: [changes, fmt, clippy, test, metal, msrv, docs, deny, release-scripts, zizmor]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - name: Verify every needed job succeeded
         env:
           NEEDS: ${{ toJSON(needs) }}
-        run: |
-          echo "$NEEDS" | jq .
-          echo "$NEEDS" | jq -e 'to_entries | all(.value.result == "success")' > /dev/null
+        run: python3 .github/scripts/ci-policy.py gate

@@ -16,7 +16,7 @@ is the full contributor document and wins wherever the two disagree.
 - `crates/oxidelake-planner|runtime|storage|api|tui` — placement rule and plan
   codec, sessions and the three binaries, Parquet/Arrow IPC, the DataFrame
   surface, and the terminal dashboard.
-- `docs/decisions/` — fifteen ADRs. **Read the one that covers what you are
+- `docs/decisions/` — the ADRs. **Read the one that covers what you are
   touching before you touch it**; most non-obvious choices here are recorded
   rather than inferable.
 

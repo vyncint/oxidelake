@@ -64,7 +64,9 @@ The tag triggers `release.yml`, which:
 
 1. fails unless the tag matches the workspace version **and** `CHANGELOG.md`
    has a non-empty section for it — both checked before anything irreversible;
-2. re-runs the full CI gate (`workflow_call` into `ci.yml`);
+2. re-runs the full CI gate without build caches or documentation skips
+   (`workflow_call` into `ci.yml`); ordinary main CI cancellation does not
+   cancel this release gate;
 3. runs `cargo-semver-checks` against the last published release — skipped on
    the first release, when there is no baseline;
 4. publishes the nine crates in dependency order (`core → memory → device →

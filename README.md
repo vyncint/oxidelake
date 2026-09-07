@@ -167,7 +167,18 @@ OXIDE_BACKEND=cuda cargo test -p oxidelake-compute --features cuda -- --ignored
 
 ## Verification
 
-Every change lands behind the same gate — `make gate`: fmt, clippy `-D warnings` on the default/cuda/metal features, the full test suite, doc build, dependency-coherence check and `cargo deny` — run locally and in [CI](.github/workflows/ci.yml) as four jobs: the Linux gate, `cargo deny`, an MSRV build with the declared `rust-version`, and a macOS job that executes the Metal conformance suite on the runner's GPU (asserting device execution through the operator transfer counters). The honesty rule from [docs/verification.md](docs/verification.md) applies throughout: nothing is claimed as working unless it ran; GPU paths that only compiled are recorded as exactly that in [STATUS.md](STATUS.md). The 2026-09-02 security and performance audit, with every finding's status, is in [docs/audit-2026-09-02.md](docs/audit-2026-09-02.md).
+Every change lands behind `required-green` and `commit-policy`. `make gate`
+runs formatting, feature-specific Clippy, the test suites, all-feature rustdoc,
+dependency-coherence and supply-chain checks, plus release and CI script tests.
+[CI](.github/workflows/ci.yml) separates the Linux feature tests and checks the
+MSRV; macOS runs Metal and PTY tests and executes conformance when a Metal
+device exists. Dependency caching reuses compilation while tests still run;
+release CI retains a clean full gate. Known documentation-only changes may
+skip Rust jobs under the tested [verification policy](docs/verification.md).
+The honesty rule applies throughout: nothing is claimed as working unless it
+ran; GPU paths that only compiled are recorded as exactly that in
+[STATUS.md](STATUS.md). The 2026-09-02 security and performance audit, with
+every finding's status, is in [docs/audit-2026-09-02.md](docs/audit-2026-09-02.md).
 
 ## Contributing
 

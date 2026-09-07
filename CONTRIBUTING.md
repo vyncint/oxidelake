@@ -33,7 +33,7 @@ always `-p <crate>` — `cargo check -p oxidelake-runtime --features cuda`.
 
 See [AGENTS.md](AGENTS.md) for the crate-by-crate map, and
 [docs/architecture.md](docs/architecture.md) for how the layers fit together.
-The fifteen ADRs under [docs/decisions/](docs/decisions/README.md) record the
+The ADRs under [docs/decisions/](docs/decisions/README.md) record the
 non-obvious choices; read the one covering what you are touching first.
 
 ## 3. Testing policy
@@ -149,8 +149,13 @@ allowlist is a list on purpose, so that widening it is a visible decision.
 - Branch from `main`; name branches `feat/…`, `fix/…`, `docs/…`, `ci/…`.
 - PRs are **squash-merged** — keep the PR title in Conventional Commit form,
   since it becomes the commit subject on `main`. Branches are deleted on merge.
-- Required checks: `required-green` (fmt, clippy on default/cuda/predict, test, metal, msrv, docs, deny, release-scripts, zizmor), plus `commit-policy` (DCO + attribution). All
-  must pass before merge; direct pushes to `main` are blocked by a ruleset.
+- Required checks: `required-green` (CI policy, fmt, clippy on
+  default/cuda/predict, Linux tests on default/io-uring/predict, Metal and PTY
+  tests, MSRV, docs, deny, release scripts, zizmor), plus `commit-policy`
+  (DCO + attribution). Both must pass before merge; direct pushes to `main`
+  are blocked by a ruleset. Only known documentation-only changes may skip
+  Rust jobs; failures and unexpected skips still fail `required-green`.
+  [Verification](docs/verification.md) explains the cache and skip policy.
 - **Every change lands with a test, and the test must be able to fail.** If
   you add a guard, break it once and watch it go red before you commit.
 - **Say what you did not do.** A PR that lists what it left out and why is

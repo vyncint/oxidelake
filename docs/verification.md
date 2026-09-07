@@ -2,36 +2,83 @@
 
 ## The gate
 
-Run after every phase; every command must pass before that phase's commit. `make gate` runs the list below (plus `cargo deny`, and the io_uring / Metal lanes on the platforms that have them); [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) runs the same list on every pull request as one job per concern — `fmt`, `clippy` (default / `cuda` / `predict`), `test` (Linux: default, io_uring, predict, coherence), `metal` (macOS: the Metal lane and the PTY suite), `msrv`, `docs` (all features, warnings denied), `deny`, `release-scripts`, `zizmor` — aggregated by `required-green`, the one check branch protection requires. `commit-policy` runs beside it. Keep the Makefile, this page and the workflow in sync.
+Run after every phase; every command must pass before that phase's commit. `make gate` runs the checks below, including MSRV, plus the io_uring lane on Linux and the full Metal lane on macOS. [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) uses the same Make targets. `commit-policy` runs beside it. Keep the Makefile, this page and the workflow in sync.
+
+CI separates default, io_uring and predict tests into three Linux jobs. Clippy
+also has default / CUDA / predict jobs. macOS runs Metal lint, Metal package
+tests together with the PTY suite, then on-device conformance when a device is
+available. The remaining checks are MSRV, all-feature rustdoc, `cargo deny`,
+release scripts, crate metadata, CI policy tests and `zizmor`. `required-green`
+aggregates their results under the stable name required by branch protection.
 
 ```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo clippy -p oxidelake-runtime --all-targets --features cuda -- -D warnings   # from Phase 2
-cargo test --workspace
-cargo test -p oxidelake-storage --features io-uring                              # from Phase 4 (Linux)
-cargo check -p oxidelake-runtime --features cuda                                 # GPU code builds with no CUDA installed
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
-cargo tree --workspace -d -e normal        # must list no duplicate arrow-* / parquet / datafusion* / object_store / tonic / prost majors
+make fmt-check lint lint-cuda lint-predict
+make test test-predict
+make test-io-uring                    # Linux only
+make check-cuda check-predict-no-second-cuda
+make doc coherence deny
+make release-scripts crate-metadata ci-scripts zizmor
 ```
 
 The Metal lane (macOS, since 2026-09-01 — CI runs it as the `metal` job on a
 macOS arm64 runner):
 
 ```bash
-cargo clippy -p oxidelake-runtime --all-targets --features metal -- -D warnings
-cargo test -p oxidelake-memory -p oxidelake-device -p oxidelake-compute -p oxidelake-runtime --features metal
-cargo test -p oxidelake-compute --features metal -- --ignored   # conformance ON the Metal device; needs one
+make lint-metal test-metal test-metal-device
 ```
+
+`test-metal` and `test-metal-device` use the same package/feature arguments,
+including the TUI test targets, so Cargo can reuse their dependencies and test
+binaries. The latter probes `MTLCreateSystemDefaultDevice()` and logs a skip
+when no device exists. Otherwise it sets `OXIDE_BACKEND=metal` and runs the
+ignored conformance test, which asserts GPU transfers as well as correct
+results. CPU fallback alone cannot satisfy it.
 
 Supply chain and toolchain claims are part of the gate too:
 
 ```bash
-cargo deny check                      # RustSec advisories, license allow-list, banned crates, registry sources (deny.toml)
+make deny                             # all-feature RustSec/license/ban/source checks
 make msrv                             # the declared rust-version really builds the workspace (CI job `msrv`)
 ```
 
 Every `deny.toml` ignore carries the reason the affected code path is unreachable in OxideLake and is revisited when the dependency chain moves ([dependencies.md](dependencies.md)).
+
+## CI reuse, selective checks and measurement
+
+Ordinary PR/main CI caches external dependencies for the Linux test lanes and
+Metal job. Each lane has its own OS/architecture key; the pinned cache action
+also keys by compiler, manifests, lockfile and compiler environment. Workspace
+crates and installed tools are excluded. All Cargo commands still run after a
+cache hit. Clippy/MSRV/rustdoc keep their independent checks; initially their
+shorter builds are uncached to limit cache storage and eviction.
+
+The release workflow always runs a full gate without restoring or saving build
+caches. Manual CI dispatch also runs the full gate and accepts `clean=true`
+to bypass caches. Ordinary main/PR CI cancels a superseded run; reusable release
+gates and manual runs are not cancelled by that policy. See [ADR-0017](decisions/ADR-0017-ci-dependency-reuse.md).
+
+The `changes` job tests the CI scripts and classifies the actual checkout diff.
+Only Markdown under `docs/` and the explicit root documentation allowlist in
+`.github/scripts/ci-policy.py` can skip Rust jobs. `README.md`, crate files,
+workflows, scripts, lockfiles and unknown paths still run the full gate. Missing
+base commits and empty diffs also run it. Release scripts, package metadata,
+CI policy tests and workflow security checks always run. `required-green`
+allows only these documented skips; any failure, cancellation, missing job or
+invalid classification fails the gate.
+
+`make ci-scripts` covers source deletion/rename handling, malformed results,
+each required job's failures, Metal build-argument reuse, and stress coverage.
+It also verifies the metadata checker under the platform's Bash and the MSRV
+target with a standalone Cargo ahead of the Rustup proxy on `PATH`.
+`make stress-tui` builds release test targets once per OS, then runs thread
+counts 1, 4 and 16 with 20/40/40 percent of `ITERS` (default 100), at least once
+per count. The first failing build or iteration fails the workflow.
+
+Test builds emit Cargo `--timings` reports. CI and stress upload these as
+`timings-*` artifacts retained for seven days. Compare a clean run, a warm run,
+and a small source change on the same toolchain; record queue time separately
+from job execution and include cache transfer time and aggregate runner minutes.
+Do not describe expected cache or parallelism gains as measured speedups.
 
 Why the GPU gate is `-p oxidelake-runtime --features cuda`: the workspace root is virtual and rejects `--features`; `oxidelake-runtime` forwards `cuda` / `metal` / `io-uring` into the crates that implement them, so one command covers the whole GPU code path. It must pass on a machine with **no CUDA installed** — cudarc runs in `dynamic-loading` mode and kernels are JIT-compiled at runtime ([ADR-0003](decisions/ADR-0003-cudarc-dynamic-loading-nvrtc.md), [ADR-0006](decisions/ADR-0006-pure-cpu-default-features-forwarded.md)).
 
