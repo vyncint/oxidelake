@@ -83,10 +83,15 @@ safetensors = "0.8"                  # reading a model's header to recover its s
 
 # test-only
 insta = "1"
-termlens = "0.9"
+# `serde` is on because the PTY suite round-trips a screen through JSON — the
+# exact bytes `TERMLENS_ARTIFACT_DIR` writes when a wait fails in CI, so the
+# artefact a failure leaves behind is a format this suite has read back. It
+# also makes those artefacts `.screen.json` rather than `.screen.txt`.
+termlens = { version = "0.10", features = ["serde"] }
 assert_cmd = "2"
 tempfile = "3"
 rand = "0.10"
+serde_json = "1"                     # reading a serialized termlens Screen back
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

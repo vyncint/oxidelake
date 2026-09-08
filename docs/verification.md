@@ -8,7 +8,10 @@ CI separates default, io_uring and predict tests into three Linux jobs. Clippy
 also has default / CUDA / predict jobs. macOS runs Metal lint, Metal package
 tests together with the PTY suite, then on-device conformance when a device is
 available. The remaining checks are MSRV, all-feature rustdoc, `cargo deny`,
-release scripts, crate metadata, CI policy tests and `zizmor`. `required-green`
+release scripts, crate metadata, CI policy tests, the vendored termlens
+skill's version and `zizmor`. The Linux and macOS test lanes run with
+`TERMLENS_ARTIFACT_DIR` set and, on failure, render every screen the PTY
+suite left behind into the job summary. `required-green`
 aggregates their results under the stable name required by branch protection.
 
 ```bash
@@ -17,8 +20,26 @@ make test test-predict
 make test-io-uring                    # Linux only
 make check-cuda check-predict-no-second-cuda
 make doc coherence deny
-make release-scripts crate-metadata ci-scripts zizmor
+make release-scripts crate-metadata ci-scripts skill-version zizmor
 ```
+
+`make skill-version` compares the `Written against **termlens X.Y.Z**` line in
+`.claude/skills/termlens/SKILL.md` with the `termlens` requirement in
+`Cargo.toml` (major.minor). CI runs it as the `skill-version` job.
+
+One CI step is deliberately **not** in `make gate`:
+
+```bash
+make test-termlens-cli                # installs termlens-cli from crates.io
+```
+
+It runs the `#[ignore]`d `oxidelake-tui/tests/termlens_cli.rs` suite, which
+drives the committed screens through the `termlens` command at the version
+`Cargo.lock` names. The gate has to run on a machine with no network, and a
+`cargo test` on a published crate must not install anything behind a
+contributor's back — so CI asks for it by name, in the default Linux test
+lane. The macOS on-device pass skips it (`--skip termlens_cli`) for the same
+reason.
 
 The Metal lane (macOS, since 2026-09-01 — CI runs it as the `metal` job on a
 macOS arm64 runner):
@@ -128,7 +149,10 @@ cargo test -p oxidelake-compute --features cuda -- --ignored
 | SQL UDFs | `oxidelake-compute/src/udf.rs` | `l2_distance` / `cosine_distance` against the reference kernels, null and coercion cases |
 | DataFrame API | `oxidelake-api/tests/dataframe.rs` | every verb against its SQL equivalent; GPU-target plans show `Gpu*Exec` for fluent pipelines |
 | TUI in-process | `oxidelake-tui/tests/tui_render_test.rs` | `ratatui::backend::TestBackend` + `insta` |
-| TUI end-to-end | `oxidelake-tui/tests/tui_pty_test.rs` | `termlens` driving `oxidelake-tui-demo` in a real PTY |
+| TUI end-to-end | `oxidelake-tui/tests/tui_pty_test.rs` | `termlens` driving `oxidelake-tui-demo` in a real PTY: three text snapshots, one styled, and the focus/backend colours as cell assertions |
+| TUI emulator invariants | `oxidelake-tui/tests/emulation.rs` | `Screen::unsupported()` pinned exactly, no terminal mode left set, snapshot-text and JSON round trips |
+| TUI saved screens | `oxidelake-tui/tests/termlens_cli.rs` | `termlens-cli` on the committed `.snap` files — `render`, and `diff`'s 0/1/2 exit codes (`#[ignore]`d; `make test-termlens-cli`) |
+| Shipped TUI binary | `oxidelake-runtime/tests/oxide_tui_pty.rs` | `oxide tui` in a PTY: the same frame `oxidelake-tui` snapshots, and no log line on the grid |
 | CLI end-to-end | `oxidelake-runtime/tests/cli.rs` | `assert_cmd` on `oxide` — `gen-data` output verified by an independent `parquet`-crate read; spawned `oxide-scheduler` + `oxide-worker` must print byte-identical `--cluster` results |
 
 ## Updating STATUS.md

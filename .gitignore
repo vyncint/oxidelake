@@ -9,6 +9,10 @@
 /data/
 /spill/
 
+# Python bytecode from the scripts under .github/scripts
+__pycache__/
+*.pyc
+
 # editors / OS
 .DS_Store
 .idea/

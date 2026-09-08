@@ -43,7 +43,16 @@ jobs:
       - name: Build once and exercise every thread count
         env:
           ITERS: ${{ inputs.iterations || '100' }}
+          # The whole point of this workflow is the one iteration in a hundred
+          # that fails, and a screen in a 45-minute log is the hardest place
+          # to read one. Every screen a failing wait carries is written here
+          # for the report step below (termlens 0.10).
+          TERMLENS_ARTIFACT_DIR: ${{ runner.temp }}/termlens
         run: make stress-tui
+      - uses: vyncint/termlens/.github/actions/report@e1b96c8203fd727fa3458af395719c429966ee82 # v0.10.1
+        if: failure()
+        with:
+          name: termlens-report-stress-${{ matrix.os }}
       - name: Upload Cargo build timings
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

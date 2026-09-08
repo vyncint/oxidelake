@@ -9,6 +9,14 @@ authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 documentation = "https://docs.rs/oxidelake-runtime"
+# Kept out of the published archive: it compares `oxide tui` against a screen
+# snapshot committed in `crates/oxidelake-tui`, which is deliberately a *sibling
+# crate's* file — two independent snapshots of the same frame would drift
+# together silently, so the cross-crate read is the point. That path does not
+# exist once this crate is unpacked on its own, and a published test that
+# cannot find its fixture is a failure handed to whoever runs `cargo test` on
+# the vendored source. It runs in the workspace, where the file is there.
+exclude = ["tests/oxide_tui_pty.rs"]
 readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
@@ -51,6 +59,9 @@ arrow.workspace = true
 assert_cmd.workspace = true
 parquet.workspace = true
 tempfile.workspace = true
+# `oxide tui` is the dashboard as users install it; assert_cmd cannot see a
+# PTY, so the shipped binary's terminal behaviour is tested with termlens.
+termlens.workspace = true
 
 [[bin]]
 name = "oxide"

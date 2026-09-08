@@ -1,0 +1,46 @@
+---
+source: crates/oxidelake-tui/tests/tui_pty_test.rs
+expression: __screen.with_styles()
+---
+size: 80x24  cursor: hidden
+OxideLake  data/t.parquet — SELECT k, sum(v), count(v) FROM t WHERE k >= 2 AND v
+┌ Plan DAG ────────────────────────────┐┌ Telemetry ───────────────────────────┐
+│▶ GpuAggregateExec [CUDA]             ││█████████████████████████████         │
+│    └─ GpuFilterExec [CUDA]           ││███████VRAM: 6.0 GiB / 8.0 GiB        │
+│      └─ DataSourceExec [CPU]         ││██████████████                        │
+│                                      ││████pinned RAM: 1.5 GiB / 4.0 GiB     │
+│                                      ││██████████                            │
+│                                      ││███disk spill: 512.0 MiB / 2.0 GiB    │
+│                                      ││PCIe  H2D 35.3 MiB  D2H 18.6 MiB      │
+│                                      ││NVMe  spilled 3.0 GiB (42 demotions)  │
+│                                      │└──────────────────────────────────────┘
+│                                      │┌ Describe ────────────────────────────┐
+└──────────────────────────────────────┘│colu type min  max  nul p25  p50  p99 │
+┌ Inspector ───────────────────────────┐│k    Int6 0    99   0   24   49   98  │
+│GpuAggregateExec [CUDA]               ││v    Floa 0.0  24.0 769 6.0  12.0 23.7│
+│group_by=[k], aggr=[SUM(v), COUNT(v)] ││s    Utf8 s0   s6   0                 │
+│                                      ││                                      │
+│rows in              812400           ││                                      │
+│rows out                  9           ││                                      │
+│batches                 100           ││                                      │
+│latency/batch      1.840 ms           ││                                      │
+│memory             16.0 MiB           ││                                      │
+└──────────────────────────────────────┘└──────────────────────────────────────┘
+ ↑/↓ select operator  Tab next panel  q quit
+
+styles:
+0: 0-8 fg=6 bold
+1: 0-39 fg=3 bold
+2: 0 fg=3 bold; 1-19 bg=8 bold; 20-25 fg=2 bg=8 bold; 26-38 bg=8 bold; 39 fg=3 bold; 41-78 fg=2
+3: 0 fg=3 bold; 8-20 bold; 22-27 fg=2 bold; 39 fg=3 bold; 41-47 fg=2; 48-69 bg=2; 70-78 fg=2
+4: 0 fg=3 bold; 10-23 bold; 25-29 fg=4 bold; 39 fg=3 bold; 41-78 fg=6
+5: 0 fg=3 bold; 39 fg=3 bold; 41-44 fg=6; 45-54 bg=6; 55-78 fg=6
+6: 0 fg=3 bold; 39 fg=3 bold; 41-78 fg=3
+7: 0 fg=3 bold; 39 fg=3 bold; 41-43 fg=3; 44-50 bg=3; 51-78 fg=3
+8: 0 fg=3 bold; 39 fg=3 bold
+9: 0 fg=3 bold; 39 fg=3 bold
+10: 0 fg=3 bold; 39 fg=3 bold
+11: 0 fg=3 bold; 39 fg=3 bold
+12: 0-39 fg=3 bold; 41-78 bold
+14: 1-16 bold; 18-23 fg=2 bold
+23: 0-4 bold; 22-24 bold; 38 bold
