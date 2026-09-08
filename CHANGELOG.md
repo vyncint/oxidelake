@@ -8,6 +8,56 @@ versions (0.x) may contain breaking changes; they are always listed under a
 
 ## [Unreleased]
 
+### Changed
+
+- **The PTY test harness moved to termlens 0.10.1** (from 0.9). The three
+  committed screen snapshots are unchanged: `assert_screen_snapshot!` records
+  styles by default in 0.10, and the text snapshots opt out with
+  `styles = false` so a colour change lands in one new styled snapshot rather
+  than rewriting three large files. The vendored agent skill
+  (`.claude/skills/termlens/SKILL.md`) was refreshed to match and is now
+  checked against the dependency by `make skill-version`, a CI job — it had
+  drifted two releases behind without anything noticing.
+
+### Added
+
+- **The dashboard's colours are tested.** Nothing asserted them before:
+  `TestBackend::to_string()` is text-only and the PTY snapshots were plain,
+  so the focused panel's yellow border and the green/blue backend tags were
+  invisible to the whole suite. `[CUDA]` is now green and `[CPU]` blue at
+  *every* occurrence (`Screen::find_all`), `Tab` is asserted to move the
+  highlight without changing one character of text, and `↓` is asserted to
+  leave the telemetry gauges and the Describe table untouched
+  (`Screen::diff`).
+
+- **`crates/oxidelake-tui/tests/emulation.rs`**: the invariant the rest of the
+  PTY suite rests on. `Screen::unsupported()` is pinned to exactly
+  `["^[[59m"]` — ratatui's underline-colour reset, which changes no cell — so
+  a sequence the emulator silently drops can no longer make every screen
+  assertion true against a wrong grid. Insert mode, bells, wrapped rows and
+  mouse modes are pinned beside it, and a dashboard screen is round-tripped
+  through the snapshot text format and through JSON.
+
+- **`crates/oxidelake-runtime/tests/oxide_tui_pty.rs`**: `oxide tui` — the
+  dashboard as users install it — in a real PTY. It renders the same frame
+  `oxidelake-tui` snapshots, it gives the terminal back, and the `tracing`
+  subscriber writing to stderr (the dashboard's own stream in a terminal)
+  puts nothing on the grid, `RUST_LOG=info` included. `assert_cmd` captures
+  pipes and could see none of that.
+
+- **`crates/oxidelake-tui/tests/termlens_cli.rs`**: the committed `.snap`
+  files read back with `termlens-cli` — `render --text/--svg/--html` keeping
+  the palette, and `diff`'s 0/1/2 exit codes on this repository's own
+  screens. `#[ignore]`d, because a published crate's `cargo test` must not
+  install a tool behind a contributor's back; CI runs it as
+  `make test-termlens-cli`.
+
+- **CI renders a failing PTY screen instead of logging it.** The Linux and
+  macOS test lanes run with `TERMLENS_ARTIFACT_DIR` set, and on failure the
+  pinned `vyncint/termlens` report action writes every screen the suite left
+  behind — and every insta `.snap.new` — into the job summary, with SVG and
+  HTML uploaded.
+
 ### Fixed
 
 - **The dashboard's Describe panel no longer prints a truncated percentile as

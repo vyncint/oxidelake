@@ -29,9 +29,10 @@ The pins live in [SPEC.md §4](SPEC.md). This page records *why* those numbers, 
 | `objc2-metal` | 0.3 | `objc2 >=0.6.2, <0.8`, `objc2-foundation ^0.3.2` | macOS target-gated, behind `metal` |
 | `objc2` / `objc2-foundation` | 0.6 / 0.3 | — | |
 | `io-uring` | 0.7 | — | Linux target-gated, behind `io-uring`; chosen over `tokio-uring` 0.5, which pins `io-uring ^0.6` and needs its own runtime ([ADR-0007](decisions/ADR-0007-io-uring-crate-dedicated-thread.md)) |
-| `termlens` | 0.6 (dev) | default feature `insta` | real-PTY harness driving `oxidelake-tui-demo`; MSRV 1.85; read <https://docs.rs/termlens/0.6.1> before use |
+| `termlens` | 0.10 (dev) | default feature `insta`; feature `serde` | real-PTY harness driving `oxidelake-tui-demo` and `oxide tui`; MSRV 1.85; `serde` is what `TERMLENS_ARTIFACT_DIR` writes in CI and what `tests/emulation.rs` round-trips; read <https://docs.rs/termlens/0.10.1> before use, and refresh `.claude/skills/termlens/SKILL.md` with the dependency (`make skill-version`) |
 | `insta` | 1 (dev) | — | snapshot files are committed |
-| `assert_cmd` | 2 (dev) | — | CLI end-to-end tests, including the spawned scheduler + worker |
+| `assert_cmd` | 2 (dev) | — | CLI end-to-end tests, including the spawned scheduler + worker; it captures pipes, so anything about a *terminal* is a termlens test |
+| `serde_json` | 1 (dev) | — | reads a serialized termlens `Screen` back in `oxidelake-tui/tests/emulation.rs`; already in the lockfile through DataFusion |
 | `postcard` | 1 (`use-std`) | `serde` | codec payloads for `Gpu*Exec` parameters |
 | `rand` | 0.10 (dev) | — | seeded generators only |
 | `thiserror` / `anyhow` | 2 / 1 | — | libraries / binaries |

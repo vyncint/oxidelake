@@ -10,7 +10,7 @@ import sys
 
 
 RUST_JOBS = {"fmt", "clippy", "test", "metal", "msrv", "docs", "deny"}
-ALWAYS_JOBS = {"changes", "release-scripts", "zizmor"}
+ALWAYS_JOBS = {"changes", "release-scripts", "skill-version", "zizmor"}
 ROOT_DOCS = {"CHANGELOG.md", "CONTRIBUTING.md", "AGENTS.md", "CODE_OF_CONDUCT.md", "SECURITY.md"}
 
 

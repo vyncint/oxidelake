@@ -143,7 +143,23 @@ jobs:
       - name: Test the selected feature configuration
         env:
           TARGET: ${{ matrix.lane.target }}
+          # Every screen a failing termlens wait carries is also written
+          # here, so the `report` step below can put it in the job summary
+          # instead of leaving it in a log someone has to scroll. The TUI
+          # PTY suite is a flake target (that is what stress.yml is for) and
+          # a flake in CI used to leave nothing but scrollback (termlens
+          # 0.10).
+          TERMLENS_ARTIFACT_DIR: ${{ runner.temp }}/termlens
         run: make "$TARGET"
+      # `#[ignore]`d so a plain `cargo test` never installs anything behind a
+      # contributor's back — these crates are published. CI is where they
+      # should run, so CI asks for them by name. The install is the version
+      # Cargo.lock names, so the tool and the library are one release.
+      - name: termlens-cli against the committed screens
+        if: matrix.lane.name == 'default'
+        env:
+          TERMLENS_ARTIFACT_DIR: ${{ runner.temp }}/termlens
+        run: make test-termlens-cli
       - name: predict adds no second CUDA stack
         if: matrix.lane.name == 'predict'
         run: make check-predict-no-second-cuda
@@ -153,6 +169,14 @@ jobs:
       - name: dependency chain is coherent
         if: matrix.lane.name == 'default'
         run: make coherence
+      # A PTY failure is a picture, and a log is the worst place to read one.
+      # This renders every screen the suite left behind — and every insta
+      # `.snap.new` — into the job summary, with SVG and HTML uploaded. It
+      # installs termlens-cli itself, so nothing else here has to.
+      - uses: vyncint/termlens/.github/actions/report@e1b96c8203fd727fa3458af395719c429966ee82 # v0.10.1
+        if: failure()
+        with:
+          name: termlens-report-linux-${{ matrix.lane.name }}
       - name: Upload Cargo build timings
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -186,9 +210,19 @@ jobs:
           cache-workspace-crates: false
       - run: make lint-metal
       - name: Metal package tests and macOS PTY suite
+        env:
+          TERMLENS_ARTIFACT_DIR: ${{ runner.temp }}/termlens
         run: make test-metal
       - name: conformance suite on the Metal device
+        env:
+          TERMLENS_ARTIFACT_DIR: ${{ runner.temp }}/termlens
         run: make test-metal-device
+      # macOS is the leg where the PTY suite times out first, and the one
+      # nobody can reproduce locally on a Linux box.
+      - uses: vyncint/termlens/.github/actions/report@e1b96c8203fd727fa3458af395719c429966ee82 # v0.10.1
+        if: failure()
+        with:
+          name: termlens-report-metal
       - name: Upload Cargo build timings
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -268,6 +302,20 @@ jobs:
           toolchain: stable
       - run: ./.github/scripts/check-crate-metadata.sh
 
+  # The vendored termlens skill is refreshed by hand, and a stale copy is
+  # silent: agents working here get guidance for a version that is no longer
+  # the dependency. Nothing can diff it against upstream — the published
+  # crate does not ship the skill — but the two versions agreeing is
+  # checkable, and that is the drift that happens (`make skill-version`).
+  skill-version:
+    name: skill version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - run: make skill-version
+
   # Workflow security audit: unpinned actions, credential persistence,
   # template injection. Accepted findings live in .github/zizmor.yml.
   zizmor:
@@ -287,7 +335,7 @@ jobs:
   required-green:
     name: required-green
     if: always()
-    needs: [changes, fmt, clippy, test, metal, msrv, docs, deny, release-scripts, zizmor]
+    needs: [changes, fmt, clippy, test, metal, msrv, docs, deny, release-scripts, skill-version, zizmor]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7

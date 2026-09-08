@@ -24,6 +24,7 @@ crossterm.workspace = true
 [dev-dependencies]
 insta.workspace = true
 termlens.workspace = true
+serde_json.workspace = true
 
 [[bin]]
 name = "oxidelake-tui-demo"

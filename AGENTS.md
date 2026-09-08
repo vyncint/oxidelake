@@ -48,6 +48,18 @@ lockfile.
 - **The TUI emits DEC 2026 synchronized updates**, which most ratatui apps do
   not — so its PTY tests use termlens's `wait_frame`, not `snapshot_after`.
   A snapshot taken any other way can catch a half-painted screen, and did.
+- **`.claude/skills/termlens/SKILL.md` is a vendored copy, and `make gate`
+  checks its version against the dependency.** Bumping `termlens` in
+  `Cargo.toml` means copying the skill over in the same change
+  (`cp ../termlens/skills/termlens/SKILL.md .claude/skills/termlens/SKILL.md`);
+  the `skill-version` job fails otherwise. Guidance for a version that is no
+  longer here is worse than none.
+- **The three text screen snapshots are text on purpose.** termlens 0.10
+  records styles by default; `tui_pty_test.rs` passes `styles = false` there
+  and keeps the colours in one styled snapshot plus direct cell assertions,
+  so a colour change does not rewrite three large files. `emulation.rs` pins
+  what the emulator could not render — read it before trusting a screen
+  assertion that suddenly went green.
 
 ## The rules that will fail CI
 

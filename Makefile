@@ -15,7 +15,7 @@ UNAME := $(shell uname -s)
 # selecting compute alone rebuilt Arrow/DataFusion for the second pass in CI.
 METAL_TEST_ARGS := -p oxidelake-memory -p oxidelake-device -p oxidelake-compute -p oxidelake-runtime -p oxidelake-tui --features oxidelake-runtime/metal --locked --timings
 
-.PHONY: help fmt fmt-check lint lint-cuda lint-metal lint-predict test test-predict test-io-uring test-metal test-metal-device check-cuda check-predict-no-second-cuda doc coherence deny gate metal msrv quickstart clean-data release-scripts crate-metadata zizmor ci-scripts stress-tui
+.PHONY: help fmt fmt-check lint lint-cuda lint-metal lint-predict test test-predict test-io-uring test-termlens-cli test-metal test-metal-device check-cuda check-predict-no-second-cuda doc coherence deny gate metal msrv quickstart clean-data release-scripts crate-metadata skill-version zizmor ci-scripts stress-tui
 
 help: ## list targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-14s %s\n", $$1, $$2}'
@@ -73,12 +73,25 @@ test: ## the full default-feature test suite
 test-io-uring: ## io_uring object store tests (Linux; skips with a reason where io_uring is denied)
 	$(CARGO) test -p oxidelake-storage --features io-uring --locked --timings
 
+# Not part of `make gate`: it installs termlens-cli from crates.io at the
+# version Cargo.lock names, and the gate has to run on a machine with no
+# network. CI runs it in the default Linux test lane (docs/verification.md).
+# The tests are #[ignore]d for the same reason — a `cargo test` on a
+# published crate must not install anything behind a contributor's back.
+test-termlens-cli: ## the termlens-cli suite against the committed screens (installs termlens-cli)
+	$(CARGO) test -p oxidelake-tui --test termlens_cli --locked -- --ignored
+
 test-metal: ## Metal package tests and macOS PTY tests with one dependency graph
 	$(CARGO) test $(METAL_TEST_ARGS)
 
+# `--skip termlens_cli` keeps this pass off the network: the graph includes
+# -p oxidelake-tui, whose `termlens_cli` tests are #[ignore]d (so `--ignored`
+# selects them) and install a tool from crates.io. Every test in that file is
+# named with the prefix for exactly this. The conformance suite is what this
+# target is for.
 test-metal-device: ## reuse the Metal test graph for on-device conformance
 	@if swift -e 'import Metal; exit(MTLCreateSystemDefaultDevice() == nil ? 1 : 0)' 2>/dev/null; then \
-	  OXIDE_BACKEND=metal $(CARGO) test $(METAL_TEST_ARGS) -- --ignored; \
+	  OXIDE_BACKEND=metal $(CARGO) test $(METAL_TEST_ARGS) -- --ignored --skip termlens_cli; \
 	else \
 	  echo "No Metal device on this runner — on-device conformance skipped."; \
 	fi
@@ -105,13 +118,16 @@ ci-scripts: ## CI change detection, required results, Metal build reuse and stre
 stress-tui: ## build once and stress all three thread counts (ITERS defaults to 100)
 	python3 .github/scripts/stress-tui.py
 
+skill-version: ## the vendored termlens skill names the version the workspace depends on
+	./.github/scripts/check-skill-version.sh
+
 zizmor: ## workflow security audit at the level CI enforces (cargo install --locked zizmor --version 1.29.0)
 	zizmor --persona=pedantic --offline .github/workflows/
 
 deny: ## advisories, licenses, bans and sources (cargo-deny)
 	$(CARGO) deny --all-features check
 
-gate: fmt-check lint lint-cuda lint-predict test test-predict check-cuda check-predict-no-second-cuda doc coherence deny release-scripts crate-metadata ci-scripts zizmor msrv ## the whole quality gate — the same list CI runs
+gate: fmt-check lint lint-cuda lint-predict test test-predict check-cuda check-predict-no-second-cuda doc coherence deny release-scripts crate-metadata ci-scripts skill-version zizmor msrv ## the whole quality gate — the same list CI runs
 ifeq ($(UNAME),Linux)
 	$(MAKE) test-io-uring
 endif

@@ -221,6 +221,50 @@ class MetadataTests(unittest.TestCase):
         self.assertNotEqual(self.run_metadata(packaged=False).returncode, 0)
 
 
+class SkillVersionTests(unittest.TestCase):
+    """The vendored termlens skill must name the dependency's major.minor."""
+
+    def run_check(self, skill_version, dep_line):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scripts = root / ".github/scripts"
+            scripts.mkdir(parents=True)
+            script = scripts / "check-skill-version.sh"
+            script.write_text((SCRIPTS / script.name).read_text())
+            skill = root / ".claude/skills/termlens/SKILL.md"
+            skill.parent.mkdir(parents=True)
+            header = f"Written against **termlens {skill_version}**.\n" if skill_version else ""
+            skill.write_text("# Testing terminal programs with termlens\n\n" + header)
+            (root / "Cargo.toml").write_text(f"[workspace.dependencies]\n{dep_line}\n")
+            return subprocess.run(["/bin/bash", str(script)], text=True, capture_output=True, cwd=directory)
+
+    def test_a_matching_skill_passes_and_a_patch_release_is_not_drift(self):
+        for skill, dep in (("0.10.1", 'termlens = { version = "0.10", features = ["serde"] }'),
+                           ("0.10.0", 'termlens = "0.10"'),
+                           ("0.10.7", 'termlens = { version = "0.10.1" }')):
+            with self.subTest(skill=skill, dep=dep):
+                run = self.run_check(skill, dep)
+                self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+
+    def test_drift_fails_in_both_directions_and_says_so(self):
+        for skill, dep in (("0.9.0", 'termlens = { version = "0.10", features = ["serde"] }'),
+                           ("0.11.0", 'termlens = "0.10"'),
+                           ("1.0.0", 'termlens = "0.10"')):
+            with self.subTest(skill=skill, dep=dep):
+                run = self.run_check(skill, dep)
+                self.assertNotEqual(run.returncode, 0)
+                self.assertIn("::error::", run.stdout)
+
+    def test_an_unreadable_claim_is_a_failure_not_a_pass(self):
+        self.assertNotEqual(self.run_check("", 'termlens = "0.10"').returncode, 0)
+        self.assertNotEqual(self.run_check("0.10.1", "insta = \"1\"").returncode, 0)
+
+    def test_the_committed_skill_matches_the_committed_manifest(self):
+        run = subprocess.run(["/bin/bash", str(SCRIPTS / "check-skill-version.sh")],
+                             text=True, capture_output=True, cwd=ROOT)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+
+
 class ToolchainTests(unittest.TestCase):
     def test_msrv_uses_rustup_even_when_path_cargo_is_not_a_proxy(self):
         with tempfile.TemporaryDirectory() as directory:
