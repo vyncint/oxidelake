@@ -26,12 +26,11 @@ use termlens::{Key, Screen, Terminal};
 /// pinned exactly: anything joining it is a sequence that *might* change a
 /// cell and has to be read before the suite is trusted again.
 ///
-/// Note what is *not* here. termlens#320 reports `^[[5m` / `^[[25m` /
-/// `^[[9m` / `^[[29m` — blink and strikethrough — as unsupported although
-/// the attribute shadow implements them, so those four are false positives
-/// wherever they appear. This dashboard neither blinks nor strikes through
-/// (`render.rs` uses BOLD, a foreground and a background and nothing else),
-/// so they do not appear and this pin needs no exception.
+/// The pin needs no exception. It used to carry one: termlens reported
+/// blink and strikethrough as unsupported although its attribute shadow
+/// implements them (termlens#320), so those four sequences were false
+/// positives wherever they appeared. Fixed in termlens 0.10.2 — an entry
+/// here is a real gap now, whatever a dashboard's modifiers are.
 const EXPECTED_UNSUPPORTED: [&str; 1] = ["^[[59m"];
 
 fn spawn(cols: u16, rows: u16) -> termlens::Result<Terminal> {
@@ -42,22 +41,18 @@ fn spawn(cols: u16, rows: u16) -> termlens::Result<Terminal> {
     )
 }
 
-fn unsupported(screen: &Screen) -> Vec<String> {
-    screen.unsupported().iter().map(|s| s.to_string()).collect()
-}
-
 fn check(label: &str, screen: &Screen) {
+    // One comparison for both halves of the record: termlens 0.11's
+    // `Unsupported` view is equal to a slice only when the retained shapes
+    // match *and* nothing overflowed the bound, so a truncated record fails
+    // here rather than passing as a shorter list.
     assert_eq!(
-        unsupported(screen),
+        screen.unsupported(),
         EXPECTED_UNSUPPORTED,
-        "{label}: the dashboard emitted a sequence termlens does not model. \
-         Until it is understood, every screen assertion in this crate is being \
-         made against a grid that may be wrong.\n{screen}"
-    );
-    assert_eq!(
-        screen.unsupported_overflow(),
-        0,
-        "{label}: the record is complete, not truncated"
+        "{label}: the dashboard emitted a sequence termlens does not model, \
+         or the record was truncated. Until it is understood, every screen \
+         assertion in this crate is being made against a grid that may be \
+         wrong.\n{screen}"
     );
 }
 

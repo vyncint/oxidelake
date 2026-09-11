@@ -84,15 +84,14 @@ fn oxide_tui_paints_the_dashboard_the_tui_crate_snapshots() -> termlens::Result<
     // the whole engine, and anything it printed would come through the same
     // stream. `^[[59m` is ratatui's underline-colour reset; it changes no
     // cell.
+    // The view compares equal to a slice only when the retained shapes match
+    // *and* nothing overflowed the bound, so this is the whole record.
     assert_eq!(
-        live.unsupported()
-            .iter()
-            .map(|u| u.to_string())
-            .collect::<Vec<_>>(),
+        live.unsupported(),
         ["^[[59m"],
-        "the shipped binary emitted a sequence termlens does not model:\n{live}"
+        "the shipped binary emitted a sequence termlens does not model, or \
+         the record was truncated:\n{live}"
     );
-    assert_eq!(live.unsupported_overflow(), 0);
 
     t.send(Key::Char('q'))?;
     let status = t.wait_exit()?;

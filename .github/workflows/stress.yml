@@ -49,7 +49,7 @@ jobs:
           # for the report step below (termlens 0.10).
           TERMLENS_ARTIFACT_DIR: ${{ runner.temp }}/termlens
         run: make stress-tui
-      - uses: vyncint/termlens/.github/actions/report@e1b96c8203fd727fa3458af395719c429966ee82 # v0.10.1
+      - uses: vyncint/termlens/.github/actions/report@b8af0fa457dd023aa708a493b7f485256009f1a5 # v0.11.0
         if: failure()
         with:
           name: termlens-report-stress-${{ matrix.os }}

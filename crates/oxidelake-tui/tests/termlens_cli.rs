@@ -169,10 +169,17 @@ fn termlens_cli_inspect_drives_the_real_dashboard() {
         assert!(screen.contains(panel), "no {panel} panel:\n{screen}");
     }
     assert!(screen.contains("[CUDA]"), "the plan tags its operators");
+    // The trailer goes to **stderr** since termlens 0.11 (termlens#340), so
+    // what stdout carries is a saved screen the tool reads back unedited.
     assert!(
-        screen.contains("still running at the deadline"),
+        String::from_utf8_lossy(&out.stderr).contains("still running at the deadline"),
         "the dashboard is a TUI, so inspect reports the deadline rather than \
-         an exit — a binary that fell out of the event loop would say so here:\n{screen}"
+         an exit — a binary that fell out of the event loop would say so here: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !screen.contains("--- "),
+        "and stdout is the screen alone:\n{screen}"
     );
 }
 
