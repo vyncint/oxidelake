@@ -10,6 +10,25 @@ versions (0.x) may contain breaking changes; they are always listed under a
 
 ### Changed
 
+- **termlens 0.10.1 → 0.11**, with the vendored skill and the report
+  action's pin in `ci.yml` and `stress.yml`. 0.11 is termlens's stability
+  candidate: from it no promised item changes incompatibly before its 1.0,
+  so this requirement should hold for a while.
+
+  Its one breaking change lands here as a simplification.
+  `Screen::unsupported()` returns a view instead of a slice of `Arc<str>`,
+  and `unsupported_overflow()` folds into it — so the pinned list and "the
+  record is not truncated" are one assertion, in both PTY suites: the
+  dashboard's (`oxidelake-tui/tests/emulation.rs`) and the shipped
+  binary's (`oxidelake-runtime/tests/oxide_tui_pty.rs`). The view compares
+  equal to a slice only when the retained shapes match *and* nothing
+  overflowed the bound, so a truncated record can no longer pass as a
+  shorter list.
+
+  The pin's known-defect caveat goes with it: termlens#320, which named
+  blink and strikethrough as unsupported although the attribute shadow
+  implements them, was fixed upstream in 0.10.2.
+
 - **The PTY test harness moved to termlens 0.10.1** (from 0.9). The three
   committed screen snapshots are unchanged: `assert_screen_snapshot!` records
   styles by default in 0.10, and the text snapshots opt out with
