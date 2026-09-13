@@ -33,7 +33,7 @@ Verified facts about the development machine (2026-08-25): Linux 7.0 x86_64, 20 
 - Every public item has a doc comment; every crate has `//!` docs stating its role and which internal crates it may depend on.
 - Observability via `tracing` spans/events (operator execution, allocations, spills, plan submission). No `println!` outside the CLI's user-facing output.
 - Tests: colocated unit tests plus `tests/` integration tests; snapshot tests via `insta` (commit the `.snap` files). Deterministic: seed every RNG; no wall-clock dependence in rendered output.
-- Toolchain: **stable Rust**, pinned in `rust-toolchain.toml` (`channel = "1.98.0"`, `components = ["rustfmt", "clippy"]`); `workspace.package.rust-version = "1.88"` (the MSRV of Ballista 54, DataFusion 54 and ratatui 0.30 — the highest in the dependency graph). Do **not** use nightly `std::simd`: CPU vectorization comes from Arrow/DataFusion compute kernels plus `rayon` data parallelism and auto-vectorization. (If profiling later justifies explicit SIMD, the `wide` crate is the stable escape hatch — do not add it now.)
+- Toolchain: **stable Rust**, pinned in `rust-toolchain.toml` (`channel = "1.98.0"`, `components = ["rustfmt", "clippy"]`); `workspace.package.rust-version = "1.94.1"` (the lockfile's floor, verified by `make msrv`). Do **not** use nightly `std::simd`: CPU vectorization comes from Arrow/DataFusion compute kernels plus `rayon` data parallelism and auto-vectorization. (If profiling later justifies explicit SIMD, the `wide` crate is the stable escape hatch — do not add it now.)
 - Workspace lints (every crate sets `[lints] workspace = true`; test modules may locally `#[allow(clippy::unwrap_used, clippy::expect_used)]`):
 
 ```toml
@@ -144,7 +144,7 @@ There is no private file format (ADR-0014). `oxidelake-storage` owns configurati
 - A deterministic demo binary `oxidelake-tui-demo` (`[[bin]]` inside `oxidelake-tui`) renders the dashboard from a fixed synthetic telemetry snapshot — no clock, no animation — so PTY tests can spawn it via `env!("CARGO_BIN_EXE_oxidelake-tui-demo")` (`termlens::bin!`).
 - **Headless tests, two layers:**
   1. `crates/oxidelake-tui/tests/tui_render_test.rs` — in-process: `ratatui::backend::TestBackend` + `insta::assert_snapshot!` of the rendered buffer at 80×24 and 120×40; state transitions (`↓`/`↑` selection, `Tab`, `q` → quit) asserted on `AppState`.
-  2. `crates/oxidelake-tui/tests/tui_pty_test.rs` — end-to-end with **`termlens`** (dev-dependency; its default feature enables `insta` integration): `termlens::bin!("oxidelake-tui-demo", size(80, 24), timeout(..))`, then `wait_frame(|s| s.contains("OxideLake"))`, `termlens::assert_screen_snapshot!(&first, styles = false)`, `send(Key::Down)` and re-snapshot, `resize(120, 40)` and re-snapshot, `send(Key::Char('q'))` then `wait_exit()?.success()`. Beside it, `tests/emulation.rs` pins what the emulator dropped (`Screen::unsupported`), that no terminal mode was left set and that a screen survives the snapshot text format and JSON; `tests/termlens_cli.rs` drives the committed screens through `termlens-cli` (`#[ignore]`d — it installs the tool); and `crates/oxidelake-runtime/tests/oxide_tui_pty.rs` does the same for the shipped `oxide tui`. Read <https://docs.rs/termlens/0.10.1> before writing these — the API is newer than your training data, and the vendored `.claude/skills/termlens/SKILL.md` is the cheat sheet for the version this workspace depends on. Never `sleep`; always use the `wait_*` methods. termlens is a real-PTY harness, so no physical TTY is needed.
+  2. `crates/oxidelake-tui/tests/tui_pty_test.rs` — end-to-end with **`termlens`** (dev-dependency; its default feature enables `insta` integration): `termlens::bin!("oxidelake-tui-demo", size(80, 24), timeout(..))`, then `wait_frame(|s| s.contains("OxideLake"))`, `termlens::assert_screen_snapshot!(&first, styles = false)`, `send(Key::Down)` and re-snapshot, `resize(120, 40)` and re-snapshot, `send(Key::Char('q'))` then `wait_exit()?.success()`. Beside it, `tests/emulation.rs` pins what the emulator dropped (`Screen::unsupported`), that no terminal mode was left set and that a screen survives the snapshot text format and JSON; `tests/termlens_cli.rs` drives the committed screens through `termlens-cli` (`#[ignore]`d — it installs the tool); and `crates/oxidelake-runtime/tests/oxide_tui_pty.rs` does the same for the shipped `oxide tui`. Read <https://docs.rs/termlens/0.11> before writing these — the API is newer than your training data, and the vendored `.claude/skills/termlens/SKILL.md` is the cheat sheet for the version this workspace depends on. Never `sleep`; always use the `wait_*` methods. termlens is a real-PTY harness, so no physical TTY is needed.
 
 ### 2.8 API — `oxidelake-api`
 
@@ -204,7 +204,7 @@ Rules:
 
 1. Every external dependency is declared once in `[workspace.dependencies]`; members use `{ workspace = true }`.
 2. **Version coherence has one root: Ballista.** Its docs say "Make sure the version of `datafusion` is the same as `ballista`'s!" — so `ballista*` fixes the `datafusion` / `datafusion-proto` major, DataFusion fixes the `arrow` / `parquet` / `object_store` majors, and `arrow-flight` / `tonic` / `prost` arrive transitively through Ballista (not declared directly). Never depend on other `datafusion-*` sub-crates; `datafusion-proto` is the single exception (needed for the plan codec) and is pinned to the identical version (ADR-0009). Gate: `cargo tree --workspace -d -e normal` shows **no duplicate `arrow-*`, `parquet`, `datafusion*`, `object_store`, `tonic` or `prost` majors**.
-3. Evidence for the set below (live registry): ballista / ballista-core / ballista-scheduler / ballista-executor 54.1.0 (2026-08-09) require `datafusion ^54`, `datafusion-proto ^54`, `arrow-flight ^58.3`, `object_store ^0.13.2`, `tonic ^0.14`, `prost ^0.14`; datafusion 54.1.0 requires `arrow ^58.3`, `parquet ^58.3`, `object_store ^0.13.2`, `tokio ^1.52`; arrow-flight 58.4 requires `tonic` / `prost ^0.14.1`; ratatui 0.30.2 pairs with crossterm 0.29 through `crossterm_0_29`; cudarc 0.19.9 ships `dynamic-loading`, `nvrtc` and `cuda-*`; objc2-metal 0.3 requires objc2 0.6 and objc2-foundation 0.3; termlens 0.10.1 defaults to `insta` and keeps `serde` / `regex` behind features (MSRV 1.85, far under this workspace's floor). MSRVs: Ballista, DataFusion 54 and ratatui 1.88 → `rust-version = "1.88"`. DataFusion 55 exists but Ballista is on 54 — Ballista wins. When Ballista moves to a new DataFusion major, re-derive the whole chain; never bump one crate alone.
+3. Evidence for the set below (live registry): ballista / ballista-core / ballista-scheduler / ballista-executor 54.1.0 (2026-08-09) require `datafusion ^54`, `datafusion-proto ^54`, `arrow-flight ^58.3`, `object_store ^0.13.2`, `tonic ^0.14`, `prost ^0.14`; datafusion 54.1.0 requires `arrow ^58.3`, `parquet ^58.3`, `object_store ^0.13.2`, `tokio ^1.52`; arrow-flight 58.4 requires `tonic` / `prost ^0.14.1`; ratatui 0.30.2 pairs with crossterm 0.29 through `crossterm_0_29`; cudarc 0.19.9 ships `dynamic-loading`, `nvrtc` and `cuda-*`; objc2-metal 0.3 requires objc2 0.6 and objc2-foundation 0.3; termlens 0.11 defaults to `insta` and keeps `serde` / `regex` behind features (MSRV 1.85, far under this workspace's floor). MSRVs: the locked dependency graph requires `rust-version = "1.94.1"`. DataFusion 55 exists but Ballista is on 54 — Ballista wins. When Ballista moves to a new DataFusion major, re-derive the whole chain; never bump one crate alone.
 
 ```toml
 [workspace]
@@ -214,7 +214,7 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.94.1"
 license = "Apache-2.0"
 authors = ["OxideLake Contributors"]
 
@@ -257,7 +257,7 @@ crossterm = "0.29"
 clap = { version = "4", features = ["derive"] }
 # test-only
 insta = "1"
-termlens = { version = "0.10", features = ["serde"] }
+termlens = { version = "0.11", features = ["serde"] }
 assert_cmd = "2"
 tempfile = "3"
 rand = "0.10"

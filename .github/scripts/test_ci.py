@@ -235,7 +235,12 @@ class SkillVersionTests(unittest.TestCase):
             skill.parent.mkdir(parents=True)
             header = f"Written against **termlens {skill_version}**.\n" if skill_version else ""
             skill.write_text("# Testing terminal programs with termlens\n\n" + header)
-            (root / "Cargo.toml").write_text(f"[workspace.dependencies]\n{dep_line}\n")
+            (root / "Cargo.toml").write_text(
+                f'[workspace.package]\nrust-version = "1.94.1"\n[workspace.dependencies]\n{dep_line}\n'
+            )
+            (root / "docs").mkdir()
+            for document in ("SPEC.md", "dependencies.md"):
+                (root / "docs" / document).write_text("termlens 0.10\nrust-version 1.94.1\n")
             return subprocess.run(["/bin/bash", str(script)], text=True, capture_output=True, cwd=directory)
 
     def test_a_matching_skill_passes_and_a_patch_release_is_not_drift(self):
@@ -258,6 +263,11 @@ class SkillVersionTests(unittest.TestCase):
     def test_an_unreadable_claim_is_a_failure_not_a_pass(self):
         self.assertNotEqual(self.run_check("", 'termlens = "0.10"').returncode, 0)
         self.assertNotEqual(self.run_check("0.10.1", "insta = \"1\"").returncode, 0)
+
+    def test_stale_documented_dependency_version_fails(self):
+        run = self.run_check("0.11.0", 'termlens = "0.11"')
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn("docs/SPEC.md does not name termlens 0.11", run.stdout)
 
     def test_the_committed_skill_matches_the_committed_manifest(self):
         run = subprocess.run(["/bin/bash", str(SCRIPTS / "check-skill-version.sh")],

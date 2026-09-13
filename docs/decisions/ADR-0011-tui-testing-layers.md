@@ -25,3 +25,22 @@ The two layers stand; the dependency moved 0.9 → 0.10.1 and the PTY layer grew
 - `tests/termlens_cli.rs` reads the committed `.snap` files back with `termlens-cli`. It is `#[ignore]`d: these crates are published, and `cargo test` must not install a tool behind a contributor's back. CI runs it (`make test-termlens-cli`).
 
 The vendored agent skill is checked against the dependency by `make skill-version`, because it had already drifted two releases behind.
+
+## Update — 2026-09-11 (termlens 0.11)
+
+The dependency moved 0.10.1 → 0.11, termlens's stability candidate: from it
+no promised item changes incompatibly before its 1.0, so this requirement
+should hold for a while. Neither layer changed shape.
+
+Its one breaking change simplified the invariant the PTY layer rests on.
+`Screen::unsupported()` returns a view instead of a slice of `Arc<str>` and
+`unsupported_overflow()` folds into it, so the pinned list and "the record
+is not truncated" became one assertion in both suites — the dashboard's
+(`oxidelake-tui/tests/emulation.rs`) and the shipped binary's
+(`oxidelake-runtime/tests/oxide_tui_pty.rs`). The view compares equal to a
+slice only when the retained shapes match *and* nothing overflowed the
+bound, so a truncated record can no longer pass as a shorter list.
+
+`make skill-version` now also holds `docs/SPEC.md` and `docs/dependencies.md`
+to the dependency's major.minor and to the workspace `rust-version`, because
+both had drifted behind this bump.

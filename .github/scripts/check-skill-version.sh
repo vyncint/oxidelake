@@ -43,11 +43,28 @@ dep_version="$(sed -n 's/^termlens = .*version = "\([0-9][0-9.]*\)".*/\1/p;s/^te
   exit 1
 }
 dep_minor="$(echo "$dep_version" | cut -d. -f1,2)"
+msrv="$(sed -n 's/^rust-version = "\([0-9][0-9.]*\)"/\1/p' "$manifest" | head -1)"
+[ -n "$msrv" ] || { echo "::error::no rust-version found in $manifest"; exit 1; }
 
 if [ "$skill_minor" != "$dep_minor" ]; then
   echo "::error::the vendored termlens skill is written against ${skill_version} but this workspace depends on ${dep_version}."
   echo "::error::Refresh it: cp ../termlens/skills/termlens/SKILL.md ${skill}"
   exit 1
 fi
+
+for document in docs/SPEC.md docs/dependencies.md; do
+  [ -f "$document" ] || { echo "::error::$document does not exist"; exit 1; }
+  # Matches every spelling these two documents use: the docs.rs URL
+  # (termlens/0.11), the table cell (`termlens` | 0.11), the manifest
+  # excerpt (termlens = { version = "0.11" }) and running prose.
+  grep -Eq "termlens[^0-9]*${dep_minor//./\\.}" "$document" || {
+      echo "::error::$document does not name termlens ${dep_minor}"
+      exit 1
+    }
+  grep -Fq "$msrv" "$document" || {
+    echo "::error::$document does not name rust-version ${msrv}"
+    exit 1
+  }
+done
 
 echo "the vendored termlens skill (${skill_version}) matches the dependency (${dep_version})"
