@@ -1,6 +1,6 @@
 //! The real-terminal event loop (crossterm) with DEC 2026 synchronized updates.
 
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -11,6 +11,14 @@ use ratatui::DefaultTerminal;
 use crate::model::DashboardModel;
 use crate::render::render;
 use crate::state::{AppState, KeyInput, Transition};
+
+/// Message shown when the dashboard is started without an interactive terminal.
+pub const NON_INTERACTIVE_TERMINAL_MESSAGE: &str = "oxide tui needs an interactive terminal; use oxide sql or oxide explain for non-interactive output";
+
+/// Whether both input and output are attached to an interactive terminal.
+pub fn is_interactive_terminal() -> bool {
+    io::stdin().is_terminal() && io::stdout().is_terminal()
+}
 
 /// Maps a crossterm key event onto the dashboard's input alphabet. Key
 /// releases (reported by some terminals) are ignored.
@@ -52,6 +60,12 @@ pub fn run_terminal(
     tick: Option<Duration>,
     mut refresh: impl FnMut(&mut DashboardModel),
 ) -> io::Result<()> {
+    if !is_interactive_terminal() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            NON_INTERACTIVE_TERMINAL_MESSAGE,
+        ));
+    }
     let mut terminal = ratatui::try_init()?;
     let mut state = AppState::new(model.plan().len());
     let result = (|| -> io::Result<()> {

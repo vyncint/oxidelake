@@ -157,6 +157,10 @@ async fn main() -> anyhow::Result<()> {
             tables,
             target,
         } => {
+            if !oxidelake_tui::is_interactive_terminal() {
+                eprintln!("{}", oxidelake_tui::NON_INTERACTIVE_TERMINAL_MESSAGE);
+                std::process::exit(2);
+            }
             let model = match &query {
                 Some(sql) => {
                     let session = session(None, target, &tables).await?;

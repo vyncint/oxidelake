@@ -20,7 +20,10 @@ pub mod model;
 pub mod render;
 pub mod state;
 
-pub use app::{draw_frame, key_input_from_crossterm, run_terminal};
+pub use app::{
+    NON_INTERACTIVE_TERMINAL_MESSAGE, draw_frame, is_interactive_terminal,
+    key_input_from_crossterm, run_terminal,
+};
 pub use model::{ColumnProfile, DashboardModel, demo_model};
 pub use render::render;
 pub use state::{AppState, KeyInput, Panel, Transition};

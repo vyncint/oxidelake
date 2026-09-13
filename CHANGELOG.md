@@ -79,6 +79,10 @@ versions (0.x) may contain breaking changes; they are always listed under a
 
 ### Fixed
 
+- **`oxide tui` now rejects non-interactive stdin/stdout before terminal setup.**
+  It prints a clear hint to use `oxide sql` or `oxide explain` for scripted output
+  and exits with usage code 2 instead of leaking a raw ENXIO-style terminal error.
+
 - **The dashboard's Describe panel no longer prints a truncated percentile as
   if it were the value.** `approx_percentile_cont` renders full precision, and
   the panel's six-character columns were clipped from the right, so the 2M-row
