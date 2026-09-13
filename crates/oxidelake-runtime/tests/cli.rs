@@ -24,6 +24,15 @@ fn oxide() -> Command {
     Command::cargo_bin("oxide").unwrap()
 }
 
+#[test]
+fn tui_rejects_non_interactive_terminal() {
+    oxide()
+        .arg("tui")
+        .assert()
+        .code(2)
+        .stderr("oxide tui needs an interactive terminal; use oxide sql or oxide explain for non-interactive output\n");
+}
+
 fn gen_data(dir: &Path, rows: u64) {
     let assert = oxide()
         .args([
