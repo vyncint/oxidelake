@@ -88,8 +88,28 @@ fn target_dir() -> PathBuf {
 fn cli() -> &'static PathBuf {
     static BIN: OnceLock<PathBuf> = OnceLock::new();
     BIN.get_or_init(|| {
+        // CI installs the tool prebuilt and points here, because building it
+        // from source on every run cost minutes for a binary the lockfile
+        // already pins exactly (#48). A given binary is checked against that
+        // pin rather than trusted: a prebuilt install at the wrong version
+        // would silently test the wrong tool, which is the one failure this
+        // shortcut can introduce.
         if let Some(given) = std::env::var_os("TERMLENS_CLI") {
-            return PathBuf::from(given);
+            let given = PathBuf::from(given);
+            let reported = Command::new(&given)
+                .arg("--version")
+                .output()
+                .expect("TERMLENS_CLI names a binary that runs");
+            let reported = String::from_utf8_lossy(&reported.stdout).trim().to_owned();
+            assert_eq!(
+                reported,
+                format!("termlens {}", version_under_test()),
+                "TERMLENS_CLI is {} but Cargo.lock pins termlens {}; the \
+                 prebuilt install and the lockfile are out of step",
+                given.display(),
+                version_under_test()
+            );
+            return given;
         }
         let root = target_dir().join("termlens-cli");
         let bin = root

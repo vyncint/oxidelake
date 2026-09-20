@@ -155,10 +155,30 @@ jobs:
       # contributor's back — these crates are published. CI is where they
       # should run, so CI asks for them by name. The install is the version
       # Cargo.lock names, so the tool and the library are one release.
+      # Prebuilt, not compiled: `cargo install termlens-cli` rebuilt the tool
+      # from source on every run, and `cache-bin: false` means it was never
+      # reused. Every other tool here arrives prebuilt (cargo-deny,
+      # cargo-semver-checks, zizmor), and this is the rule for this
+      # ecosystem's workflows -- prebuilt tools, not cached builds (#48).
+      # The version comes from the lockfile so the tool and the library stay
+      # one release, and the test re-reads it and refuses a mismatch.
+      - name: Read the pinned termlens version
+        if: matrix.lane.name == 'default'
+        id: termlens
+        run: |
+          set -euo pipefail
+          version="$(awk '/^name = "termlens"$/{found=1; next} found && /^version = /{gsub(/[",]/, "", $3); print $3; exit}' Cargo.lock)"
+          [ -n "$version" ] || { echo "::error::no termlens version in Cargo.lock"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2.87.17
+        if: matrix.lane.name == 'default'
+        with:
+          tool: termlens-cli@${{ steps.termlens.outputs.version }}
       - name: termlens-cli against the committed screens
         if: matrix.lane.name == 'default'
         env:
           TERMLENS_ARTIFACT_DIR: ${{ runner.temp }}/termlens
+          TERMLENS_CLI: termlens
         run: make test-termlens-cli
       - name: predict adds no second CUDA stack
         if: matrix.lane.name == 'predict'
