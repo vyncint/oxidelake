@@ -158,3 +158,85 @@ async fn corrupt_parquet_is_a_format_error() {
     ));
     assert!(matches!(err, EngineError::Io(_)));
 }
+
+/// The third proof the README claims (#43): statistics and Bloom filters
+/// skip whole row groups, the page index skips *pages inside* one.
+///
+/// It needs a dataset the other two cannot handle, or there is nothing left
+/// for it to do. `seq` is sorted across the whole file and written as one
+/// big row group, so min/max statistics cannot exclude that row group for
+/// any predicate inside the range — and with pages of 1,000 rows a narrow
+/// range touches a handful of them and the index skips the rest.
+fn page_index_dataset(dir: &Path) -> PathBuf {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("seq", DataType::Int64, false),
+        Field::new("v", DataType::Float64, false),
+    ]));
+    let mut batches = Vec::new();
+    for start in (0..ROWS).step_by(CHUNK) {
+        let seq: Vec<i64> = (start..start + CHUNK).map(|i| i as i64).collect();
+        let v: Vec<f64> = (start..start + CHUNK).map(|i| (i % 97) as f64).collect();
+        batches.push(
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(seq)),
+                    Arc::new(Float64Array::from(v)),
+                ],
+            )
+            .unwrap(),
+        );
+    }
+    let path = dir.join("page-index.parquet");
+    let opts = ParquetWriteOptions {
+        // One row group for the whole file: whatever the page index prunes
+        // here, statistics demonstrably could not have.
+        row_group_rows: ROWS,
+        compression: Compression::None,
+        data_page_rows: Some(1_000),
+        ..Default::default()
+    };
+    assert_eq!(
+        write_parquet(&path, schema, &batches, &opts).unwrap(),
+        ROWS as u64
+    );
+    path
+}
+
+#[tokio::test]
+async fn the_page_index_prunes_rows_statistics_cannot() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = page_index_dataset(dir.path());
+    let sql = "SELECT count(*) AS n, sum(v) AS total FROM t WHERE seq BETWEEN 100000 AND 100999";
+
+    let (pruned, s) = run(with_pruning(SessionConfig::new()), &path, sql).await;
+    let (full, s0) = run(with_pruning_disabled(SessionConfig::new()), &path, sql).await;
+
+    assert_eq!(pruned, full, "pruning must not change the answer");
+    assert!(
+        pruned.contains("1000"),
+        "the range holds 1000 rows: {pruned}"
+    );
+
+    // The mechanism under test.
+    assert!(
+        s.page_index_rows_pruned > 0,
+        "the page index pruned nothing: {s:?}"
+    );
+    assert!(
+        s.page_index_rows_matched > 0,
+        "and it kept the pages the answer is in: {s:?}"
+    );
+    // The point of the single row group: this is work the other two proofs
+    // could not have done, so the third proof is not a restatement of them.
+    assert_eq!(
+        s.row_groups_pruned(),
+        0,
+        "one row group spanning the predicate leaves statistics and Bloom \
+         filters nothing to skip, so every pruned row is the index's: {s:?}"
+    );
+    assert_eq!(
+        s0.page_index_rows_pruned, 0,
+        "with pruning disabled the index prunes nothing: {s0:?}"
+    );
+}
