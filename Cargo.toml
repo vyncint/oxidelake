@@ -78,7 +78,7 @@ clap = { version = "4", features = ["derive"] }
 # scheduler and worker included, dlopen libcuda and create a CUDA context at
 # load time, beside the one OxideLake creates itself, even for a pure-CPU
 # query. oxmera 0.4.0 made that a feature; this is the reason to use it.
-oxmera = { version = "0.4", default-features = false }
+oxmera = { version = "0.5", default-features = false }
 safetensors = "0.8"                  # reading a model's header to recover its shape
 
 # test-only
