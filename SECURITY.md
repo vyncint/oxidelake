@@ -31,8 +31,17 @@ What the project does continuously, enforced by required CI on every change:
   Every accepted advisory in `deny.toml` carries a written reason.
 - **Workflow security** (`zizmor` job at `--persona=pedantic`): every GitHub
   Action pinned to a full commit SHA, checkouts that do not persist
-  credentials, a read-only workflow token by default, no build cache that
-  could serve a stale artifact. Accepted findings are in `.github/zizmor.yml`.
+  credentials, a read-only workflow token by default. Accepted findings are
+  in `.github/zizmor.yml`.
+- **Build caches are dependency-only and never restored for a release.**
+  Three jobs use `Swatinem/rust-cache` with `cache-bin: false` and
+  `cache-workspace-crates: false`, so no workspace crate and no tool binary
+  is ever served from a cache; what returns is third-party dependency
+  builds keyed by the lockfile. Every such step is guarded by
+  `github.workflow == 'CI' && !inputs.clean`, so a `workflow_call` from
+  `release.yml` restores nothing and builds from scratch — a published
+  artifact never comes from a cache (ADR-0017, measured in
+  [docs/ci-cache-measurement.md](docs/ci-cache-measurement.md)).
 - **Protected history.** `main` takes only squash-merged pull requests with
   `required-green` and `commit-policy` green — direct pushes are rejected, the
   maintainer's included. `v*` tags can only be created by an admin, and
