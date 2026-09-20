@@ -1665,22 +1665,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ctor"
-version = "0.6.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "424e0138278faeb2b401f174ad17e715c829512d74f3d1e81eb43365c2e0590e"
-dependencies = [
- "ctor-proc-macro",
- "dtor",
-]
-
-[[package]]
-name = "ctor-proc-macro"
-version = "0.0.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52560adf09603e58c9a7ee1fe1dcb95a16927b17c127f0ac02d6e768a0e25bc1"
-
-[[package]]
 name = "ctutils"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2541,21 +2525,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
 
 [[package]]
-name = "dtor"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "404d02eeb088a82cfd873006cb713fe411306c7d182c344905e101fb1167d301"
-dependencies = [
- "dtor-proc-macro",
-]
-
-[[package]]
-name = "dtor-proc-macro"
-version = "0.0.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f678cf4a922c215c63e0de95eb1ff08a958a81d47e485cf9da1e27bf6305cfa5"
-
-[[package]]
 name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2598,7 +2567,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4186,9 +4155,9 @@ dependencies = [
 
 [[package]]
 name = "oxmera"
-version = "0.4.0"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f78b1dd1f7b14fd55700e46754af91db3d4add07198fc8e016962c76bbe534e3"
+checksum = "10abb7f2c7c4a00359645b608e13cf57c5c9986c1f6d1de29c14fa1b2c19b43e"
 dependencies = [
  "oxmera-autograd",
  "oxmera-core",
@@ -4203,9 +4172,9 @@ dependencies = [
 
 [[package]]
 name = "oxmera-autograd"
-version = "0.4.0"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e90c3b1805c6c6692e06c9b4e55d8ffb18602c29ea55612444ebb91dfafdb37f"
+checksum = "cf34ac98228272757533940044b261076e61fb6c220b4a6cee65f267cb2eeb90"
 dependencies = [
  "oxmera-core",
  "oxmera-tensor",
@@ -4213,18 +4182,18 @@ dependencies = [
 
 [[package]]
 name = "oxmera-core"
-version = "0.4.0"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f7ec5278085fe55f464d2276182c9f354c7ed15aa64104d8536e174b775b394"
+checksum = "b15381434bcff12a52ea2f740759a93aee698af0232b3c622a77f5db2eb8c78b"
 dependencies = [
  "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "oxmera-cpu"
-version = "0.4.0"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa0ea907daac61c556eb01cfcee5f0ec1f0654665b03d23dcb33f5f4852fcc37"
+checksum = "4c28e00a2baa5ef66785c47ab8ddb6eb9bfaa758854c9afd2d9528fe626fa943"
 dependencies = [
  "oxmera-core",
  "oxmera-tensor",
@@ -4232,11 +4201,10 @@ dependencies = [
 
 [[package]]
 name = "oxmera-metal"
-version = "0.4.0"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3df7c3d204ba36a3916f002d4fb58ff596e84fc752345627f5c99a9e1ac6f79"
+checksum = "fc6f8406cdfa32d0e911e36717d6c27174bb89943a4a61a778bd786bd42c8771"
 dependencies = [
- "ctor",
  "metal",
  "oxmera-core",
  "oxmera-tensor",
@@ -4244,9 +4212,9 @@ dependencies = [
 
 [[package]]
 name = "oxmera-nn"
-version = "0.4.0"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c128fe49c6c19ce43bea1b6fb13fc4abf5db317da5b193eccb1333b1026df5c"
+checksum = "9e3cb521263a08b540b35f65e6d23632f5ce35bcc1d0d4fb254dcea3c657c09c"
 dependencies = [
  "oxmera-core",
  "oxmera-tensor",
@@ -4256,9 +4224,9 @@ dependencies = [
 
 [[package]]
 name = "oxmera-ops"
-version = "0.4.0"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86dfa8647b8be365c40e28e6f83bb42308758d1b20d25ad85a28df867f69aa37"
+checksum = "afce2ec33246653e7571767b56383d7520ca6279b5d1a2f57aa14483ab81945a"
 dependencies = [
  "oxmera-core",
  "oxmera-tensor",
@@ -4266,9 +4234,9 @@ dependencies = [
 
 [[package]]
 name = "oxmera-optim"
-version = "0.4.0"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "79bcd291da3e6df2e06e320cb9760d4f8d61bfbb07570afd723297f6eead64b8"
+checksum = "b4576e4243831480f2a77f791e158b5da99bc1b227203b54f7a84be0c4572746"
 dependencies = [
  "oxmera-core",
  "oxmera-nn",
@@ -4277,9 +4245,9 @@ dependencies = [
 
 [[package]]
 name = "oxmera-runtime"
-version = "0.4.0"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c16c954ec02099274589f411ec04b678fd062a312bea42433099388e77c1c8e"
+checksum = "2e9b7da6c16f8e76d0250a3f4631007149b754b1d2cb2234d1a415cb26bdd269"
 dependencies = [
  "oxmera-core",
  "oxmera-cpu",
@@ -4290,9 +4258,9 @@ dependencies = [
 
 [[package]]
 name = "oxmera-tensor"
-version = "0.4.0"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1ded6fff67d2d0268daf503a83e47a85691a179e9820aff9e7c8cea0e11a963"
+checksum = "383436365ce88dd80dd79c1919a5afd09672c5d4e56a480f26b6977c8bdb7396"
 dependencies = [
  "metal",
  "oxmera-core",
@@ -4823,7 +4791,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5193,7 +5161,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5732,10 +5700,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6623,7 +6591,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
