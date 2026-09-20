@@ -41,7 +41,10 @@ tree as it stood:
 - **The repository takes the vyncint contributor pattern in full**: the
   generated policy scripts and `commit-policy` workflow, a one-job-per-concern
   CI aggregated by `required-green`, every action pinned to a commit SHA,
-  `zizmor` at pedantic, no build cache, a tag-guarded and changelog-gated
+  `zizmor` at pedantic, no build cache — amended by
+  [ADR-0017](ADR-0017-ci-dependency-reuse.md) to dependency-only caches that
+  are never restored for a release; measured in
+  [../ci-cache-measurement.md](../ci-cache-measurement.md) — a tag-guarded and changelog-gated
   release pipeline publishing nine crates in dependency order through Trusted
   Publishing, static binaries, and an install-from-registry check.
 

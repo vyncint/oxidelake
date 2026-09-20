@@ -1,10 +1,32 @@
 //! `oxide` — the OxideLake command-line interface.
 
+use std::io::{self, Write};
+
 use clap::{Parser, Subcommand};
 use oxidelake_core::BackendKind;
 use oxidelake_runtime::{OxideSession, dashboard};
 use oxidelake_storage::{Compression, demo_write_options, write_demo_table};
 use tracing_subscriber::EnvFilter;
+
+/// Writes `text` to stdout, treating a closed reader as success (#34).
+///
+/// `println!` panics when the pipe it is writing to has gone — which is
+/// what `oxide sql … | head -1` does the moment `head` has its line. A
+/// query tool whose primary use is a shell pipeline must not treat the
+/// most ordinary thing in a pipeline as a crash: SECURITY.md's "no panics"
+/// bullet and ADR-0008 both say so. The write is made by hand so the
+/// `BrokenPipe` is a value to match on rather than a panic inside the
+/// formatting machinery.
+fn write_out(text: &str) -> Result<(), io::Error> {
+    let mut stdout = io::stdout().lock();
+    match stdout
+        .write_all(text.as_bytes())
+        .and_then(|()| stdout.flush())
+    {
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        other => other,
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -128,12 +150,12 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let options = demo_write_options(row_group_rows, compression);
             let table = write_demo_table(std::path::Path::new(&out), rows, seed, &options)?;
-            println!(
-                "wrote {} rows to {} (seed {seed}, {row_group_rows} rows per row group, {})",
+            write_out(&format!(
+                "wrote {} rows to {} (seed {seed}, {row_group_rows} rows per row group, {})\n",
                 table.rows,
                 table.path.display(),
                 compression.as_str(),
-            );
+            ))?;
         }
         Command::Sql {
             query,
@@ -142,7 +164,13 @@ async fn main() -> anyhow::Result<()> {
             target,
         } => {
             let session = session(cluster.as_deref(), target, &tables).await?;
-            session.sql(&query).await?.show().await?;
+            // Not `DataFrame::show()`: that is `println!` inside DataFusion,
+            // so a closed pipe panics there and the CLI never sees it (#34).
+            let batches = session.sql(&query).await?.collect().await?;
+            write_out(
+                &datafusion::arrow::util::pretty::pretty_format_batches(&batches)?.to_string(),
+            )?;
+            write_out("\n")?;
         }
         Command::Explain {
             query,
@@ -150,7 +178,7 @@ async fn main() -> anyhow::Result<()> {
             target,
         } => {
             let session = session(None, target, &tables).await?;
-            print!("{}", session.explain(&query).await?);
+            write_out(&session.explain(&query).await?)?;
         }
         Command::Tui {
             query,

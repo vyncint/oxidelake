@@ -62,7 +62,8 @@ flowchart LR
 ```
 
 - Every in-memory table is an Arrow `RecordBatch`; host buffers are 64-byte aligned, device-bound buffers 128-byte aligned.
-- With CUDA active, host buffers are page-locked (DMA without staging copies); otherwise `AlignedBuf`. The path taken is observable as `MemoryClass::{Pinned, Pageable}`.
+- Pinned host memory is available: with `cuda` active and a driver present, `GpuBackend::alloc_pinned_host` allocates page-locked memory (the `cuMemHostAlloc` path) for DMA without staging copies, falling back to `AlignedBuf` otherwise. The path taken is observable as `MemoryClass::{Pinned, Pageable}`.
+- **The operator layer does not use it in 0.x.** `upload_bytes` copies from a pageable Arrow `Buffer` and `download_column` copies into a pageable `Vec`, so the operator path pays the staging copy that pinned memory exists to avoid; `alloc_pinned_host` is exercised only by the T4 device tests. Pinned staging for operator transfers is audit item P6 (#26), tracked in the roadmap's Phase 8. Any transfer-throughput number measured today is a pageable number.
 - On Apple Silicon, `MTLResourceStorageModeShared` buffers give CPU and GPU one physical allocation.
 - `SpillManager` holds per-tier budgets, demotes cold batches on high-watermark pressure, promotes on access, and exports metrics to the TUI. On a GPU-less machine the device tier is empty and the host ↔ disk path is fully testable.
 

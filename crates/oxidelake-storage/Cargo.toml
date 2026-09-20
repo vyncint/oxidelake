@@ -41,3 +41,6 @@ io-uring = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
+# The io_uring signal test installs a SIGUSR1 handler without SA_RESTART, so
+# `submit_and_wait` really returns EINTR (#27). Dev-only.
+libc.workspace = true

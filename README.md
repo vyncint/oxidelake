@@ -6,9 +6,9 @@
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![MSRV](https://img.shields.io/badge/MSRV-1.94.1-orange)
 
-A GPU-accelerated, Arrow-native distributed analytical query engine and columnar lakehouse, written in Rust.
+A GPU-accelerated, Arrow-native distributed analytical query engine, written in Rust. It reads and writes Parquet on object storage; a catalog, a metastore and transactions are out of scope, so it is a query engine over a lake rather than a lakehouse in the full sense.
 
-**Status: v1 complete.** The default build is pure CPU and the whole gate is green on Linux x86_64 and macOS arm64; the **Metal backend executes for real** on Apple silicon (conformance-tested against stock DataFusion on an M4 Pro); the **CUDA backend compiles and lints** with no CUDA installed but has not yet run on a CUDA machine — see [STATUS.md](STATUS.md) for the precise verification matrix. The specification the engine was built to is [docs/SPEC.md](docs/SPEC.md).
+**Status: internal phases 0–7 complete; published 0.1.3. Production readiness is milestone v0.2.0.** The default build is pure CPU and the whole gate is green on Linux x86_64 and macOS arm64. Both GPU backends have executed on real hardware: **Metal** on Apple silicon (conformance-tested against stock DataFusion on an M4 Pro) and **CUDA** on an NVIDIA T4 since 2026-09-06, where every kernel was NVRTC-compiled and launched — and where a correctness bug in the aggregation kernel was found. [STATUS.md](STATUS.md) holds the verification matrix, component by component, and is the ledger ADR-0012 makes it. The specification the engine was built to is [docs/SPEC.md](docs/SPEC.md).
 
 ## Install
 
@@ -142,7 +142,7 @@ cargo check -p oxidelake-runtime --features cuda
 # Metal (macOS): the conformance suite executes on the device
 cargo test -p oxidelake-compute --features metal -- --ignored
 
-# On a CUDA machine (not yet run anywhere — reports welcome):
+# On a CUDA machine (run on a T4 since 2026-09-06; see STATUS.md):
 OXIDE_BACKEND=cuda cargo test -p oxidelake-compute --features cuda -- --ignored
 ```
 
@@ -154,7 +154,7 @@ OXIDE_BACKEND=cuda cargo test -p oxidelake-compute --features cuda -- --ignored
 | [`crates/oxidelake-memory`](crates/oxidelake-memory) | 64/128-byte-aligned buffers, pinned/UMA allocators, 3-tier `SpillManager`, Arrow IPC codec |
 | [`crates/oxidelake-device`](crates/oxidelake-device) | object-safe `GpuBackend`; CPU reference, CUDA (NVRTC) and Metal (MSL) backends; `HardwareDetector` |
 | [`crates/oxidelake-compute`](crates/oxidelake-compute) | the four `Gpu*Exec` operators, per-batch CPU fallback, `l2_distance`/`cosine_distance` UDFs, conformance suite |
-| [`crates/oxidelake-storage`](crates/oxidelake-storage) | Parquet writer/pruning config with *proofs*, Arrow IPC spill files, io_uring `ObjectStore` (Linux), `gen-data` generator |
+| [`crates/oxidelake-storage`](crates/oxidelake-storage) | Parquet writer/pruning config with *proofs*, Arrow IPC spill files, io_uring `ObjectStore` (Linux — implemented and conformance-tested, not yet used by sessions), `gen-data` generator |
 | [`crates/oxidelake-planner`](crates/oxidelake-planner) | `HardwarePlacementRule` (+ vector-distance lowering before projection pushdown), `OxidePhysicalCodec` |
 | [`crates/oxidelake-runtime`](crates/oxidelake-runtime) | `OxideSession` (embedded + Ballista cluster), scheduler/worker wrappers, the `oxide` CLI, dashboard builder |
 | [`crates/oxidelake-tui`](crates/oxidelake-tui) | ratatui dashboard, `TestBackend` snapshots and termlens PTY tests |

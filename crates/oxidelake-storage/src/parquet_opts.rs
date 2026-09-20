@@ -72,6 +72,15 @@ pub struct ParquetWriteOptions {
     pub bloom_filter_columns: Vec<String>,
     /// Bloom filter false-positive probability.
     pub bloom_filter_fpp: f64,
+    /// Rows per data page, when set.
+    ///
+    /// The page index prunes at page granularity, so it can only skip work a
+    /// row group's statistics could not — and only if the row group holds
+    /// more than one page of the column being filtered. Leaving this `None`
+    /// keeps the `parquet` crate's byte-based default, which is the right
+    /// choice for real data; setting it is how a test makes pages small
+    /// enough for that third pruning mechanism to be observable (#43).
+    pub data_page_rows: Option<usize>,
 }
 
 impl Default for ParquetWriteOptions {
@@ -82,6 +91,7 @@ impl Default for ParquetWriteOptions {
             dictionary: true,
             bloom_filter_columns: Vec::new(),
             bloom_filter_fpp: 0.01,
+            data_page_rows: None,
         }
     }
 }
@@ -108,6 +118,12 @@ impl ParquetWriteOptions {
             .set_dictionary_enabled(self.dictionary)
             .set_statistics_enabled(EnabledStatistics::Page)
             .set_bloom_filter_enabled(false);
+        if let Some(rows) = self.data_page_rows {
+            if rows == 0 {
+                return Err(EngineError::plan("data_page_rows must be positive"));
+            }
+            builder = builder.set_data_page_row_count_limit(rows);
+        }
         for column in &self.bloom_filter_columns {
             let path = ColumnPath::from(column.as_str());
             builder = builder

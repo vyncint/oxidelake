@@ -76,7 +76,10 @@ shorter builds are uncached to limit cache storage and eviction.
 The release workflow always runs a full gate without restoring or saving build
 caches. Manual CI dispatch also runs the full gate and accepts `clean=true`
 to bypass caches. Ordinary main/PR CI cancels a superseded run; reusable release
-gates and manual runs are not cancelled by that policy. See [ADR-0017](decisions/ADR-0017-ci-dependency-reuse.md).
+gates and manual runs are not cancelled by that policy. See [ADR-0017](decisions/ADR-0017-ci-dependency-reuse.md)
+and [ci-cache-measurement.md](ci-cache-measurement.md), which is the cold/warm
+comparison ADR-0017 was asked for: 7 min warm, 19–29 min cold, against a 59 min
+pre-cache median.
 
 The `changes` job tests the CI scripts and classifies the actual checkout diff.
 Only Markdown under `docs/` and the explicit root documentation allowlist in

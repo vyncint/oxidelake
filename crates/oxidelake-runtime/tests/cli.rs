@@ -289,3 +289,90 @@ fn cluster_sql_matches_embedded_sql() {
     };
     assert_eq!(cluster_stdout, embedded_stdout);
 }
+
+/// A closed reader is the most ordinary thing in a shell pipeline, and it
+/// used to be exit 101 and a panic from inside DataFusion's `show()` (#34).
+///
+/// `assert_cmd` cannot express this: it captures stdout itself and never
+/// closes it early. So the pipeline is built by hand — `oxide sql` writing
+/// into `head -1`, which takes its line and goes — and both ends are checked.
+/// The query is ordered and wide enough that the output is many lines, so
+/// `head` is certainly gone long before the writer is done.
+#[test]
+fn sql_into_a_closed_pipe_exits_zero_without_panicking() {
+    let dir = tempfile::tempdir().unwrap();
+    // Enough rows that the rendered table is far larger than a pipe buffer,
+    // so the writer is certainly still writing when `head` takes its line and
+    // goes. 5,000 rows fit and the bug does not reproduce at that size --
+    // measured, after a first version of this test passed against the panic.
+    gen_data(dir.path(), 50_000);
+
+    let bin = assert_cmd::cargo::cargo_bin("oxide");
+    let mut sql = StdCommand::new(&bin)
+        .args(["sql", "-q", "SELECT id, k, v FROM t ORDER BY id", "--table"])
+        .arg(format!("t={}", dir.path().display()))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let head = StdCommand::new("head")
+        .arg("-1")
+        .stdin(Stdio::from(sql.stdout.take().unwrap()))
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let head_out = head.wait_with_output().unwrap();
+    let sql_out = sql.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&sql_out.stderr);
+
+    assert!(
+        !stderr.contains("panicked"),
+        "a closed pipe is not a crash:\n{stderr}"
+    );
+    assert_eq!(
+        sql_out.status.code(),
+        Some(0),
+        "a closed pipe is a clean exit; stderr:\n{stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&head_out.stdout).lines().count(),
+        1,
+        "head took its one line"
+    );
+}
+
+/// `explain` and `gen-data` write to stdout through the same helper, and the
+/// issue asked for both to be checked rather than assumed (#34).
+#[test]
+fn explain_into_a_closed_pipe_exits_zero_without_panicking() {
+    let dir = tempfile::tempdir().unwrap();
+    gen_data(dir.path(), 1_000);
+
+    // `explain` output is short and fits a pipe buffer whatever the data, so
+    // this cannot reproduce #34 the way the `sql` case does. It is here to
+    // hold the other write path to the same exit code, not as a regression
+    // test for the panic.
+    let bin = assert_cmd::cargo::cargo_bin("oxide");
+    let mut explain = StdCommand::new(&bin)
+        .args(["explain", "-q", QUERY, "--table"])
+        .arg(format!("t={}", dir.path().display()))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let head = StdCommand::new("head")
+        .arg("-1")
+        .stdin(Stdio::from(explain.stdout.take().unwrap()))
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    head.wait_with_output().unwrap();
+    let out = explain.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{stderr}");
+}

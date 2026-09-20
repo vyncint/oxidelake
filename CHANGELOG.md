@@ -8,6 +8,93 @@ versions (0.x) may contain breaking changes; they are always listed under a
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-09-20
+
+### Fixed
+
+- **io_uring: the worker reaps its completion before returning** (#27).
+  `submit_one` pushed an SQE and returned early when `submit_and_wait`
+  failed — but after a successful push the SQE belongs to the kernel, so
+  that dropped the caller's read buffer while the kernel could still be
+  writing into it, and left the completion to be reaped by the *next* job,
+  which read the stale result as its own. `user_data` was a constant per
+  operation kind, so nothing could tell the two apart. EINTR is a signal
+  rather than a failure and is retried; other errors are reported only
+  after the completion is in hand; every SQE carries the worker's next
+  submission number and a foreign completion is a hard error. Exposure was
+  limited only because no session constructs this store (#24).
+
+- **`GetOptions` preconditions are honoured by both stores** (#44).
+  `UringLocalFileSystem::get_opts` read `range` and `head` and ignored the
+  rest, while `LocalFileSystem` checks `if_match` / `if_none_match` /
+  `if_modified_since` before reading a byte — so a conditional read was
+  honoured or silently dropped depending on which store a caller held, of
+  two the documentation calls identical. The cases live in the shared
+  conformance body now. The worker's job channel is bounded too: one SQE
+  is in flight at a time, so an unbounded queue only moved the backlog out
+  of the callers and into memory.
+
+- **`oxide sql` survives a closed pipe** (#34). `… | head -1` exited 101
+  with `failed printing to stdout: Broken pipe`, from `println!` inside
+  DataFusion's `DataFrame::show()`. Output is formatted and written
+  directly now, and `BrokenPipe` means success — the reader got what it
+  asked for. `explain` and `gen-data` take the same path.
+
+### Added
+
+- **A proof for page-index pruning**, beside the ones for statistics and
+  Bloom filters (#43). The README claimed three and two had proofs. It
+  needs a dataset the other two cannot touch or it restates them: a sorted
+  column in a single row group, where min/max cannot exclude the row group
+  and there is no Bloom filter. A 1,000-row predicate prunes 198,192 of
+  200,000 rows with no row group pruned at all.
+- `ParquetWriteOptions::data_page_rows`, which is what makes that
+  observable — the page index prunes at page granularity, so pages have to
+  be small enough for a narrow predicate to skip most of them. `None`
+  keeps the `parquet` crate's byte-based default.
+
+### Changed
+
+- **CI installs `termlens-cli` prebuilt** instead of compiling it from
+  source on every run (#48), at the version `Cargo.lock` names. The test
+  refuses a binary whose `--version` disagrees with the lockfile, so the
+  shortcut cannot silently test a different tool.
+
+### Documentation
+
+- **README and STATUS agree about CUDA again** (#36). README said the CUDA
+  backend "has not yet run on a CUDA machine"; STATUS's matrix has
+  recorded since 2026-09-06 that a T4 NVRTC-compiled and launched every
+  kernel — and that the aggregation kernel's correctness bug was found
+  there. Under-claiming breaks the ADR-0012 ledger as thoroughly as
+  over-claiming. The header names the published version, says what "v1
+  complete" means (the internal phase plan, not a 1.0), and the README
+  leads with "query engine" and says a catalog, a metastore and
+  transactions are out of scope.
+- **The io_uring store is documented as not wired into sessions** (#24).
+  SPEC §2.4 said it was "registered into the session's `RuntimeEnv`";
+  nothing constructs it, so `--features io-uring` changes nothing at run
+  time. Demoted rather than wired, because the 2026-09-02 audit measured
+  the ring slower than `LocalFileSystem` here — the roadmap line is
+  unticked with that measurement named as the blocker.
+- **Pinned memory is available, not what the operators use** (#26).
+  architecture.md and SPEC §2.1 described DMA without staging copies; the
+  operator path uploads from pageable Arrow buffers and downloads into
+  pageable `Vec`s, so any transfer number measured today is a pageable
+  number.
+- **Phase 8 — production readiness** in the roadmap (#23), listing every
+  open issue in the `v0.2.0` milestone with the acceptance criterion that
+  would close it, and folding in the audit's deferred plans so there is
+  one list. The Phase 6 claim of "double-buffered stream pipelines" is
+  unticked: `round_trip` is serial per batch, as the audit itself says.
+- **The CI build-cache policy is measured and settled** (#39). SECURITY.md
+  and ADR-0016 said "no build cache" while three jobs cached; the
+  exception had never been justified with a number. Measured: 7 min warm,
+  19–29 min cold, against a 59 min pre-cache median. The caches stay and
+  the documents say what they actually are — dependency-only, never
+  restored for a release — with the run URLs in
+  `docs/ci-cache-measurement.md`.
+
 ### Changed
 
 - **termlens 0.10.1 → 0.11**, with the vendored skill and the report
@@ -276,7 +363,8 @@ Metal executes on Apple silicon (verified on an M4 Pro and on GitHub's macOS
 runners); CUDA compiles and lints without a CUDA installation but has not yet
 run on a CUDA machine.
 
-[Unreleased]: https://github.com/vyncint/oxidelake/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/vyncint/oxidelake/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/vyncint/oxidelake/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/vyncint/oxidelake/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/vyncint/oxidelake/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/vyncint/oxidelake/compare/v0.1.0...v0.1.1
