@@ -4132,6 +4132,7 @@ dependencies = [
  "datafusion",
  "futures",
  "io-uring",
+ "libc",
  "object_store",
  "oxidelake-core",
  "oxidelake-memory",

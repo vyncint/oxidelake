@@ -51,6 +51,10 @@ bytes = "1"
 async-trait = "0.1"                  # only to implement object_store's ObjectStore (foreign trait)
 # parallelism
 rayon = "1"
+# syscalls the standard library does not expose: installing a SIGUSR1 handler
+# in the io_uring signal test (#27). Already in the graph transitively; this
+# only names it so a dev-dependency can use it directly.
+libc = "0.2"
 # errors + observability
 thiserror = "2"
 anyhow = "1"
