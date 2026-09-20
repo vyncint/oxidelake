@@ -57,7 +57,8 @@ Deliverables
 - [x] Parquet writer properties for generated datasets (row-group size, dictionaries, Bloom filters on keys, page statistics, `--compression none|lz4|zstd`)
 - [x] Session settings with statistics pruning, Bloom-filter-on-read and page index enabled
 - [x] Arrow IPC spill/cache file writer + reader (64-byte alignment, no compression)
-- [x] `object_store::ObjectStore` wiring: `LocalFileSystem` default; `UringLocalFileSystem` behind `io-uring` (dedicated ring thread, `oneshot` completions), registered into `RuntimeEnv`
+- [x] `object_store::ObjectStore` wiring: `LocalFileSystem` default; `UringLocalFileSystem` behind `io-uring` (dedicated ring thread, `oneshot` completions)
+- [ ] `UringLocalFileSystem` registered into `RuntimeEnv` — implemented and conformance-tested, but no session constructs it, so the feature flag changes nothing at run time (#24). Blocked on a measurement: the 2026-09-02 audit found the ring slower than `LocalFileSystem` here.
 - [x] Error mapping to `EngineError::Format` / `EngineError::Io`
 
 Acceptance

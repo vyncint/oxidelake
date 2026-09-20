@@ -154,7 +154,7 @@ OXIDE_BACKEND=cuda cargo test -p oxidelake-compute --features cuda -- --ignored
 | [`crates/oxidelake-memory`](crates/oxidelake-memory) | 64/128-byte-aligned buffers, pinned/UMA allocators, 3-tier `SpillManager`, Arrow IPC codec |
 | [`crates/oxidelake-device`](crates/oxidelake-device) | object-safe `GpuBackend`; CPU reference, CUDA (NVRTC) and Metal (MSL) backends; `HardwareDetector` |
 | [`crates/oxidelake-compute`](crates/oxidelake-compute) | the four `Gpu*Exec` operators, per-batch CPU fallback, `l2_distance`/`cosine_distance` UDFs, conformance suite |
-| [`crates/oxidelake-storage`](crates/oxidelake-storage) | Parquet writer/pruning config with *proofs*, Arrow IPC spill files, io_uring `ObjectStore` (Linux), `gen-data` generator |
+| [`crates/oxidelake-storage`](crates/oxidelake-storage) | Parquet writer/pruning config with *proofs*, Arrow IPC spill files, io_uring `ObjectStore` (Linux — implemented and conformance-tested, not yet used by sessions), `gen-data` generator |
 | [`crates/oxidelake-planner`](crates/oxidelake-planner) | `HardwarePlacementRule` (+ vector-distance lowering before projection pushdown), `OxidePhysicalCodec` |
 | [`crates/oxidelake-runtime`](crates/oxidelake-runtime) | `OxideSession` (embedded + Ballista cluster), scheduler/worker wrappers, the `oxide` CLI, dashboard builder |
 | [`crates/oxidelake-tui`](crates/oxidelake-tui) | ratatui dashboard, `TestBackend` snapshots and termlens PTY tests |
