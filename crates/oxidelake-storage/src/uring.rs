@@ -35,6 +35,12 @@ use tokio::sync::{mpsc, oneshot};
 
 const STORE: &str = "UringLocalFileSystem";
 
+/// How many jobs may wait on the ring thread before a caller is made to
+/// wait too. The worker handles one SQE at a time, so an unbounded queue
+/// only moves the backlog from the callers into memory, where it is neither
+/// visible nor bounded (#44).
+const JOB_QUEUE: usize = 256;
+
 enum Job {
     Read {
         path: PathBuf,
@@ -191,7 +197,7 @@ fn write_all(ring: &mut IoUring, seq: &mut u64, path: &PathBuf, data: &Bytes) ->
     Ok(())
 }
 
-fn worker(mut rx: mpsc::UnboundedReceiver<Job>, mut ring: IoUring) {
+fn worker(mut rx: mpsc::Receiver<Job>, mut ring: IoUring) {
     // Submission counter for the ring this thread owns. Every SQE is tagged
     // with the next value so its completion can be recognised rather than
     // assumed to be the only one outstanding (#27).
@@ -211,7 +217,7 @@ fn worker(mut rx: mpsc::UnboundedReceiver<Job>, mut ring: IoUring) {
 /// A local object store whose data-path reads and writes go through io_uring.
 pub struct UringLocalFileSystem {
     inner: Arc<LocalFileSystem>,
-    tx: mpsc::UnboundedSender<Job>,
+    tx: mpsc::Sender<Job>,
 }
 
 impl UringLocalFileSystem {
@@ -224,7 +230,7 @@ impl UringLocalFileSystem {
                 format!("io_uring is unavailable on this machine ({e}); use LocalFileSystem"),
             ))
         })?;
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(JOB_QUEUE);
         std::thread::Builder::new()
             .name("oxide-io-uring".into())
             .spawn(move || worker(rx, ring))?;
@@ -262,6 +268,7 @@ impl UringLocalFileSystem {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Job::Read { path, range, reply })
+            .await
             .map_err(|_| Error::Generic {
                 store: STORE,
                 source: "io_uring worker thread has exited".into(),
@@ -278,6 +285,7 @@ impl UringLocalFileSystem {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Job::Write { path, data, reply })
+            .await
             .map_err(|_| Error::Generic {
                 store: STORE,
                 source: "io_uring worker thread has exited".into(),
@@ -332,6 +340,12 @@ impl ObjectStore for UringLocalFileSystem {
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
         let meta: ObjectMeta = self.inner.head(location).await?;
+        // `LocalFileSystem::get_opts` checks these before reading anything, and
+        // the two stores are documented as behaving identically — so a
+        // conditional request that one store honours and the other ignores is
+        // a difference a caller cannot see until it matters (#44). Checked
+        // against the same `meta` the read below is ranged against.
+        options.check_preconditions(&meta)?;
         let range = match &options.range {
             Some(r) => r.as_range(meta.size).map_err(|e| Error::Generic {
                 store: STORE,

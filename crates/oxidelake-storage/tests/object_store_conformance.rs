@@ -11,7 +11,7 @@ use bytes::Bytes;
 use futures::TryStreamExt;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
-use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+use object_store::{GetOptions, ObjectStore, ObjectStoreExt, PutPayload};
 
 fn pattern(len: usize, seed: u8) -> Bytes {
     Bytes::from(
@@ -34,6 +34,49 @@ async fn exercise(store: Arc<dyn ObjectStore>) {
         .put(&b, PutPayload::from_bytes(data_b.clone()))
         .await
         .unwrap();
+
+    // Conditional requests: `LocalFileSystem` checks these before reading and
+    // the io_uring store used to ignore them, so a caller's `if_match` was
+    // honoured or dropped depending on which store it happened to hold (#44).
+    // Both stores answer these the same way now, and this is where that is
+    // held.
+    let tag = store.head(&a).await.unwrap().e_tag;
+    if let Some(tag) = tag {
+        let matching = GetOptions {
+            if_match: Some(tag.clone()),
+            ..Default::default()
+        };
+        let got = store.get_opts(&a, matching).await.unwrap();
+        assert_eq!(
+            got.bytes().await.unwrap(),
+            data_a,
+            "if_match on the current etag reads the object"
+        );
+
+        let stale = GetOptions {
+            if_match: Some("\"not-the-etag\"".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            matches!(
+                store.get_opts(&a, stale).await,
+                Err(object_store::Error::Precondition { .. })
+            ),
+            "if_match on a stale etag is a precondition failure"
+        );
+
+        let unchanged = GetOptions {
+            if_none_match: Some(tag),
+            ..Default::default()
+        };
+        assert!(
+            matches!(
+                store.get_opts(&a, unchanged).await,
+                Err(object_store::Error::NotModified { .. })
+            ),
+            "if_none_match on the current etag is not-modified"
+        );
+    }
 
     // whole object
     let got = store.get(&a).await.unwrap();
