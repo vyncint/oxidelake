@@ -42,7 +42,7 @@ Acceptance
 Deliverables
 - [x] `crates/oxidelake-device/kernels/cuda/{filter_project,hash_join,aggregation,vector_distance}.cu` — `extern "C"` entry points, explicit grid math, bounds checks on every global access
 - [x] `crates/oxidelake-device/kernels/metal/{filter_project,vector_distance}.metal`
-- [x] `GpuFilterExec`, `GpuHashJoinExec`, `GpuAggregateExec`, `GpuVectorDistanceExec` with double-buffered stream pipelines, execute-time backend selection and per-batch CPU fallback
+- [x] `GpuFilterExec`, `GpuHashJoinExec`, `GpuAggregateExec`, `GpuVectorDistanceExec` with execute-time backend selection and per-batch CPU fallback — transfers are **serial per batch** (`round_trip` is upload → kernel → download → `synchronize`); overlapping them with double-buffered streams is deferred to P6 in Phase 8
 - [x] Conformance suite vs stock DataFusion operators (seeded random batches; nulls, empty, 0/1/odd rows); GPU variants `#[ignore]`
 
 Acceptance
@@ -110,6 +110,90 @@ Acceptance
 - [x] `oxide explain` shows placement tags (`--target cpu|cuda|metal` picks the planning target on any machine)
 - [x] `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` clean
 - [x] Gate green
+
+## Phase 8 — production readiness (milestone `v0.2.0`)
+
+Phases 0–7 were the build. This is the list that stands between the
+published 0.1.x and something to run in production, and it is the one
+place that list lives: the audit's deferred plans
+(`docs/audit-2026-09-02.md` P1-rest, P4, P6, P12, P13, P14) are folded in
+by issue number rather than kept in a second document that drifts.
+
+Every line names an open issue and what would close it. Ticked lines link
+the release that shipped them.
+
+### Correctness
+
+- [x] io_uring worker reaps its CQE before returning (#27) — *Acceptance:* a
+      signal delivered while the ring waits cannot free the caller's buffer
+      or misattribute a completion; the regression test fails without the
+      fix. **0.1.4**
+- [x] `GetOptions` preconditions honoured by both stores (#44) —
+      *Acceptance:* `if_match`/`if_none_match` cases in the shared
+      conformance body pass for `LocalFileSystem` and the io_uring store.
+      **0.1.4**
+- [x] `oxide sql` survives a closed pipe (#34) — *Acceptance:* `… | head -1`
+      exits 0 with no panic, on an output larger than a pipe buffer.
+      **0.1.4**
+- [ ] CUDA filter matches Arrow totalOrder float comparison (#28) —
+      *Acceptance:* NaN and `-0.0` rows in the conformance suite agree with
+      stock DataFusion on a CUDA device.
+- [ ] `GpuAggregateExec` streams and partitions instead of collecting the
+      whole input (#29, audit P4) — *Acceptance:* a input larger than device
+      memory completes.
+- [ ] CUDA `SUM` detects Int64 overflow instead of wrapping (#46) —
+      *Acceptance:* an overflowing sum is an error, not a wrong number.
+- [ ] `SpillManager` and `MemoryInfo` reach the operators, or the docs and
+      the TUI say they are library-only (#25).
+
+### Performance
+
+- [ ] Pinned staging for operator transfers (#26, audit P6) —
+      *Acceptance:* `Gpu*Exec` uploads and downloads through pinned memory,
+      with the before/after number recorded.
+- [ ] Double-buffered stream pipelines (audit P6-rest) — *Acceptance:*
+      transfer and compute overlap for a multi-batch scan, measured.
+- [ ] CUDA join table persists across probe batches (#45) — *Acceptance:*
+      the build side is uploaded once per join, not once per batch.
+- [ ] io_uring store wired into sessions, or the claim stays demoted (#24,
+      audit P12) — *Acceptance:* a test proves a Parquet scan goes through
+      the ring thread **and** the measurement says it is not slower.
+
+### Operability
+
+- [ ] Per-batch CPU fallbacks and planner skip reasons are countable (#32)
+      — *Acceptance:* `fallback_batches` in the TUI Inspector; `EXPLAIN
+      VERBOSE` names why a shape stayed on the CPU.
+- [ ] Tracing spans on the query path and an exportable metrics surface
+      (#33).
+- [ ] Worker loss, Ballista retry settings and `SIGTERM` handling (#31,
+      audit P13).
+- [ ] TLS/auth for cluster mode, or an enforced private-network posture
+      (#30) — *Acceptance:* the production cluster instructions do not
+      describe an unauthenticated listener.
+- [ ] Plan codec version fingerprint, failing fast on mixed builds (#42).
+- [ ] `--batch-size`, `--output table|json|csv`, worker `--backend` (#49) —
+      *Acceptance:* every knob in one README table, each with an
+      `assert_cmd` test.
+- [ ] `predict` reads its activation from the model header (#47) —
+      *Acceptance:* a header-less model is refused by name; a GELU model
+      works.
+
+### Supply chain and release
+
+- [ ] Ballista 55 / DataFusion 55 / arrow 59 chain bump (#40) — blocks #4
+      and #54.
+- [ ] thrift advisory retired once parquet ≥ 59 lands (#4, #54).
+- [ ] Public enums `non_exhaustive`, DataFusion-coupling semver policy
+      written (#41) — *Acceptance:* lands in a minor, not a patch.
+- [ ] On-demand CUDA execution job, made a release prerequisite (#38).
+- [ ] CI build-cache policy decided and documented (#39) — *Acceptance:*
+      SECURITY.md, ADR-0016/0017 and the workflows say the same thing.
+- [ ] termlens-cli installed prebuilt in CI (#48).
+- [x] README, STATUS and CHANGELOG agree on CUDA execution and the
+      published version (#36). **0.1.4**
+- [x] Page-index pruning proved beside statistics and Bloom filters (#43).
+      **0.1.4**
 
 ## Out of scope for v1
 
