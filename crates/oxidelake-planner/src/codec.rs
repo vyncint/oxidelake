@@ -22,7 +22,68 @@ use oxidelake_core::BackendKind;
 use serde::{Deserialize, Serialize};
 
 const MAGIC: &[u8; 4] = b"OXGP";
-const VERSION: u8 = 1;
+/// Bumped to 2 by the fingerprint: the header grew four bytes (#42).
+const VERSION: u8 = 2;
+
+/// What the two ends of a plan must agree on, beyond the version byte.
+///
+/// `postcard` is not self-describing. A field added to or reordered within
+/// `GpuNode` decodes into a *different* field of the same width without
+/// complaint, so a mixed-build fleet does not fail — it computes the wrong
+/// answer from plausible-looking parameters. The version byte only helps if
+/// somebody remembers to bump it; this is derived, so it changes whether or
+/// not anybody remembered.
+///
+/// It folds in the crate version (every release is a new fingerprint, which
+/// is blunt but never wrong) and the compute layer's enabled features (a
+/// planner with `predict` emits plans referencing a UDF an executor without
+/// it cannot resolve — today that fails at execution, which is late and
+/// looks like a query bug rather than a deployment one).
+const FINGERPRINT: u32 = fingerprint();
+
+const fn fnv1a(mut hash: u32, bytes: &[u8]) -> u32 {
+    let mut i = 0;
+    while i < bytes.len() {
+        hash ^= bytes[i] as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+        i += 1;
+    }
+    hash
+}
+
+const fn fingerprint() -> u32 {
+    let h = fnv1a(0x811c_9dc5, env!("CARGO_PKG_VERSION").as_bytes());
+    let h = fnv1a(h, &[VERSION]);
+    fnv1a(h, &oxidelake_compute::FEATURE_MASK.to_le_bytes())
+}
+
+/// `MAGIC` + version byte + fingerprint.
+const HEADER: usize = MAGIC.len() + 1 + 4;
+
+/// Refuses a plan this build cannot be trusted to read, before `postcard`
+/// turns it into confident nonsense (#42).
+///
+/// Different fingerprints mean a different crate version or a different
+/// feature set at the other end, and either can change what the bytes after
+/// the header mean. Extracted so the refusal is testable without a
+/// `TaskContext`: the failure it guards against is the one nobody sets up by
+/// accident.
+fn check_fingerprint(tag: &[u8]) -> Result<()> {
+    let mut bytes = [0u8; 4];
+    bytes.copy_from_slice(tag);
+    let theirs = u32::from_le_bytes(bytes);
+    if theirs == FINGERPRINT {
+        return Ok(());
+    }
+    Err(DataFusionError::Internal(format!(
+        "OxidePhysicalCodec: plan was encoded by a build with fingerprint {theirs:#010x}; \
+         this build is {FINGERPRINT:#010x}. The two ends of the cluster are not the same \
+         version, or were built with different features (oxidelake-compute feature mask \
+         {:#x} here). The plan is refused rather than decoded into parameters that would \
+         only look right.",
+        oxidelake_compute::FEATURE_MASK
+    )))
+}
 
 /// Serialized form of one `Gpu*Exec` node (children excluded).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -232,14 +293,15 @@ impl PhysicalExtensionCodec for OxidePhysicalCodec {
         inputs: &[Arc<dyn ExecutionPlan>],
         ctx: &TaskContext,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        if buf.len() > MAGIC.len() + 1 && &buf[..MAGIC.len()] == MAGIC {
+        if buf.len() > HEADER && &buf[..MAGIC.len()] == MAGIC {
             let version = buf[MAGIC.len()];
             if version != VERSION {
                 return Err(DataFusionError::Internal(format!(
                     "OxidePhysicalCodec: unsupported payload version {version} (expected {VERSION})"
                 )));
             }
-            let node: GpuNode = postcard::from_bytes(&buf[MAGIC.len() + 1..]).map_err(|e| {
+            check_fingerprint(&buf[MAGIC.len() + 1..HEADER])?;
+            let node: GpuNode = postcard::from_bytes(&buf[HEADER..]).map_err(|e| {
                 DataFusionError::Internal(format!("OxidePhysicalCodec: corrupt payload: {e}"))
             })?;
             return Self::build(node, inputs);
@@ -252,6 +314,7 @@ impl PhysicalExtensionCodec for OxidePhysicalCodec {
             Some(gpu) => {
                 buf.extend_from_slice(MAGIC);
                 buf.push(VERSION);
+                buf.extend_from_slice(&FINGERPRINT.to_le_bytes());
                 let payload = postcard::to_allocvec(&gpu).map_err(|e| {
                     DataFusionError::Internal(format!("OxidePhysicalCodec: encode failed: {e}"))
                 })?;
@@ -260,5 +323,79 @@ impl PhysicalExtensionCodec for OxidePhysicalCodec {
             }
             None => self.inner.try_encode(node, buf),
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// The fingerprint is derived, not declared, so it cannot be forgotten
+    /// the way the version byte can (#42).
+    #[test]
+    fn the_fingerprint_depends_on_the_version_and_the_feature_set() {
+        // Recomputed here the way a different build would, rather than
+        // asserting a literal: a literal would have to be updated on every
+        // release and would then be testing that somebody updated it.
+        let expected = {
+            let h = fnv1a(0x811c_9dc5, env!("CARGO_PKG_VERSION").as_bytes());
+            let h = fnv1a(h, &[VERSION]);
+            fnv1a(h, &oxidelake_compute::FEATURE_MASK.to_le_bytes())
+        };
+        assert_eq!(FINGERPRINT, expected);
+
+        // A different crate version and a different feature set each move it.
+        let other_version = fnv1a(
+            fnv1a(fnv1a(0x811c_9dc5, b"0.0.0-not-this-build"), &[VERSION]),
+            &oxidelake_compute::FEATURE_MASK.to_le_bytes(),
+        );
+        assert_ne!(FINGERPRINT, other_version, "the crate version is in it");
+
+        let other_features = fnv1a(
+            fnv1a(
+                fnv1a(0x811c_9dc5, env!("CARGO_PKG_VERSION").as_bytes()),
+                &[VERSION],
+            ),
+            &(oxidelake_compute::FEATURE_MASK ^ 0b1).to_le_bytes(),
+        );
+        assert_ne!(
+            FINGERPRINT, other_features,
+            "flipping the `predict` bit must move it: that is the mismatch \
+             this exists to catch"
+        );
+    }
+
+    /// The refusal names both fingerprints and says what it means, because
+    /// the person reading it is looking at a cluster that half works.
+    #[test]
+    fn a_foreign_fingerprint_is_refused_and_named() {
+        check_fingerprint(&FINGERPRINT.to_le_bytes()).expect("our own plan decodes");
+
+        let foreign = FINGERPRINT ^ 0xdead_beef;
+        let err = check_fingerprint(&foreign.to_le_bytes())
+            .expect_err("a plan from another build is refused");
+        let text = err.to_string();
+        assert!(text.contains(&format!("{foreign:#010x}")), "{text}");
+        assert!(text.contains(&format!("{FINGERPRINT:#010x}")), "{text}");
+        assert!(
+            text.contains("not the same version") && text.contains("different features"),
+            "the message says which two things could differ: {text}"
+        );
+    }
+
+    /// The header is exactly what `try_encode` writes, so the offsets the
+    /// decoder slices at are not two independent guesses.
+    #[test]
+    fn the_header_is_magic_version_and_fingerprint() {
+        assert_eq!(HEADER, MAGIC.len() + 1 + 4);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(MAGIC);
+        buf.push(VERSION);
+        buf.extend_from_slice(&FINGERPRINT.to_le_bytes());
+        assert_eq!(buf.len(), HEADER);
+        assert_eq!(&buf[..MAGIC.len()], MAGIC);
+        assert_eq!(buf[MAGIC.len()], VERSION);
+        check_fingerprint(&buf[MAGIC.len() + 1..HEADER]).expect("its own header verifies");
     }
 }

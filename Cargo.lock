@@ -4085,6 +4085,7 @@ dependencies = [
  "arrow",
  "datafusion",
  "datafusion-proto",
+ "insta",
  "oxidelake-compute",
  "oxidelake-core",
  "postcard",
