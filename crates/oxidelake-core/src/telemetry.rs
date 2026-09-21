@@ -351,14 +351,7 @@ pub struct TelemetryHub {
     capacity: RwLock<TierCapacity>,
 }
 
-/// The process-wide hub.
-///
-/// Cluster executors do not build their operators — the plan arrives over the
-/// wire and the codec rebuilds it — so there is no session object to hand a
-/// hub to. This is that hub: the codec attaches it to every `Gpu*Exec` it
-/// decodes, which is what makes a worker's `/metrics` describe the work the
-/// worker actually did rather than an empty struct. Embedded sessions own
-/// their own hub and never touch this one.
+/// Backs [`TelemetryHub::global`].
 static GLOBAL: OnceLock<Arc<TelemetryHub>> = OnceLock::new();
 
 impl TelemetryHub {
@@ -367,7 +360,14 @@ impl TelemetryHub {
         Arc::new(Self::default())
     }
 
-    /// The process-wide hub (see [`GLOBAL`]).
+    /// The process-wide hub.
+    ///
+    /// Cluster executors do not build their operators — the plan arrives over
+    /// the wire and the codec rebuilds it — so there is no session object to
+    /// hand a hub to. The codec attaches this one to every `Gpu*Exec` it
+    /// decodes, which is what makes a worker's `/metrics` describe the work
+    /// the worker actually did. Embedded sessions own their own hub and never
+    /// touch this one.
     pub fn global() -> &'static Arc<TelemetryHub> {
         GLOBAL.get_or_init(TelemetryHub::new)
     }

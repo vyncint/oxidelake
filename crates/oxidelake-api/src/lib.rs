@@ -29,7 +29,7 @@ mod frame;
 pub use frame::{OxideFrame, OxideSessionExt};
 pub use oxidelake_core::params::DistanceMetric;
 pub use oxidelake_core::{BackendKind, EngineError};
-pub use oxidelake_runtime::{OxideSession, SessionMode};
+pub use oxidelake_runtime::{OutputFormat, OxideSession, SessionMode, SessionOptions};
 
 /// Commonly used imports: the session and frame types plus the DataFusion
 /// expression builders the verbs take.
@@ -39,6 +39,6 @@ pub mod prelude {
 
     pub use crate::{
         BackendKind, DistanceMetric, EngineError, OxideFrame, OxideSession, OxideSessionExt,
-        SessionMode,
+        SessionMode, SessionOptions,
     };
 }
