@@ -37,7 +37,7 @@ pub const FEATURE_MASK: u32 = (cfg!(feature = "predict") as u32)
     | ((cfg!(feature = "cuda") as u32) << 1)
     | ((cfg!(feature = "metal") as u32) << 2);
 
-pub use backend::local_backend;
+pub use backend::{init_local_backend, local_backend};
 pub use exec::{
     GpuAggregateExec, GpuFilterExec, GpuHashJoinExec, GpuVectorDistanceExec,
     aggregate_output_schema,

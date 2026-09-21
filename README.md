@@ -146,6 +146,55 @@ cargo test -p oxidelake-compute --features metal -- --ignored
 OXIDE_BACKEND=cuda cargo test -p oxidelake-compute --features cuda -- --ignored
 ```
 
+## Configuration
+
+Every knob OxideLake reads, in one table. Flags win over environment
+variables; an explicit choice that the machine cannot honour is a startup
+error, never a silent fallback.
+
+### `oxide`
+
+| Knob | Where | Default | What it does |
+| --- | --- | --- | --- |
+| `--query`, `-q` | `sql`, `explain`, `tui` | — | The SQL statement (optional for `tui`, which then shows the demo model). |
+| `--table`, `-t` | `sql`, `explain`, `tui` | — | Registers `NAME=PATH` (a Parquet file or directory) before planning. Repeatable. |
+| `--cluster` | `sql` | — | Runs on a Ballista scheduler (`df://host:port`) instead of in-process. |
+| `--target` | `sql`, `explain`, `tui` | detected | Plans for `cpu`, `cuda` or `metal`. Placement only: execution uses the hardware that is present. Embedded mode only — on a cluster the scheduler decides. |
+| `--batch-size` | `sql`, `explain`, `tui` | 8192, or 65536 on a GPU target | Rows per record batch. Batch boundaries never change results; larger batches amortise the host↔device round trip. `0` is refused. |
+| `--output` | `sql` | `table` | `table`, `json` (an array of objects) or `csv` (RFC 4180 with a header). An empty result still prints the CSV header and `[]`, so a script can tell "no rows" from "the query failed". |
+| `--rows` | `gen-data` | `1000000` | Rows in the demo table. |
+| `--out` | `gen-data` | — | Output directory; writes `<out>/t.parquet`. |
+| `--seed` | `gen-data` | `42` | PRNG seed. The same seed always writes the same bytes. |
+| `--row-group-rows` | `gen-data` | `65536` | Rows per Parquet row group. |
+| `--compression` | `gen-data` | `zstd` | `none`, `lz4` or `zstd`. |
+
+### `oxide-scheduler`
+
+| Knob | Default | What it does |
+| --- | --- | --- |
+| `--bind-host` | `127.0.0.1` | Address to bind. |
+| `--port` | `50050` | gRPC port. |
+| `--cluster-backend` | `$OXIDE_CLUSTER_BACKEND`, then `cpu` | The capability the cluster declares, which is what placement rewrites against. |
+
+### `oxide-worker`
+
+| Knob | Default | What it does |
+| --- | --- | --- |
+| `--scheduler-host` / `--scheduler-port` | `localhost` / `50050` | The scheduler to join. |
+| `--port` | `50051` | Arrow Flight port for shuffle data. |
+| `--grpc-port` | `50052` | gRPC control port. |
+| `--concurrent-tasks` | available parallelism | Tasks run at once. |
+| `--work-dir` | a temporary directory | Where shuffle files go. |
+| `--backend` | `$OXIDE_BACKEND`, then detected | The backend this worker executes on. Selected before the first task, so it reaches the operators; a backend the machine cannot provide is a startup error. |
+
+### Environment
+
+| Variable | Read by | What it does |
+| --- | --- | --- |
+| `OXIDE_BACKEND` | every process that executes operators | Forces `cpu`, `cuda` or `metal` instead of the detected backend. `oxide-worker --backend` overrides it. |
+| `OXIDE_CLUSTER_BACKEND` | `oxide-scheduler` | The cluster's declared placement capability (default `cpu`: no GPU rewrites). `--cluster-backend` overrides it. |
+| `RUST_LOG` | every binary | `tracing` filter; logs go to stderr, so they never mix into `--output json`. |
+
 ## Repository map
 
 | Path | Purpose |

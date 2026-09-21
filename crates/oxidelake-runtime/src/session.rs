@@ -35,6 +35,62 @@ pub enum SessionMode {
     },
 }
 
+/// Knobs a session is built with.
+///
+/// Every field has a default that matches the no-argument constructors, so
+/// `SessionOptions::default()` and [`OxideSession::local`] agree. The struct
+/// is `#[non_exhaustive]`: a knob added later is a minor release, not a
+/// broken build for anyone who used the builder methods.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SessionOptions {
+    /// Plan for this backend instead of the detected one (embedded only).
+    pub target: Option<BackendKind>,
+    /// Rows per record batch. `None` leaves DataFusion's default (8192), or
+    /// [`oxidelake_storage::GPU_BATCH_SIZE`] when the placement target is a GPU.
+    pub batch_size: Option<usize>,
+}
+
+impl SessionOptions {
+    /// Defaults: detected backend, default batch size.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Plans for `target` rather than the detected backend.
+    pub fn with_target(mut self, target: BackendKind) -> Self {
+        self.target = Some(target);
+        self
+    }
+
+    /// Sets the rows per record batch, overriding the CPU and GPU defaults.
+    pub fn with_batch_size(mut self, rows: usize) -> Self {
+        self.batch_size = Some(rows);
+        self
+    }
+
+    /// Applies the batch size to `config`, or the GPU default when the
+    /// placement target is a device and no size was asked for.
+    ///
+    /// A batch size of zero is rejected here rather than passed on: DataFusion
+    /// would take it and then produce no rows at all, which reads as an empty
+    /// result rather than as a bad flag.
+    fn apply(
+        &self,
+        config: SessionConfig,
+        target: Option<BackendKind>,
+    ) -> Result<SessionConfig, EngineError> {
+        match self.batch_size {
+            Some(0) => Err(EngineError::plan(
+                "batch size must be at least 1 row (0 would make every query return nothing)",
+            )),
+            Some(rows) => Ok(config.with_batch_size(rows)),
+            None if target.is_some_and(BackendKind::is_gpu) => Ok(with_gpu_batch_size(config)),
+            None => Ok(config),
+        }
+    }
+}
+
 /// An OxideLake session.
 pub struct OxideSession {
     ctx: SessionContext,
@@ -47,7 +103,7 @@ impl OxideSession {
     /// registered, the SQL UDFs, and the placement rule targeting the detected
     /// backend.
     pub fn local() -> Result<Self, EngineError> {
-        Self::local_with_target(local_backend()?.kind())
+        Self::local_with_options(&SessionOptions::new())
     }
 
     /// An embedded session whose placement rule targets `target` instead of
@@ -56,12 +112,18 @@ impl OxideSession {
     /// CPU reference, so planning for an absent GPU is safe — it is exactly
     /// what cluster executors do with the scheduler's plans.
     pub fn local_with_target(target: BackendKind) -> Result<Self, EngineError> {
+        Self::local_with_options(&SessionOptions::new().with_target(target))
+    }
+
+    /// An embedded session built with `options`.
+    pub fn local_with_options(options: &SessionOptions) -> Result<Self, EngineError> {
+        let target = match options.target {
+            Some(target) => target,
+            None => local_backend()?.kind(),
+        };
         let telemetry = TelemetryHub::new();
         let rule = HardwarePlacementRule::new(target).with_telemetry(Arc::clone(&telemetry));
-        let mut config = with_pruning(SessionConfig::new());
-        if target.is_gpu() {
-            config = with_gpu_batch_size(config);
-        }
+        let config = options.apply(with_pruning(SessionConfig::new()), Some(target))?;
         let state = SessionStateBuilder::new()
             .with_default_features()
             .with_config(config)
@@ -84,8 +146,19 @@ impl OxideSession {
     /// and the SQL UDFs so queries plan client-side; placement itself happens
     /// on the scheduler.
     pub async fn connect(scheduler_url: &str) -> Result<Self, EngineError> {
+        Self::connect_with_options(scheduler_url, &SessionOptions::new()).await
+    }
+
+    /// Connects to a Ballista scheduler with `options`. `target` is ignored:
+    /// on a cluster the scheduler's `OXIDE_CLUSTER_BACKEND` decides placement,
+    /// so a client-side target would be a knob that quietly does nothing.
+    pub async fn connect_with_options(
+        scheduler_url: &str,
+        options: &SessionOptions,
+    ) -> Result<Self, EngineError> {
         let config = with_pruning(SessionConfig::new_with_ballista())
             .with_ballista_physical_extension_codec(cluster::oxide_codec());
+        let config = options.apply(config, None)?;
         let state = SessionStateBuilder::new()
             .with_default_features()
             .with_config(config)
@@ -166,5 +239,57 @@ mod tests {
         assert_eq!(batches[0].num_rows(), 1);
         let text = session.explain("SELECT 1 + 1 AS two").await.unwrap();
         assert!(text.contains("ProjectionExec"), "{text}");
+    }
+
+    fn batch_size(session: &OxideSession) -> usize {
+        session.ctx().state().config().batch_size()
+    }
+
+    /// `--batch-size` has to reach DataFusion's configuration: a flag that is
+    /// parsed and then dropped would pass every test that only compares query
+    /// results, because batch boundaries do not change them.
+    #[test]
+    fn the_batch_size_option_reaches_the_session_configuration() {
+        let session =
+            OxideSession::local_with_options(&SessionOptions::new().with_batch_size(7)).unwrap();
+        assert_eq!(batch_size(&session), 7);
+    }
+
+    /// Without an explicit size, a GPU-targeted session keeps the larger
+    /// default that amortises the host↔device round trip, and a CPU one keeps
+    /// DataFusion's. An explicit size overrides both.
+    #[test]
+    fn the_target_picks_the_default_batch_size_and_the_option_overrides_it() {
+        let gpu = OxideSession::local_with_target(BackendKind::Cuda).unwrap();
+        assert_eq!(batch_size(&gpu), oxidelake_storage::GPU_BATCH_SIZE);
+
+        let cpu = OxideSession::local_with_target(BackendKind::CpuSimd).unwrap();
+        assert_eq!(batch_size(&cpu), SessionConfig::new().batch_size());
+
+        let forced = OxideSession::local_with_options(
+            &SessionOptions::new()
+                .with_target(BackendKind::Cuda)
+                .with_batch_size(1_024),
+        )
+        .unwrap();
+        assert_eq!(batch_size(&forced), 1_024);
+    }
+
+    #[test]
+    fn a_zero_batch_size_is_refused() {
+        let err = OxideSession::local_with_options(&SessionOptions::new().with_batch_size(0))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("at least 1 row"), "{err}");
+    }
+
+    /// The no-argument constructors and `SessionOptions::default()` are the
+    /// same session, so the builder cannot drift away from the plain one.
+    #[test]
+    fn the_default_options_are_the_plain_constructor() {
+        let plain = OxideSession::local().unwrap();
+        let built = OxideSession::local_with_options(&SessionOptions::default()).unwrap();
+        assert_eq!(plain.mode(), built.mode());
+        assert_eq!(batch_size(&plain), batch_size(&built));
     }
 }

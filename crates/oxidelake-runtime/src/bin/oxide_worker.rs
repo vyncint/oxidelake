@@ -1,6 +1,7 @@
 //! `oxide-worker` — a Ballista executor that can run OxideLake's `Gpu*Exec` operators.
 
 use clap::Parser;
+use oxidelake_core::BackendKind;
 use oxidelake_runtime::cluster;
 use tracing_subscriber::EnvFilter;
 
@@ -29,6 +30,12 @@ struct Cli {
     /// Directory for shuffle files (default: a temporary directory).
     #[arg(long)]
     work_dir: Option<String>,
+    /// Backend this worker executes on (cpu, cuda or metal), overriding
+    /// `OXIDE_BACKEND`. A backend this machine cannot provide is a startup
+    /// error, never a silent fall back to the CPU — a worker that reports
+    /// GPU capacity it does not have poisons the whole cluster's placement.
+    #[arg(long, value_name = "BACKEND")]
+    backend: Option<BackendKind>,
 }
 
 #[tokio::main]
@@ -38,7 +45,13 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();
-    let backend = oxidelake_compute::local_backend()?;
+    // Selected before anything runs: operators read the memoised
+    // `local_backend()`, so a choice made after the first task would be
+    // accepted and then ignored.
+    let backend = match cli.backend {
+        Some(kind) => oxidelake_compute::init_local_backend(Some(kind.as_str()))?,
+        None => oxidelake_compute::local_backend()?,
+    };
     tracing::info!(backend = %backend.kind(), "worker backend");
     cluster::run_executor(cluster::executor_config(
         &cli.scheduler_host,

@@ -4,7 +4,7 @@ use std::io::{self, Write};
 
 use clap::{Parser, Subcommand};
 use oxidelake_core::BackendKind;
-use oxidelake_runtime::{OxideSession, dashboard};
+use oxidelake_runtime::{OutputFormat, OxideSession, SessionOptions, dashboard};
 use oxidelake_storage::{Compression, demo_write_options, write_demo_table};
 use tracing_subscriber::EnvFilter;
 
@@ -75,6 +75,13 @@ enum Command {
         /// planned for an absent GPU take the CPU path. Embedded mode only.
         #[arg(long, value_name = "BACKEND")]
         target: Option<BackendKind>,
+        /// Rows per record batch, overriding the CPU default (8192) and the
+        /// GPU-target default (65536). Batch boundaries never change results.
+        #[arg(long, value_name = "ROWS")]
+        batch_size: Option<usize>,
+        /// How to print the result: table, json or csv.
+        #[arg(long, value_name = "FORMAT", default_value = "table")]
+        output: OutputFormat,
     },
     /// Print the physical plan for a SQL statement (with placement tags in embedded mode).
     Explain {
@@ -87,6 +94,11 @@ enum Command {
         /// Plan for this backend (cpu, cuda or metal) instead of the detected one.
         #[arg(long, value_name = "BACKEND")]
         target: Option<BackendKind>,
+        /// Rows per record batch (see `oxide sql --batch-size`), so the plan
+        /// is built under the same session configuration as the `oxide sql`
+        /// run it explains.
+        #[arg(long, value_name = "ROWS")]
+        batch_size: Option<usize>,
     },
     /// Open the terminal dashboard: run a query and inspect its plan,
     /// telemetry and column profiles — or a synthetic demo without a query.
@@ -100,6 +112,9 @@ enum Command {
         /// Plan for this backend (cpu, cuda or metal) instead of the detected one.
         #[arg(long, value_name = "BACKEND")]
         target: Option<BackendKind>,
+        /// Rows per record batch (see `oxide sql --batch-size`).
+        #[arg(long, value_name = "ROWS")]
+        batch_size: Option<usize>,
     },
 }
 
@@ -116,16 +131,25 @@ fn parse_tables(tables: &[String]) -> anyhow::Result<Vec<(&str, &str)>> {
 async fn session(
     cluster: Option<&str>,
     target: Option<BackendKind>,
+    batch_size: Option<usize>,
     tables: &[String],
 ) -> anyhow::Result<OxideSession> {
+    let mut options = SessionOptions::new();
+    if let Some(rows) = batch_size {
+        options = options.with_batch_size(rows);
+    }
     let session = match (cluster, target) {
         (Some(_), Some(_)) => anyhow::bail!(
             "--target picks the embedded placement target; on a cluster the \
              scheduler's OXIDE_CLUSTER_BACKEND decides placement"
         ),
-        (Some(url), None) => OxideSession::connect(url).await?,
-        (None, Some(target)) => OxideSession::local_with_target(target)?,
-        (None, None) => OxideSession::local()?,
+        (Some(url), None) => OxideSession::connect_with_options(url, &options).await?,
+        (None, target) => {
+            if let Some(target) = target {
+                options = options.with_target(target);
+            }
+            OxideSession::local_with_options(&options)?
+        }
     };
     for (name, path) in parse_tables(tables)? {
         session.register_parquet(name, path).await?;
@@ -162,28 +186,33 @@ async fn main() -> anyhow::Result<()> {
             tables,
             cluster,
             target,
+            batch_size,
+            output,
         } => {
-            let session = session(cluster.as_deref(), target, &tables).await?;
+            let session = session(cluster.as_deref(), target, batch_size, &tables).await?;
             // Not `DataFrame::show()`: that is `println!` inside DataFusion,
             // so a closed pipe panics there and the CLI never sees it (#34).
-            let batches = session.sql(&query).await?.collect().await?;
-            write_out(
-                &datafusion::arrow::util::pretty::pretty_format_batches(&batches)?.to_string(),
-            )?;
-            write_out("\n")?;
+            let frame = session.sql(&query).await?;
+            let schema = frame.schema().inner().clone();
+            let batches = frame.collect().await?;
+            write_out(&oxidelake_runtime::output::render(
+                &schema, &batches, output,
+            )?)?;
         }
         Command::Explain {
             query,
             tables,
             target,
+            batch_size,
         } => {
-            let session = session(None, target, &tables).await?;
+            let session = session(None, target, batch_size, &tables).await?;
             write_out(&session.explain(&query).await?)?;
         }
         Command::Tui {
             query,
             tables,
             target,
+            batch_size,
         } => {
             if !oxidelake_tui::is_interactive_terminal() {
                 eprintln!("{}", oxidelake_tui::NON_INTERACTIVE_TERMINAL_MESSAGE);
@@ -191,7 +220,7 @@ async fn main() -> anyhow::Result<()> {
             }
             let model = match &query {
                 Some(sql) => {
-                    let session = session(None, target, &tables).await?;
+                    let session = session(None, target, batch_size, &tables).await?;
                     let names: Vec<String> = parse_tables(&tables)?
                         .into_iter()
                         .map(|(name, _)| name.to_owned())

@@ -8,7 +8,9 @@
 
 pub mod cluster;
 pub mod dashboard;
+pub mod output;
 pub mod session;
 
+pub use output::OutputFormat;
 pub use oxidelake_compute::udf;
-pub use session::{OxideSession, SessionMode};
+pub use session::{OxideSession, SessionMode, SessionOptions};
