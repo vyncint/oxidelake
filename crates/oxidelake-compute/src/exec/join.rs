@@ -265,6 +265,9 @@ impl ExecutionPlan for GpuHashJoinExec {
     ) -> Result<SendableRecordBatchStream> {
         let left = self.left.execute(partition, Arc::clone(&context))?;
         let operator = self.config.operator("GpuHashJoinExec")?;
+        let span = self
+            .config
+            .span("GpuHashJoinExec", partition, operator.backend().kind());
         let baseline = BaselineMetrics::new(&self.metrics, partition);
         let (left_key, right_key) = (self.left_key, self.right_key);
         let projection = self.projection.clone();
@@ -285,6 +288,7 @@ impl ExecutionPlan for GpuHashJoinExec {
         let stream = futures::stream::once(async move {
             let build = build_fut.await.map_err(DataFusionError::Shared)?;
             Ok::<_, DataFusionError>(left.map(move |batch| {
+                let _entered = span.enter();
                 let batch = batch?;
                 let _timer = baseline.elapsed_compute().timer();
                 let out = operator.hash_join(&batch, &build, left_key, projection.as_deref())?;

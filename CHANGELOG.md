@@ -8,6 +8,141 @@ versions (0.x) may contain breaking changes; they are always listed under a
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-21
+
+The observability release. A GPU deployment that silently ran everything on
+the CPU used to produce identical rows, identical `EXPLAIN` tags and nothing
+above `debug` — this release makes that visible, from a counter in the
+dashboard to a Prometheus endpoint on every worker.
+
+**It does not complete the production-readiness milestone.** Ten lines of
+[Phase 8](docs/roadmap.md) remain open; three of them (#28, #45, #46) need a
+CUDA device to verify on and one (#29) is what the spill manager's real
+wiring waits for.
+
+### Added
+
+- **The CPU-fallback counter** (#32). `fallback_batches` on `OperatorStats`
+  and `OperatorSnapshot` counts every batch that took the CPU reference path
+  although its operator was placed on a device. The TUI Inspector shows
+  `cpu fallback N / M` — green at zero, yellow when some batches fell back,
+  red when all of them did — and each operator logs one `warn!` on its first
+  fallback naming the reason. A silent fallback was previously detectable
+  only by re-running with `RUST_LOG=oxidelake_compute=debug`.
+
+- **Placement notes in `oxide explain`** (#32). A node the rule leaves on the
+  CPU is an ordinary DataFusion operator in the plan, indistinguishable from
+  one that was never eligible. `oxide explain` now prints, under the plan,
+  every node that was skipped and why — `AggregateExec: \`avg\` is not one of
+  the aggregates the device kernels implement (sum, count, min, max)`, `the
+  grouping key \`s\` is Utf8View; the device kernel groups on Int64`. A plan
+  that lowered completely prints nothing.
+
+- **Spans, a per-query log line and a metrics endpoint** (#33). An
+  `oxide.operator` span per operator and partition carrying `operator`,
+  `partition`, `target` (what the plan says) and `backend` (what is
+  executing). `OxideSession::collect` logs one `INFO` line per query with the
+  mode, rows, elapsed time and fallback count; `oxide sql` uses it, so
+  `RUST_LOG=oxidelake_runtime=info oxide sql …` prints one line per query.
+  Behind the new `metrics` feature, `oxide-worker --metrics-port` and
+  `oxide-scheduler --metrics-port` serve `oxide_*` counters as Prometheus
+  text. Cluster executors never run the placement rule, so the plan codec
+  attaches a process-wide `TelemetryHub` to every `Gpu*Exec` it decodes —
+  without that a worker's `/metrics` would describe no work at all. The
+  endpoint is unauthenticated, like the Ballista ports themselves: bind it on
+  a private interface. Without the feature `--metrics-port` is refused, never
+  ignored.
+
+- **`--batch-size`, `--output table|json|csv`, worker `--backend`** (#49).
+  `--batch-size` overrides the CPU default (8192) and the GPU-target default
+  (65536) on `sql`, `explain` and `tui`; zero is refused rather than silently
+  returning nothing. `--output json` writes an array of objects and
+  `--output csv` RFC 4180 with a header — an empty result still prints the
+  header and `[]`, so a script can tell "no rows" from "the query failed".
+  `oxide-worker --backend` mirrors `OXIDE_BACKEND` and is applied before the
+  first task, so it reaches the operators rather than being accepted and
+  ignored. Every flag and environment variable is now in one README table.
+
+- **`SessionOptions`** (#49), with `OxideSession::local_with_options` and
+  `connect_with_options`. `#[non_exhaustive]` with builder methods, so a knob
+  added later is a minor release.
+
+### Changed
+
+- **`predict` reads its activation from the model file** (#47). **Breaking
+  for existing model files.** A `safetensors` header declares
+  `{"__metadata__": {"oxidelake.activation": "relu"}}` — `relu`, `gelu`,
+  `sigmoid`, `tanh` or `none`, applied between the `Linear` layers and never
+  after the last. A file that declares nothing is refused with a message
+  naming the key and the alternative: `predict(path, features, 'relu')`, a
+  new third argument that must agree with the header when the file has one.
+
+  Fixing this found a worse bug. The loader built a stack of bare `Linear`
+  layers and applied **no activation at all**, while the module docs, the
+  README and ADR-0015 all said "ReLU between them" — so every non-linear
+  model returned a linear model's numbers, and the only test of the numbers
+  compared them against the same bare stack. The `none` case is now checked
+  against oxmera's own `Sequential::forward`, which does not share the
+  loader's loop, and `relu`, `gelu` and `none` must disagree with each other.
+
+- **Public enums are `#[non_exhaustive]`** (#41). `BackendKind`,
+  `Compression`, `SessionMode`, `MemoryClass`, `MemoryTier`, `Tier`,
+  `ModelSpec`, `Activation` and the TUI's `Panel` / `KeyInput` / `Transition`
+  now need a `_` arm in a downstream `match`. `ModelSpec::SequentialMlpRelu`
+  is gone, replaced by `ModelSpec::SequentialMlp { activation }` (see
+  `predict`, below). The **plan vocabulary stays
+  exhaustive on purpose** — `Predicate`, `Comparison`, `Literal`,
+  `AggregateFunction`, `DistanceMetric` and the codec's `GpuNode`: every
+  kernel must handle every variant, so a `_` arm in the CPU correctness
+  reference is a wrong answer that compiles. `docs/RELEASING.md` records the
+  distinction, and the DataFusion coupling that `cargo-semver-checks` cannot
+  see.
+
+- **The plan codec carries a version fingerprint** (#42). `postcard` is not
+  self-describing, so a `GpuNode` field added or reordered between builds
+  decodes without complaint into the wrong parameters and a mixed-build fleet
+  computes a confident wrong answer. Every encoded plan now carries a magic,
+  a format version and a fingerprint over the crate version and the compute
+  layer's feature mask; a plan from a different build is refused at decode
+  with both fingerprints named. A committed snapshot pins the bytes of all
+  four variants, so a wire-format change cannot land unnoticed.
+
+- **Memory-tier gauges show what the backend reports** (#25). Capacities come
+  from the local backend's `MemoryInfo` — the device's total for a GPU
+  backend, host RAM for the CPU one — instead of the fixed 8/4/2 GiB
+  constants the gauges used to be drawn against, and a tier the engine has no
+  number for is drawn without a ratio rather than against a plausible one.
+
+- **The dashboard says the spill manager is library-only** (#25).
+  `SpillManager` is not on the query path: no operator registers a batch with
+  it, so the tier gauges and spill counters stay at zero however much memory
+  a query used. The Telemetry panel says so (`spill library only: no query
+  registers batches`), as do the README, `STATUS.md` and
+  `docs/architecture.md`. Wiring it in is not a matter of calling it from the
+  join — the build side is probed by every batch — and waits on the streaming
+  aggregate (#29).
+
+- **`OperatorSnapshot` and `TelemetrySnapshot` gained public fields**
+  (`fallback_batches`, `capacity`). Both are exhaustively constructible, so a
+  downstream struct literal over them no longer compiles. They are snapshot
+  types read field by field in practice, which is why they stay plain structs
+  rather than becoming `#[non_exhaustive]` — a reader should be able to
+  destructure one.
+
+- **An unavailable backend names the backend, not the way it was asked for.**
+  `oxide-worker --backend cuda` reaches the same code as `OXIDE_BACKEND`, so
+  the message no longer sends the reader to a variable they did not set.
+
+- **Logs are uncoloured when stderr is not a terminal.** ANSI escapes in a
+  redirected log file are noise, and they break a grep for `field=value`.
+
+### Fixed
+
+- **`oxide sql` prints the columns of an empty result.** The CSV header and
+  the JSON `[]` are written from the plan's schema, which an empty result
+  still has.
+
+
 ## [0.1.4] - 2026-09-20
 
 ### Fixed
@@ -362,7 +497,8 @@ Metal executes on Apple silicon (verified on an M4 Pro and on GitHub's macOS
 runners); CUDA compiles and lints without a CUDA installation but has not yet
 run on a CUDA machine.
 
-[Unreleased]: https://github.com/vyncint/oxidelake/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/vyncint/oxidelake/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/vyncint/oxidelake/compare/v0.1.4...v0.2.0
 [0.1.4]: https://github.com/vyncint/oxidelake/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/vyncint/oxidelake/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/vyncint/oxidelake/compare/v0.1.1...v0.1.2

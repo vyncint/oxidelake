@@ -89,17 +89,29 @@ impl HardwareDetector {
                 }
                 instantiate_metal()
             }
+            // `BackendKind` is `#[non_exhaustive]`, so a backend added to
+            // oxidelake-core compiles here rather than breaking this crate.
+            // It cannot be instantiated without a backend implementation, so
+            // it is a typed error naming the kind — never a silent fallback
+            // to the CPU, which would report work as accelerated that ran on
+            // the reference path.
+            other => Err(EngineError::plan(format!(
+                "backend `{other}` has no implementation in this build of \
+                 oxidelake-device; it was added to BackendKind without a \
+                 backend behind it"
+            ))),
         }
     }
 }
 
+/// The request can arrive through [`BACKEND_ENV`] or through a command-line
+/// flag that mirrors it (`oxide-worker --backend`), so the message names the
+/// backend and the reason rather than one of the two ways of asking.
 fn unavailable(kind: BackendKind, compiled_in: bool) -> EngineError {
     let detail = if compiled_in {
-        format!(
-            "requested via {BACKEND_ENV} but no {kind} device or driver is present on this machine"
-        )
+        format!("explicitly requested but no {kind} device or driver is present on this machine")
     } else {
-        format!("requested via {BACKEND_ENV} but OxideLake was built without the `{kind}` feature")
+        format!("explicitly requested but OxideLake was built without the `{kind}` feature")
     };
     EngineError::device(kind, detail)
 }
@@ -186,7 +198,14 @@ mod tests {
                 ),
                 "{err}"
             );
-            assert!(err.to_string().contains(BACKEND_ENV));
+            // The message names the backend and why it is unavailable, not
+            // the way it was asked for: `oxide-worker --backend` reaches the
+            // same code and naming the environment variable there would send
+            // the reader to a knob they did not touch.
+            let message = err.to_string();
+            assert!(message.contains("cuda"), "{message}");
+            assert!(message.contains("explicitly requested"), "{message}");
+            assert!(!message.contains(BACKEND_ENV), "{message}");
         }
         if !availability.metal {
             let err = HardwareDetector::select_with(Some("metal")).unwrap_err();

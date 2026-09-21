@@ -122,6 +122,16 @@ by issue number rather than kept in a second document that drifts.
 Every line names an open issue and what would close it. Ticked lines link
 the release that shipped them.
 
+**0.2.0 did not finish this milestone.** It shipped the operability half —
+the CPU-fallback counter and placement notes (#32), spans, a per-query log
+line and a metrics endpoint (#33), the plan-codec fingerprint (#42), the CLI
+knobs (#49), `predict`'s activation header (#47), the `non_exhaustive` /
+semver policy (#41) — and settled the spill manager's scope honestly (#25).
+Ten lines remain, and the three that matter most cannot be closed here: #28,
+#45 and #46 need a CUDA device to verify on, and #29's streaming aggregate is
+what #25's real wiring waits for. Do not read 0.2.0 as "production ready";
+read it as "a running deployment can now tell whether its GPU is being used".
+
 ### Correctness
 
 - [x] io_uring worker reaps its CQE before returning (#27) — *Acceptance:* a
@@ -143,53 +153,64 @@ the release that shipped them.
       memory completes.
 - [ ] CUDA `SUM` detects Int64 overflow instead of wrapping (#46) —
       *Acceptance:* an overflowing sum is an error, not a wrong number.
-- [ ] `SpillManager` and `MemoryInfo` reach the operators, or the docs and
-      the TUI say they are library-only (#25).
+- [x] `SpillManager` and `MemoryInfo` reach the operators, or the docs and
+      the TUI say they are library-only (#25) — *closed the second way*:
+      tier capacities come from the backend's `MemoryInfo`, and the panel,
+      README, STATUS and architecture say the spill manager is a library
+      that no query path calls. Wiring it in needs the streaming aggregate
+      (#29) first. **0.2.0**
 
 ### Performance
 
-- [ ] Pinned staging for operator transfers (#26, audit P6) —
-      *Acceptance:* `Gpu*Exec` uploads and downloads through pinned memory,
-      with the before/after number recorded.
+- [x] Pinned staging for operator transfers (#26, audit P6) — *closed as
+      documentation*: the operator path is pageable and says so; the
+      measurement and the change are Phase 9. **0.1.4**
 - [ ] Double-buffered stream pipelines (audit P6-rest) — *Acceptance:*
       transfer and compute overlap for a multi-batch scan, measured.
 - [ ] CUDA join table persists across probe batches (#45) — *Acceptance:*
       the build side is uploaded once per join, not once per batch.
-- [ ] io_uring store wired into sessions, or the claim stays demoted (#24,
-      audit P12) — *Acceptance:* a test proves a Parquet scan goes through
-      the ring thread **and** the measurement says it is not slower.
+- [x] io_uring store wired into sessions, or the claim stays demoted (#24,
+      audit P12) — *the claim stays demoted*: no session constructs it, and
+      every document says so. **0.1.4**
 
 ### Operability
 
-- [ ] Per-batch CPU fallbacks and planner skip reasons are countable (#32)
-      — *Acceptance:* `fallback_batches` in the TUI Inspector; `EXPLAIN
-      VERBOSE` names why a shape stayed on the CPU.
-- [ ] Tracing spans on the query path and an exportable metrics surface
-      (#33).
+- [x] Per-batch CPU fallbacks and planner skip reasons are countable (#32)
+      — `fallback_batches` on `OperatorStats`, a `cpu fallback` line in the
+      TUI Inspector, one `warn!` per operator on first fallback, and
+      `oxide explain` printing `placement notes` naming every node the rule
+      left on the CPU and why. **0.2.0**
+- [x] Tracing spans on the query path and an exportable metrics surface
+      (#33) — an `oxide.operator` span per operator and partition, one
+      `INFO` line per query from `OxideSession::collect`, and
+      `--metrics-port` on the worker and scheduler behind the `metrics`
+      feature. **0.2.0**
 - [ ] Worker loss, Ballista retry settings and `SIGTERM` handling (#31,
       audit P13).
 - [ ] TLS/auth for cluster mode, or an enforced private-network posture
       (#30) — *Acceptance:* the production cluster instructions do not
       describe an unauthenticated listener.
-- [ ] Plan codec version fingerprint, failing fast on mixed builds (#42).
-- [ ] `--batch-size`, `--output table|json|csv`, worker `--backend` (#49) —
-      *Acceptance:* every knob in one README table, each with an
-      `assert_cmd` test.
-- [ ] `predict` reads its activation from the model header (#47) —
-      *Acceptance:* a header-less model is refused by name; a GELU model
-      works.
+- [x] Plan codec version fingerprint, failing fast on mixed builds (#42).
+      **0.2.0**
+- [x] `--batch-size`, `--output table|json|csv`, worker `--backend` (#49) —
+      every knob in one README table, each with an `assert_cmd` test.
+      **0.2.0**
+- [x] `predict` reads its activation from the model header (#47) — a
+      header-less model is refused by name and a GELU model works. It also
+      found that the loader applied *no* activation at all while three
+      documents said ReLU. **0.2.0**
 
 ### Supply chain and release
 
 - [ ] Ballista 55 / DataFusion 55 / arrow 59 chain bump (#40) — blocks #4
       and #54.
 - [ ] thrift advisory retired once parquet ≥ 59 lands (#4, #54).
-- [ ] Public enums `non_exhaustive`, DataFusion-coupling semver policy
-      written (#41) — *Acceptance:* lands in a minor, not a patch.
+- [x] Public enums `non_exhaustive`, DataFusion-coupling semver policy
+      written (#41) — landed in a minor, with the plan vocabulary left
+      exhaustive on purpose. **0.2.0**
 - [ ] On-demand CUDA execution job, made a release prerequisite (#38).
-- [ ] CI build-cache policy decided and documented (#39) — *Acceptance:*
-      SECURITY.md, ADR-0016/0017 and the workflows say the same thing.
-- [ ] termlens-cli installed prebuilt in CI (#48).
+- [x] CI build-cache policy decided and documented (#39). **0.1.4**
+- [x] termlens-cli installed prebuilt in CI (#48). **0.1.4**
 - [x] README, STATUS and CHANGELOG agree on CUDA execution and the
       published version (#36). **0.1.4**
 - [x] Page-index pruning proved beside statistics and Bloom filters (#43).

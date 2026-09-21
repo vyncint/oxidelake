@@ -9,6 +9,7 @@ use parquet::schema::types::ColumnPath;
 
 /// Compression codecs exposed on the command line (`--compression`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum Compression {
     /// ZSTD level 1: good ratio, fast decode (the default).
     #[default]

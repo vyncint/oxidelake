@@ -20,7 +20,24 @@ pub mod exec;
 pub mod operator;
 pub mod udf;
 
-pub use backend::local_backend;
+/// Which optional capabilities this build of the compute layer carries, as a
+/// bitmask.
+///
+/// A plan is only executable by an executor that can run every node in it,
+/// and the features decide what a planner will put there — `predict` adds a
+/// UDF the planner will happily reference and an executor without it cannot
+/// resolve. The plan codec folds this into its fingerprint so the mismatch
+/// is refused when the plan is decoded rather than discovered when it runs
+/// (#42).
+///
+/// Bit 0 `predict`, bit 1 `cuda`, bit 2 `metal`. Append, never renumber: an
+/// old executor reading a new mask must still disagree with it, which it
+/// does as long as the bits it knows keep their places.
+pub const FEATURE_MASK: u32 = (cfg!(feature = "predict") as u32)
+    | ((cfg!(feature = "cuda") as u32) << 1)
+    | ((cfg!(feature = "metal") as u32) << 2);
+
+pub use backend::{init_local_backend, local_backend};
 pub use exec::{
     GpuAggregateExec, GpuFilterExec, GpuHashJoinExec, GpuVectorDistanceExec,
     aggregate_output_schema,
@@ -34,7 +51,7 @@ pub use oxidelake_core::params::{
 #[cfg(feature = "predict")]
 pub mod predict;
 #[cfg(feature = "predict")]
-pub use predict::{Model, ModelSpec, PREDICT, predict_udf};
+pub use predict::{ACTIVATION_KEY, Activation, Model, ModelSpec, PREDICT, predict_udf};
 
 pub use udf::{
     COSINE_DISTANCE, L2_DISTANCE, cosine_distance_udf, distance_metric_for, distance_udf_name,

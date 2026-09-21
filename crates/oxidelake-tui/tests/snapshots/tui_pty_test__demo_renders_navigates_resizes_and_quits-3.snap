@@ -9,12 +9,12 @@ OxideLake  data/t.parquet — SELECT k, sum(v), count(v) FROM t WHERE k >= 2 AND
 │  GpuAggregateExec [CUDA]                                 ││████████████████████████████████████████████              │
 │    └─ GpuFilterExec [CUDA]                               ││█████████████████VRAM: 6.0 GiB / 8.0 GiB ███              │
 │▶     └─ DataSourceExec [CPU]                             ││██████████████████████                                    │
-│                                                          ││██████████████pinned RAM: 1.5 GiB / 4.0 GiB               │
-│                                                          ││███████████████                                           │
-│                                                          ││█████████████disk spill: 512.0 MiB / 2.0 GiB              │
+│                                                          ││███████████████host RAM: 1.5 GiB / 4.0 GiB                │
+│                                                          ││                                                          │
+│                                                          ││                  disk spill: 512.0 MiB                   │
 │                                                          ││PCIe  H2D 35.3 MiB  D2H 18.6 MiB                          │
 │                                                          ││NVMe  spilled 3.0 GiB (42 demotions)  reloaded 256.0 MiB (│
-│                                                          ││                                                          │
+│                                                          ││spill on the query path                                   │
 │                                                          ││                                                          │
 │                                                          ││                                                          │
 │                                                          ││                                                          │
@@ -36,7 +36,7 @@ OxideLake  data/t.parquet — SELECT k, sum(v), count(v) FROM t WHERE k >= 2 AND
 │latency/batch      4.100 ms                               ││                                                          │
 │memory              8.0 MiB                               ││                                                          │
 │H2D / D2H       0 B /    0 B                              ││                                                          │
-│                                                          ││                                                          │
+│cpu fallback        0 / 100                               ││                                                          │
 │                                                          ││                                                          │
 │                                                          ││                                                          │
 │                                                          ││                                                          │

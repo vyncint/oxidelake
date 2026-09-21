@@ -11,6 +11,7 @@ use ratatui::widgets::{
 };
 
 use oxidelake_core::BackendKind;
+use oxidelake_core::telemetry::OperatorSnapshot;
 
 use crate::model::DashboardModel;
 use crate::state::{AppState, Panel};
@@ -36,6 +37,12 @@ fn backend_tag(backend: BackendKind) -> Span<'static> {
         BackendKind::Cuda => ("[CUDA]", Color::Green),
         BackendKind::Metal => ("[Metal]", Color::Magenta),
         BackendKind::CpuSimd => ("[CPU]", Color::Blue),
+        // `BackendKind` is `#[non_exhaustive]`, so a backend added to
+        // oxidelake-core compiles here instead of breaking the dashboard.
+        // It renders as a question rather than as nothing: a tag the
+        // dashboard does not recognise is worth seeing, and silently
+        // drawing it as `[CPU]` would misreport where the work ran.
+        _ => ("[?]", Color::Yellow),
     };
     Span::styled(
         text,
@@ -166,11 +173,62 @@ fn render_inspector(state: &AppState, model: &DashboardModel, frame: &mut Frame<
                 human_bytes(op.bytes_h2d),
                 human_bytes(op.bytes_d2h)
             )),
+            fallback_line(op),
         ],
         (Some(node), None) => vec![Line::from(node.name.clone()), Line::from("no counters yet")],
         _ => vec![Line::from("no operator selected")],
     };
     frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// Says whether the three gauges above can move at all (#25).
+///
+/// `SpillManager` is a library in 0.x: no query registers a batch with it, so
+/// the tiers read zero however much memory a query used. A panel that showed
+/// a bounded memory model the engine does not have would be a lie told in
+/// colour, so it says which of the two it is showing.
+fn spill_scope_line(on_query_path: bool) -> Line<'static> {
+    if on_query_path {
+        Line::from(vec![
+            Span::raw("spill "),
+            Span::styled("on the query path", Style::default().fg(Color::Green)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::raw("spill "),
+            Span::styled(
+                "library only: no query registers batches",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
+    }
+}
+
+/// The CPU-fallback line (#32).
+///
+/// A GPU deployment that silently runs everything on the CPU produces the
+/// same rows and the same `EXPLAIN` tags as one that does not, so this is the
+/// line that tells them apart. It is coloured rather than merely printed:
+/// zero is the claim being made by the backend tag above it, and any other
+/// number contradicts it.
+fn fallback_line(op: &OperatorSnapshot) -> Line<'static> {
+    let style = if op.fell_back_entirely() {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    } else if op.fallback_batches > 0 {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::Green)
+    };
+    Line::from(vec![
+        Span::raw("cpu fallback "),
+        Span::styled(
+            format!(
+                "{:>14}",
+                format!("{} / {}", op.fallback_batches, op.batches)
+            ),
+            style,
+        ),
+    ])
 }
 
 fn ratio(used: u64, total: u64) -> f64 {
@@ -193,31 +251,38 @@ fn render_telemetry(state: &AppState, model: &DashboardModel, frame: &mut Frame<
     ])
     .areas(inner);
     let tiers = &model.telemetry.tiers;
-    // Fixed reference capacities keep the gauges deterministic; real capacity
-    // arrives with backend MemoryInfo in a later release.
-    const VRAM_CAP: u64 = 8 * 1024 * 1024 * 1024;
-    const HOST_CAP: u64 = 4 * 1024 * 1024 * 1024;
-    const DISK_CAP: u64 = 2 * 1024 * 1024 * 1024;
+    let capacity = model.telemetry.capacity;
+    // Capacities come from the backend's `MemoryInfo`, and a tier the engine
+    // has no number for says so rather than being drawn against a plausible
+    // constant — which is what these gauges used to do (#25). The disk tier
+    // has no capacity at all: the spill directory's free space is the
+    // filesystem's business, not the engine's.
     for (area, label, used, cap, color) in [
-        (vram, "VRAM", tiers.device_bytes, VRAM_CAP, Color::Green),
-        (host, "pinned RAM", tiers.host_bytes, HOST_CAP, Color::Cyan),
         (
-            disk,
-            "disk spill",
-            tiers.disk_bytes,
-            DISK_CAP,
-            Color::Yellow,
+            vram,
+            "VRAM",
+            tiers.device_bytes,
+            capacity.device_bytes,
+            Color::Green,
         ),
+        (
+            host,
+            "host RAM",
+            tiers.host_bytes,
+            capacity.host_bytes,
+            Color::Cyan,
+        ),
+        (disk, "disk spill", tiers.disk_bytes, None, Color::Yellow),
     ] {
+        let label = match cap {
+            Some(cap) => format!("{label}: {} / {}", human_bytes(used), human_bytes(cap)),
+            None => format!("{label}: {}", human_bytes(used)),
+        };
         frame.render_widget(
             Gauge::default()
                 .gauge_style(Style::default().fg(color))
-                .ratio(ratio(used, cap))
-                .label(format!(
-                    "{label}: {} / {}",
-                    human_bytes(used),
-                    human_bytes(cap)
-                )),
+                .ratio(cap.map_or(0.0, |cap| ratio(used, cap)))
+                .label(label),
             area,
         );
     }
@@ -238,6 +303,7 @@ fn render_telemetry(state: &AppState, model: &DashboardModel, frame: &mut Frame<
                 human_bytes(spill.reloaded_bytes),
                 spill.promotions
             )),
+            spill_scope_line(model.telemetry.capacity.spill_on_query_path),
         ]),
         rates,
     );

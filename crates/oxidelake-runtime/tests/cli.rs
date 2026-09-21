@@ -376,3 +376,292 @@ fn explain_into_a_closed_pipe_exits_zero_without_panicking() {
     assert!(!stderr.contains("panicked"), "{stderr}");
     assert_eq!(out.status.code(), Some(0), "stderr:\n{stderr}");
 }
+
+// --- The operational flags (#49): --batch-size, --output, --backend ---------
+
+/// `k -> n` parsed out of the CSV form, with the header checked.
+fn parse_csv(stdout: &str) -> BTreeMap<Option<i64>, i64> {
+    let mut lines = stdout.lines();
+    assert_eq!(lines.next(), Some("k,n"), "csv header\n{stdout}");
+    lines
+        .map(|line| {
+            let (k, n) = line.split_once(',').unwrap_or_else(|| panic!("{line:?}"));
+            let key = (!k.is_empty()).then(|| k.parse::<i64>().unwrap());
+            (key, n.parse::<i64>().unwrap())
+        })
+        .collect()
+}
+
+/// `k -> n` parsed out of the JSON form. A null `k` is *absent* from the
+/// object rather than `null`, which is arrow-json's encoding and is why this
+/// reads the key rather than expecting it.
+fn parse_json(stdout: &str) -> BTreeMap<Option<i64>, i64> {
+    let trimmed = stdout.trim();
+    let inner = trimmed
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or_else(|| panic!("not a JSON array: {trimmed}"));
+    if inner.is_empty() {
+        return BTreeMap::new();
+    }
+    inner
+        .split("},{")
+        .map(|object| {
+            let object = object.trim_matches(['{', '}']);
+            let mut row = (None, None);
+            for field in object.split(',') {
+                let (name, value) = field.split_once(':').unwrap();
+                match name.trim_matches('"') {
+                    "k" => row.0 = Some(value.parse::<i64>().unwrap()),
+                    "n" => row.1 = Some(value.parse::<i64>().unwrap()),
+                    other => panic!("unexpected field {other}"),
+                }
+            }
+            (row.0, row.1.expect("every row has a count"))
+        })
+        .collect()
+}
+
+const COUNT_QUERY: &str = "SELECT k, COUNT(v) AS n FROM t GROUP BY k ORDER BY k";
+
+/// The format is a rendering choice made after execution, so all three must
+/// carry the same rows — and `--batch-size` must not change them either. Both
+/// claims are in the flags' own `--help` text; this is what makes them true.
+#[test]
+fn output_formats_and_batch_sizes_agree_on_the_same_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    gen_data(dir.path(), 20_000);
+    let table_arg = format!("t={}", dir.path().display());
+
+    let run = |args: &[&str]| {
+        let assert = oxide()
+            .args(["sql", "-q", COUNT_QUERY, "--table", &table_arg])
+            .args(args)
+            .assert()
+            .success();
+        String::from_utf8(assert.get_output().stdout.clone()).unwrap()
+    };
+
+    let csv = parse_csv(&run(&["--output", "csv"]));
+    assert!(!csv.is_empty());
+    assert_eq!(parse_json(&run(&["--output", "json"])), csv);
+
+    // The table form is the default, and naming it explicitly changes nothing.
+    let table = run(&[]);
+    assert_eq!(run(&["--output", "table"]), table);
+    assert!(table.starts_with('+'), "{table}");
+
+    // A batch size far below and far above the row count: same answer.
+    for rows in ["1", "7", "1000000"] {
+        assert_eq!(
+            parse_csv(&run(&["--output", "csv", "--batch-size", rows])),
+            csv,
+            "--batch-size {rows}"
+        );
+    }
+}
+
+/// An empty result still says what the columns were, so a script can tell
+/// "no rows" from "the query failed".
+#[test]
+fn an_empty_result_keeps_its_csv_header_and_json_array() {
+    let dir = tempfile::tempdir().unwrap();
+    gen_data(dir.path(), 4_096);
+    let table_arg = format!("t={}", dir.path().display());
+    let run = |format: &str| {
+        let assert = oxide()
+            .args([
+                "sql",
+                "-q",
+                "SELECT k, COUNT(v) AS n FROM t WHERE k = -1 GROUP BY k",
+                "--table",
+                &table_arg,
+                "--output",
+                format,
+            ])
+            .assert()
+            .success();
+        String::from_utf8(assert.get_output().stdout.clone()).unwrap()
+    };
+    assert_eq!(run("csv"), "k,n\n");
+    assert_eq!(run("json"), "[]\n");
+}
+
+/// Zero rows per batch would be accepted by DataFusion and then return
+/// nothing, which reads as an empty result rather than as a bad flag.
+#[test]
+fn a_zero_batch_size_is_refused_rather_than_returning_nothing() {
+    let assert = oxide()
+        .args(["sql", "-q", "SELECT 1", "--batch-size", "0"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains("at least 1 row"), "{stderr}");
+}
+
+#[test]
+fn an_unknown_output_format_names_the_ones_that_exist() {
+    let assert = oxide()
+        .args(["sql", "-q", "SELECT 1", "--output", "yaml"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains("table, json, csv"), "{stderr}");
+}
+
+/// The batch-size and output flags are documented knobs, so they have to be
+/// discoverable from `--help` — that is where the README table points.
+#[test]
+fn the_flags_appear_in_help() {
+    let assert = oxide().args(["sql", "--help"]).assert().success();
+    let help = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    for flag in ["--batch-size", "--output", "--target", "--cluster"] {
+        assert!(help.contains(flag), "oxide sql --help lacks {flag}\n{help}");
+    }
+
+    let assert = Command::cargo_bin("oxide-worker")
+        .unwrap()
+        .arg("--help")
+        .assert()
+        .success();
+    let help = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(help.contains("--backend"), "{help}");
+    assert!(help.contains("OXIDE_BACKEND"), "{help}");
+}
+
+/// A worker asked for a backend this machine cannot provide must fail at
+/// startup rather than join the cluster on the CPU: the scheduler would then
+/// place GPU operators on a worker that has no GPU.
+///
+/// Guarded by the real availability, because on a machine that *does* have the
+/// device the worker would start and then block waiting for a scheduler.
+#[test]
+fn a_worker_refuses_a_backend_this_machine_does_not_have() {
+    let availability = oxidelake_device::HardwareDetector::availability();
+    let absent = if !availability.cuda {
+        "cuda"
+    } else if !availability.metal {
+        "metal"
+    } else {
+        return;
+    };
+    let assert = Command::cargo_bin("oxide-worker")
+        .unwrap()
+        .args(["--backend", absent])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains(absent), "{stderr}");
+    assert!(stderr.contains("explicitly requested"), "{stderr}");
+}
+
+#[test]
+fn a_worker_rejects_an_unknown_backend_name() {
+    let assert = Command::cargo_bin("oxide-worker")
+        .unwrap()
+        .args(["--backend", "tpu"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains("cpu, cuda, metal"), "{stderr}");
+}
+
+/// `oxide explain` names why a node stayed on the CPU (#32).
+///
+/// The plan above the notes shows an ordinary `AggregateExec`, which is
+/// exactly what a node that was never eligible looks like; the difference is
+/// only visible because the rule writes its reason down.
+#[test]
+fn explain_names_why_a_node_stayed_on_the_cpu() {
+    let dir = tempfile::tempdir().unwrap();
+    gen_data(dir.path(), 4_096);
+    let table_arg = format!("t={}", dir.path().display());
+
+    let assert = oxide()
+        .args([
+            "explain",
+            "-q",
+            "SELECT k, AVG(v) FROM t GROUP BY k",
+            "--table",
+            &table_arg,
+            "--target",
+            "cuda",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(stdout.contains("placement notes (target cuda)"), "{stdout}");
+    assert!(stdout.contains("AggregateExec:"), "{stdout}");
+    assert!(stdout.contains("sum, count, min, max"), "{stdout}");
+
+    // A plan that lowers completely has nothing to explain.
+    let assert = oxide()
+        .args([
+            "explain",
+            "-q",
+            "SELECT k, SUM(v) FROM t WHERE k >= 2 GROUP BY k",
+            "--table",
+            &table_arg,
+            "--target",
+            "cuda",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(stdout.contains("GpuAggregateExec[cuda]"), "{stdout}");
+    assert!(!stdout.contains("placement notes"), "{stdout}");
+}
+
+// --- observability (#33) ----------------------------------------------------
+
+/// `RUST_LOG=info oxide sql …` prints one line per query with the mode, the
+/// rows, the time and how much of it fell back to the CPU.
+#[test]
+fn a_query_logs_one_line_with_rows_and_elapsed() {
+    let dir = tempfile::tempdir().unwrap();
+    gen_data(dir.path(), 4_096);
+    let table_arg = format!("t={}", dir.path().display());
+
+    let assert = oxide()
+        .env("RUST_LOG", "oxidelake_runtime=info")
+        .args([
+            "sql",
+            "-q",
+            "SELECT k, SUM(v) FROM t WHERE k >= 2 GROUP BY k",
+            "--table",
+            &table_arg,
+            "--target",
+            "cuda",
+        ])
+        .assert()
+        .success();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains("query finished"), "{stderr}");
+    assert!(stderr.contains("mode=embedded/cuda"), "{stderr}");
+    assert!(stderr.contains("rows="), "{stderr}");
+    assert!(stderr.contains("elapsed_ms="), "{stderr}");
+    assert!(stderr.contains("fallback_batches="), "{stderr}");
+
+    // The log goes to stderr, so it never mixes into `--output json`.
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(!stdout.contains("query finished"), "{stdout}");
+}
+
+/// Without the `metrics` feature the flag is refused, not ignored. A worker
+/// that was asked for metrics and quietly served none is the failure the
+/// endpoint exists to prevent.
+#[test]
+#[cfg_attr(feature = "metrics", ignore = "the flag is honoured in this build")]
+fn a_metrics_port_without_the_feature_is_refused() {
+    let assert = Command::cargo_bin("oxide-worker")
+        .unwrap()
+        .args(["--metrics-port", "19999"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("--metrics-port needs the `metrics` feature"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("--features metrics"), "{stderr}");
+}

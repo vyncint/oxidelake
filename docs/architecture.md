@@ -66,6 +66,8 @@ flowchart LR
 - **The operator layer does not use it in 0.x.** `upload_bytes` copies from a pageable Arrow `Buffer` and `download_column` copies into a pageable `Vec`, so the operator path pays the staging copy that pinned memory exists to avoid; `alloc_pinned_host` is exercised only by the T4 device tests. Pinned staging for operator transfers is audit item P6 (#26), tracked in the roadmap's Phase 8. Any transfer-throughput number measured today is a pageable number.
 - On Apple Silicon, `MTLResourceStorageModeShared` buffers give CPU and GPU one physical allocation.
 - `SpillManager` holds per-tier budgets, demotes cold batches on high-watermark pressure, promotes on access, and exports metrics to the TUI. On a GPU-less machine the device tier is empty and the host ↔ disk path is fully testable.
+- **It is a library, not part of the query path** (#25). No operator registers a batch with it, so in a running query the tier gauges and the spill counters stay at zero however much memory the query used — a reading of zero there says nothing about the query. The dashboard states this rather than implying otherwise: the Telemetry panel's last line reads `spill library only: no query registers batches`, and `TelemetrySnapshot::capacity.spill_on_query_path` is the flag it renders. The gauges' capacities now come from the local backend's `MemoryInfo` (the device's total for a GPU backend, host RAM for the CPU one) instead of the fixed constants they used to be drawn against, and a tier the engine has no number for is drawn without a ratio.
+- Wiring it in is not a matter of calling it from the join. `GpuHashJoinExec`'s build side is probed by *every* batch, so demoting it would trade an unbounded memory claim for an unbounded time one, and promoting it once puts it straight back in host RAM; `GpuAggregateExec` collects its whole input before aggregating, so bounding it needs the streaming aggregate first. The honest version of this in 0.2 is the label; the engineering is Phase 8.
 
 ## Hardware abstraction
 
@@ -91,7 +93,19 @@ flowchart LR
 
 ## Telemetry and TUI
 
-`TelemetryHub` (in `oxidelake-core`) is the only coupling between engine and dashboard; in v1 it observes the local process only. The TUI is a state machine with a pure `render(state, frame)`; repaints are bracketed in DEC 2026 synchronized updates. Four panels: Plan DAG with hardware tags, Inspector, Telemetry gauges, Describe (P25/P50/P99). Tested two ways: in-process with `ratatui::backend::TestBackend` + `insta`, and end-to-end with `termlens` driving the deterministic `oxidelake-tui-demo` binary in a real PTY ([ADR-0011](decisions/ADR-0011-tui-testing-layers.md)).
+`TelemetryHub` (in `oxidelake-core`) is the only coupling between engine and dashboard; in v1 it observes the local process only. The TUI is a state machine with a pure `render(state, frame)`; repaints are bracketed in DEC 2026 synchronized updates. Four panels: Plan DAG with hardware tags, Inspector, Telemetry gauges, Describe (P25/P50/P99).
+
+### Observability
+
+Three surfaces, in increasing cost to the reader (#33):
+
+- **One `INFO` line per query**, from `OxideSession::collect`: `query finished mode=embedded/cuda rows=98 batches=1 elapsed_ms=3.9 gpu_operators=2 fallback_batches=2`. It is on `collect` and not on `sql`, because a `DataFrame` has not run yet. Logs go to stderr, so they never mix into `oxide sql --output json`, and ANSI is off unless stderr is a terminal.
+- **One span per `(operator, partition)`**, `oxide.operator`, entered around each batch, with fields `operator`, `partition`, `target` (what the plan says) and `backend` (what is executing). The pair is the question these logs exist to answer; they differ exactly when the CPU-fallback counter is moving. `GpuOperator`'s own methods run inside it and add no span of their own — a nested span there would carry no field the outer one does not.
+- **A Prometheus endpoint**, `oxide-worker --metrics-port` / `oxide-scheduler --metrics-port` (feature `metrics`): `oxide_operator_*` counters labelled by operator and backend, plus the tier gauges and spill counters. A cluster executor never runs the placement rule, so its operators are attached to a process-wide `TelemetryHub` by the plan codec; that hub is what is served. It is unauthenticated, like the Ballista ports themselves — bind it on a private interface. Without the feature the flag is refused rather than ignored.
+
+`OxideSession::telemetry()` is the embedded hub and stays empty for a cluster session: the work happened in other processes, and each of those has its own endpoint.
+
+The Inspector's `cpu fallback` line is the one counter that cannot be inferred from the others (#32). A GPU deployment that runs every batch on the CPU reference produces identical rows and identical `EXPLAIN` tags, so `fallback_batches / batches` is what tells the two apart; it is green at zero, yellow when some batches fell back and red when all of them did. The matching planner-side answer is the `placement notes` section `oxide explain` prints under the plan, naming each node the rule left on the CPU and why — a skipped node is an ordinary DataFusion operator in the plan above it, indistinguishable from one that was never eligible. Tested two ways: in-process with `ratatui::backend::TestBackend` + `insta`, and end-to-end with `termlens` driving the deterministic `oxidelake-tui-demo` binary in a real PTY ([ADR-0011](decisions/ADR-0011-tui-testing-layers.md)).
 
 ## Out of scope for v1
 

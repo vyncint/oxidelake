@@ -4,7 +4,7 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -13,6 +13,7 @@ use crate::BackendKind;
 
 /// The three memory tiers tracked by the spill manager.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum MemoryTier {
     /// Device (VRAM) memory.
     Device,
@@ -45,6 +46,7 @@ pub struct OperatorStats {
     bytes_h2d: AtomicU64,
     bytes_d2h: AtomicU64,
     memory_bytes: AtomicU64,
+    fallback_batches: AtomicU64,
 }
 
 impl OperatorStats {
@@ -60,6 +62,7 @@ impl OperatorStats {
             bytes_h2d: AtomicU64::new(0),
             bytes_d2h: AtomicU64::new(0),
             memory_bytes: AtomicU64::new(0),
+            fallback_batches: AtomicU64::new(0),
         }
     }
 
@@ -98,6 +101,22 @@ impl OperatorStats {
         self.memory_bytes.store(bytes, Ordering::Relaxed);
     }
 
+    /// Records one batch that took the CPU reference path although the
+    /// operator was placed on a device (#32).
+    ///
+    /// Identical results and identical `EXPLAIN` tags are exactly what a
+    /// silently-falling-back cluster produces, so this is the number that
+    /// distinguishes "the GPU ran it" from "something ran it". A batch is
+    /// counted once, where the decision is made.
+    pub fn record_fallback(&self) {
+        self.fallback_batches.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Batches that took the CPU reference path.
+    pub fn fallback_batches(&self) -> u64 {
+        self.fallback_batches.load(Ordering::Relaxed)
+    }
+
     /// A point-in-time copy of the counters.
     pub fn snapshot(&self) -> OperatorSnapshot {
         OperatorSnapshot {
@@ -111,6 +130,7 @@ impl OperatorStats {
             bytes_h2d: self.bytes_h2d.load(Ordering::Relaxed),
             bytes_d2h: self.bytes_d2h.load(Ordering::Relaxed),
             memory_bytes: self.memory_bytes.load(Ordering::Relaxed),
+            fallback_batches: self.fallback_batches.load(Ordering::Relaxed),
         }
     }
 }
@@ -138,9 +158,20 @@ pub struct OperatorSnapshot {
     pub bytes_d2h: u64,
     /// Currently allocated bytes.
     pub memory_bytes: u64,
+    /// Batches that ran on the CPU reference although the operator was
+    /// placed on a device. Zero is the claim "this operator is accelerated";
+    /// anything else is the size of the gap between the plan and what ran.
+    pub fallback_batches: u64,
 }
 
 impl OperatorSnapshot {
+    /// `true` when every batch this operator processed took the CPU
+    /// reference path — the shape of a GPU deployment that is not using its
+    /// GPU at all.
+    pub fn fell_back_entirely(&self) -> bool {
+        self.batches > 0 && self.fallback_batches >= self.batches
+    }
+
     /// Mean per-batch latency in milliseconds (zero when nothing ran).
     pub fn mean_batch_latency_ms(&self) -> f64 {
         if self.batches == 0 {
@@ -234,6 +265,27 @@ impl SpillCounters {
     }
 }
 
+/// What the engine knows about the size of each memory tier, and whether
+/// anything on the query path fills them (#25).
+///
+/// `None` is "this engine has no number", which is different from zero and
+/// different from a plausible constant. The gauges used to be drawn against
+/// fixed reference capacities, which made a dashboard that looked like a
+/// bounded memory model over an engine that had none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct TierCapacity {
+    /// Device memory the local backend reports, when it drives a device.
+    pub device_bytes: Option<u64>,
+    /// Host memory the local backend reports.
+    pub host_bytes: Option<u64>,
+    /// Whether a [`crate::telemetry::SpillCounters`] writer is on the query
+    /// path. `false` means the tier gauges and spill counters below can only
+    /// be moved by a caller using the spill manager as a library — no query
+    /// registers a batch with it — so a reading of zero says nothing about
+    /// the query's memory use.
+    pub spill_on_query_path: bool,
+}
+
 /// Snapshot of the spill counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct SpillSnapshot {
@@ -260,6 +312,26 @@ pub struct PlanNodeSummary {
     pub detail: String,
 }
 
+/// Why the placement rule left a node on the CPU (#32).
+///
+/// A skipped node is invisible in `EXPLAIN`: it is an ordinary DataFusion
+/// operator, indistinguishable from one that was never eligible. The reason
+/// was written to `debug!` and nowhere else, so the only way to find out was
+/// to re-run the query with `RUST_LOG` turned up — which is not available to
+/// someone reading a plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlacementSkip {
+    /// The DataFusion operator that stayed on the CPU, e.g. `HashJoinExec`.
+    pub node: String,
+    /// Why, in one line.
+    pub reason: String,
+}
+
+/// Most placement notes a hub keeps for one plan. A pathological plan should
+/// not grow the hub without bound, and a reader stops reading long before
+/// this.
+pub const MAX_PLACEMENT_SKIPS: usize = 256;
+
 /// Most operator registrations a hub keeps. A hub lives as long as its session
 /// and every `Gpu*Exec` instance registers once, so without a bound a
 /// long-lived session would accumulate one entry per operator of every query
@@ -275,12 +347,29 @@ pub struct TelemetryHub {
     tiers: TierGauges,
     spill: SpillCounters,
     plan: RwLock<Vec<PlanNodeSummary>>,
+    skips: RwLock<Vec<PlacementSkip>>,
+    capacity: RwLock<TierCapacity>,
 }
+
+/// Backs [`TelemetryHub::global`].
+static GLOBAL: OnceLock<Arc<TelemetryHub>> = OnceLock::new();
 
 impl TelemetryHub {
     /// Creates a shared hub.
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// The process-wide hub.
+    ///
+    /// Cluster executors do not build their operators — the plan arrives over
+    /// the wire and the codec rebuilds it — so there is no session object to
+    /// hand a hub to. The codec attaches this one to every `Gpu*Exec` it
+    /// decodes, which is what makes a worker's `/metrics` describe the work
+    /// the worker actually did. Embedded sessions own their own hub and never
+    /// touch this one.
+    pub fn global() -> &'static Arc<TelemetryHub> {
+        GLOBAL.get_or_init(TelemetryHub::new)
     }
 
     /// Registers an operator and returns its live counters. Ids increase
@@ -313,9 +402,52 @@ impl TelemetryHub {
             .clear();
     }
 
+    /// Records why the placement rule left a node on the CPU.
+    pub fn record_skip(&self, node: impl Into<String>, reason: impl Into<String>) {
+        let mut skips = self.skips.write().unwrap_or_else(PoisonError::into_inner);
+        if skips.len() >= MAX_PLACEMENT_SKIPS {
+            return;
+        }
+        skips.push(PlacementSkip {
+            node: node.into(),
+            reason: reason.into(),
+        });
+    }
+
+    /// The placement notes recorded since the last [`Self::clear_skips`].
+    pub fn skips(&self) -> Vec<PlacementSkip> {
+        self.skips
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Forgets the placement notes (called before planning a fresh query, so
+    /// the notes belong to the plan being looked at).
+    pub fn clear_skips(&self) {
+        self.skips
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+    }
+
     /// Replaces the displayed plan.
     pub fn set_plan(&self, nodes: Vec<PlanNodeSummary>) {
         *self.plan.write().unwrap_or_else(PoisonError::into_inner) = nodes;
+    }
+
+    /// Records what the backend says the tiers hold, and whether anything on
+    /// the query path fills them.
+    pub fn set_capacity(&self, capacity: TierCapacity) {
+        *self
+            .capacity
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = capacity;
+    }
+
+    /// What was last recorded by [`Self::set_capacity`].
+    pub fn capacity(&self) -> TierCapacity {
+        *self.capacity.read().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Memory tier gauges.
@@ -347,6 +479,7 @@ impl TelemetryHub {
             tiers: self.tiers.snapshot(),
             spill: self.spill.snapshot(),
             plan,
+            capacity: self.capacity(),
         }
     }
 }
@@ -362,11 +495,165 @@ pub struct TelemetrySnapshot {
     pub spill: SpillSnapshot,
     /// The displayed plan.
     pub plan: Vec<PlanNodeSummary>,
+    /// Tier capacities, and whether the query path fills the tiers at all.
+    pub capacity: TierCapacity,
+}
+
+impl TelemetrySnapshot {
+    /// Renders the snapshot as Prometheus text (`text/plain; version=0.0.4`).
+    ///
+    /// Written by hand rather than through a metrics crate: the counters are
+    /// already the right shape, the output is a dozen lines, and a scrape
+    /// endpoint is not worth a dependency tree in a query engine. Operator
+    /// counters carry `operator` and `backend` labels; the tier gauges and
+    /// spill counters carry none.
+    ///
+    /// Label values are escaped per the exposition format, because an
+    /// operator name is `GpuFilterExec` today and a user-supplied string the
+    /// moment someone adds one.
+    pub fn to_prometheus(&self) -> String {
+        let mut out = String::new();
+        let counters: [OperatorCounter; 7] = [
+            ("oxide_operator_rows_in_total", "Input rows.", |o| o.rows_in),
+            ("oxide_operator_rows_out_total", "Output rows.", |o| {
+                o.rows_out
+            }),
+            ("oxide_operator_batches_total", "Batches processed.", |o| {
+                o.batches
+            }),
+            (
+                "oxide_operator_fallback_batches_total",
+                "Batches that ran on the CPU reference although the operator was placed on a device.",
+                |o| o.fallback_batches,
+            ),
+            (
+                "oxide_operator_elapsed_nanoseconds_total",
+                "Processing time.",
+                |o| o.elapsed_ns,
+            ),
+            (
+                "oxide_operator_bytes_h2d_total",
+                "Bytes copied host to device.",
+                |o| o.bytes_h2d,
+            ),
+            (
+                "oxide_operator_bytes_d2h_total",
+                "Bytes copied device to host.",
+                |o| o.bytes_d2h,
+            ),
+        ];
+        for (name, help, value) in counters {
+            out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} counter\n"));
+            for op in &self.operators {
+                out.push_str(&format!(
+                    "{name}{{operator=\"{}\",backend=\"{}\"}} {}\n",
+                    escape_label(&op.name),
+                    op.backend,
+                    value(op)
+                ));
+            }
+        }
+        out.push_str("# HELP oxide_operator_memory_bytes Currently allocated bytes.\n");
+        out.push_str("# TYPE oxide_operator_memory_bytes gauge\n");
+        for op in &self.operators {
+            out.push_str(&format!(
+                "oxide_operator_memory_bytes{{operator=\"{}\",backend=\"{}\"}} {}\n",
+                escape_label(&op.name),
+                op.backend,
+                op.memory_bytes
+            ));
+        }
+        let gauges = [
+            ("oxide_tier_device_bytes", self.tiers.device_bytes),
+            ("oxide_tier_host_bytes", self.tiers.host_bytes),
+            ("oxide_tier_disk_bytes", self.tiers.disk_bytes),
+        ];
+        for (name, value) in gauges {
+            out.push_str(&format!(
+                "# HELP {name} Bytes resident in this memory tier.\n# TYPE {name} gauge\n{name} {value}\n"
+            ));
+        }
+        let spill = [
+            ("oxide_spill_demotions_total", self.spill.demotions),
+            ("oxide_spill_promotions_total", self.spill.promotions),
+            ("oxide_spill_spilled_bytes_total", self.spill.spilled_bytes),
+            (
+                "oxide_spill_reloaded_bytes_total",
+                self.spill.reloaded_bytes,
+            ),
+        ];
+        for (name, value) in spill {
+            out.push_str(&format!(
+                "# HELP {name} Spill manager activity.\n# TYPE {name} counter\n{name} {value}\n"
+            ));
+        }
+        out
+    }
+}
+
+/// One exported operator counter: metric name, HELP text, and how to read it
+/// off a snapshot.
+type OperatorCounter = (&'static str, &'static str, fn(&OperatorSnapshot) -> u64);
+
+/// Escapes a Prometheus label value: backslash, double quote, newline.
+fn escape_label(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_snapshot_renders_as_prometheus_text() {
+        let hub = TelemetryHub::new();
+        let op = hub.register_operator("GpuFilterExec", BackendKind::Cuda);
+        op.record_batch(1_000, 400, Duration::from_millis(3));
+        op.record_transfer(2_048, 512);
+        op.record_fallback();
+        hub.tiers().set(MemoryTier::Disk, 4_096);
+        let text = hub.snapshot().to_prometheus();
+
+        assert!(
+            text.contains(
+                "oxide_operator_rows_in_total{operator=\"GpuFilterExec\",backend=\"cuda\"} 1000"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("oxide_operator_fallback_batches_total{operator=\"GpuFilterExec\",backend=\"cuda\"} 1"),
+            "{text}"
+        );
+        assert!(text.contains("oxide_tier_disk_bytes 4096"), "{text}");
+        // Every metric is declared before it is used, which is what a scraper
+        // needs and what a hand-written exporter is most likely to forget.
+        for line in text.lines().filter(|l| !l.starts_with('#')) {
+            let name = line.split(['{', ' ']).next().unwrap_or_default();
+            assert!(
+                text.contains(&format!("# TYPE {name} ")),
+                "{name} has no TYPE"
+            );
+        }
+    }
+
+    /// An operator name is a Rust type name today and could be anything
+    /// tomorrow; an unescaped quote would produce a file a scraper rejects.
+    #[test]
+    fn label_values_are_escaped() {
+        let hub = TelemetryHub::new();
+        hub.register_operator("we\"ird\\name", BackendKind::CpuSimd);
+        let text = hub.snapshot().to_prometheus();
+        assert!(text.contains("operator=\"we\\\"ird\\\\name\""), "{text}");
+    }
 
     #[test]
     fn operators_register_in_order_and_accumulate() {

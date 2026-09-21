@@ -68,6 +68,29 @@ impl ExecConfig {
         });
         Ok(GpuOperator::new(backend, stats)?)
     }
+
+    /// The span every batch of one partition is processed inside (#33).
+    ///
+    /// One span per `(operator, partition)`, entered around each batch rather
+    /// than one span per batch: a scan has thousands of batches and a span
+    /// each would drown the interesting fields. `target` is what the plan
+    /// says and `backend` is what is actually executing — the pair is the
+    /// whole question a reader of these logs is asking, and they differ
+    /// exactly when the CPU-fallback counter is moving.
+    pub(crate) fn span(
+        &self,
+        operator: &'static str,
+        partition: usize,
+        backend: BackendKind,
+    ) -> tracing::Span {
+        tracing::info_span!(
+            "oxide.operator",
+            operator,
+            partition,
+            target = %self.target,
+            backend = %backend,
+        )
+    }
 }
 
 pub(crate) fn plan_properties(

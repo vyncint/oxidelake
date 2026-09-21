@@ -3,7 +3,7 @@
 
 use oxidelake_core::BackendKind;
 use oxidelake_core::telemetry::{
-    OperatorSnapshot, PlanNodeSummary, SpillSnapshot, TelemetrySnapshot, TierSnapshot,
+    OperatorSnapshot, PlanNodeSummary, SpillSnapshot, TelemetrySnapshot, TierCapacity, TierSnapshot,
 };
 
 /// Profiling summary of one column for the Describe panel.
@@ -86,6 +86,7 @@ pub fn demo_model() -> DashboardModel {
             bytes_h2d: 13_000_000,
             bytes_d2h: 512,
             memory_bytes: 16_777_216,
+            fallback_batches: 0,
         },
         OperatorSnapshot {
             id: 1,
@@ -98,6 +99,10 @@ pub fn demo_model() -> DashboardModel {
             bytes_h2d: 24_000_000,
             bytes_d2h: 19_500_000,
             memory_bytes: 33_554_432,
+            // The demo shows what a partial fallback looks like: 7 of 100
+            // batches had a predicate this backend declined, so the panel has
+            // a non-zero value to render and a reader can see what it means.
+            fallback_batches: 7,
         },
         OperatorSnapshot {
             id: 2,
@@ -110,6 +115,7 @@ pub fn demo_model() -> DashboardModel {
             bytes_h2d: 0,
             bytes_d2h: 0,
             memory_bytes: 8_388_608,
+            fallback_batches: 0,
         },
     ];
     DashboardModel {
@@ -127,6 +133,15 @@ pub fn demo_model() -> DashboardModel {
                 reloaded_bytes: 256 * 1024 * 1024,
             },
             plan,
+            // The demo is what a spill manager on the query path would look
+            // like, which is why its capacities are real numbers and its
+            // flag is set. A live session reports what its backend says and
+            // leaves the flag false until a query registers a batch (#25).
+            capacity: TierCapacity {
+                device_bytes: Some(8 * 1024 * 1024 * 1024),
+                host_bytes: Some(4 * 1024 * 1024 * 1024),
+                spill_on_query_path: true,
+            },
         },
         profiles: vec![
             ColumnProfile {

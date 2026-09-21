@@ -162,10 +162,17 @@ impl ExecutionPlan for GpuFilterExec {
     ) -> Result<SendableRecordBatchStream> {
         let input = self.input.execute(partition, context)?;
         let operator = self.config.operator("GpuFilterExec")?;
+        let span = self
+            .config
+            .span("GpuFilterExec", partition, operator.backend().kind());
         let baseline = BaselineMetrics::new(&self.metrics, partition);
         let predicate = self.predicate.clone();
         let projection = self.projection.clone();
         let stream = input.map(move |batch| {
+            // The closure body is synchronous, so the guard is created and
+            // dropped inside one poll: entering a span across an await point
+            // is what `tracing` warns about, and there is none here.
+            let _entered = span.enter();
             let batch = batch?;
             let _timer = baseline.elapsed_compute().timer();
             let out = operator.filter_project(&batch, &predicate, &projection)?;

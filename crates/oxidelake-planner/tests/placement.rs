@@ -361,3 +361,78 @@ async fn ineligible_distance_projections_stay_on_cpu() {
         assert_same_results(sql, target, None).await;
     }
 }
+
+// --- placement notes (#32) --------------------------------------------------
+
+/// Plans `sql` on a Cuda target with a telemetry hub attached and returns the
+/// `node: reason` notes the rule recorded.
+async fn placement_notes(sql: &str) -> Vec<String> {
+    let hub = oxidelake_core::telemetry::TelemetryHub::new();
+    let rule = HardwarePlacementRule::new(BackendKind::Cuda).with_telemetry(Arc::clone(&hub));
+    let state = SessionStateBuilder::new()
+        .with_default_features()
+        .with_physical_optimizer_rules(physical_optimizer_rules(rule))
+        .build();
+    let ctx = SessionContext::new_with_state(state);
+    register(&ctx);
+    hub.clear_skips();
+    ctx.sql(sql)
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    hub.skips()
+        .into_iter()
+        .map(|s| format!("{}: {}", s.node, s.reason))
+        .collect()
+}
+
+/// A node that stayed on the CPU says why, and the reason names the thing the
+/// reader has to change. Without this the plan shows an ordinary
+/// `AggregateExec` and the reason lives only in a `debug!` line.
+#[tokio::test]
+async fn an_ineligible_shape_records_why_it_stayed_on_the_cpu() {
+    let notes = placement_notes("SELECT k, avg(v) FROM t GROUP BY k").await;
+    assert!(
+        notes.iter().any(|n| n.starts_with("AggregateExec:")
+            && n.contains("avg")
+            && n.contains("sum, count, min, max")),
+        "{notes:?}"
+    );
+
+    let notes = placement_notes("SELECT s, sum(v) FROM t GROUP BY s").await;
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.contains("grouping key `s`") && n.contains("Int64")),
+        "{notes:?}"
+    );
+
+    let notes = placement_notes("SELECT k FROM t WHERE k >= 2 OR v < 1.0").await;
+    assert!(
+        notes.iter().any(|n| n.starts_with("FilterExec:")),
+        "{notes:?}"
+    );
+
+    // A string comparison: the literal is not one the kernels hold, and the
+    // note says so rather than repeating "ineligible".
+    let notes = placement_notes("SELECT k FROM t WHERE s = 's1'").await;
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.starts_with("FilterExec:") && n.contains("Int64 or Float64 literal")),
+        "{notes:?}"
+    );
+}
+
+/// A plan the rule lowered completely has nothing to explain. A note that
+/// appeared for an accelerated query would teach readers to ignore the
+/// section.
+#[tokio::test]
+async fn a_fully_lowered_plan_records_no_notes() {
+    assert_eq!(
+        placement_notes("SELECT k, sum(v) FROM t WHERE k >= 2 GROUP BY k").await,
+        Vec::<String>::new()
+    );
+}

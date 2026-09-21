@@ -80,6 +80,7 @@ fn operators_for_plan(
                 bytes_h2d: 0,
                 bytes_d2h: 0,
                 memory_bytes: 0,
+                fallback_batches: 0,
             });
         entry.rows_in += op.rows_in;
         entry.rows_out += op.rows_out;
@@ -88,6 +89,7 @@ fn operators_for_plan(
         entry.bytes_h2d += op.bytes_h2d;
         entry.bytes_d2h += op.bytes_d2h;
         entry.memory_bytes = entry.memory_bytes.max(op.memory_bytes);
+        entry.fallback_batches += op.fallback_batches;
     }
     plan.iter()
         .enumerate()
@@ -107,6 +109,7 @@ fn operators_for_plan(
                         bytes_h2d: 0,
                         bytes_d2h: 0,
                         memory_bytes: 0,
+                        fallback_batches: 0,
                     });
             op.id = id;
             op.backend = node.backend;

@@ -10,6 +10,7 @@
 //!
 //! Dependency direction: depends on `oxidelake-core` and `oxidelake-memory`.
 
+#[cfg(feature = "datagen")]
 pub mod datagen;
 pub mod errors;
 pub mod ipc;
@@ -21,6 +22,7 @@ pub mod store;
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
 pub mod uring;
 
+#[cfg(feature = "datagen")]
 pub use datagen::{
     CHUNK_ROWS, DemoTable, demo_batches, demo_chunks, demo_schema, demo_write_options,
     write_demo_table,

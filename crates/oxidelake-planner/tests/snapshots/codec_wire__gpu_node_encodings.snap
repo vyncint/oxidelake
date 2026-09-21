@@ -1,0 +1,8 @@
+---
+source: crates/oxidelake-planner/tests/codec_wire.rs
+expression: rendered
+---
+filter: 00 01 00 03 03 00 22 02 05 08
+hash_join: 01 02 01 02 01 03 04 06 09
+aggregate: 02 00 07 01 00 0b 02 01 6b 00 02 73 76 01
+vector_distance: 03 01 0d 02 00 00 00 3f 00 00 80 3e 01 04 64 69 73 74

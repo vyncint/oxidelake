@@ -27,4 +27,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 arrow.workspace = true
+# The codec snapshot: a change to `GpuNode`'s wire form has to move a
+# committed file, so it cannot pass review unnoticed (#42).
+insta.workspace = true
 tokio.workspace = true

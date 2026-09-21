@@ -203,12 +203,17 @@ impl ExecutionPlan for GpuAggregateExec {
         let input = Arc::clone(&self.input);
         let input_schema = input.schema();
         let operator = self.config.operator("GpuAggregateExec")?;
+        let span = self
+            .config
+            .span("GpuAggregateExec", partition, operator.backend().kind());
         let baseline = BaselineMetrics::new(&self.metrics, partition);
         let spec = self.spec.clone();
         let schema = Arc::clone(&self.schema);
         let stream = futures::stream::once(async move {
             let batches = collect(input, context).await?;
             let all = concat_batches(&input_schema, &batches)?;
+            // Entered after the input is collected: the await is above it.
+            let _entered = span.enter();
             let _timer = baseline.elapsed_compute().timer();
             let out = operator.aggregate(&all, &spec)?;
             let out = RecordBatch::try_new(Arc::clone(&schema), out.columns().to_vec())?;

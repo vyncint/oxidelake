@@ -2,6 +2,7 @@
 
 /// The four dashboard panels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Panel {
     /// Physical plan tree with a hardware tag per operator.
     PlanDag,
@@ -46,6 +47,7 @@ impl Panel {
 /// Keyboard input, abstracted from the terminal backend so the state machine
 /// stays pure and testable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum KeyInput {
     /// Move the selection up.
     Up,
@@ -61,6 +63,7 @@ pub enum KeyInput {
 
 /// The outcome of handling one input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Transition {
     /// Keep running.
     Continue,

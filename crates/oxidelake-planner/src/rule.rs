@@ -69,6 +69,21 @@ impl HardwarePlacementRule {
         self.target
     }
 
+    /// Records why a node stayed on the CPU, in the log and — when a hub is
+    /// attached — where `oxide explain` can print it (#32).
+    ///
+    /// A skipped node looks exactly like one that was never eligible, so
+    /// without this the reason existed only in a `debug!` line nobody was
+    /// going to turn on.
+    fn skip(&self, node: &str, reason: impl std::fmt::Display) -> Option<()> {
+        let reason = reason.to_string();
+        tracing::debug!(node, reason, "leaving node on the CPU");
+        if let Some(hub) = &self.telemetry {
+            hub.record_skip(node, reason);
+        }
+        None
+    }
+
     /// Attaches the rule's telemetry hub to a freshly built exec, when set.
     fn instrument<T>(&self, exec: T, with_telemetry: impl FnOnce(T, Arc<TelemetryHub>) -> T) -> T {
         match &self.telemetry {
@@ -112,8 +127,12 @@ impl HardwarePlacementRule {
     fn lower_filter(&self, filter: &FilterExec) -> Result<Option<GpuFilterExec>> {
         let input = filter.input();
         let schema = input.schema();
-        let Some(predicate) = lower_predicate(filter.predicate(), &schema) else {
-            return Ok(None);
+        let predicate = match try_lower_predicate(filter.predicate(), &schema) {
+            Ok(predicate) => predicate,
+            Err(why) => {
+                self.skip("FilterExec", why);
+                return Ok(None);
+            }
         };
         let projection: Vec<usize> = match filter.projection() {
             Some(p) => p.iter().copied().collect(),
@@ -121,7 +140,7 @@ impl HardwarePlacementRule {
         };
         let exec = GpuFilterExec::try_new(Arc::clone(input), predicate, projection, self.target)?;
         if exec.schema() != filter.schema() {
-            tracing::debug!("skipping FilterExec: fused schema differs from the original");
+            self.skip("FilterExec", "the fused schema differs from the original");
             return Ok(None);
         }
         Ok(Some(self.instrument(exec, GpuFilterExec::with_telemetry)))
@@ -200,7 +219,10 @@ impl HardwarePlacementRule {
         ) {
             Ok(exec) => exec,
             Err(err) => {
-                tracing::debug!(error = %err, "skipping ProjectionExec: distance call not representable");
+                self.skip(
+                    "ProjectionExec",
+                    format_args!("the distance call is not representable: {err}"),
+                );
                 return None;
             }
         };
@@ -253,7 +275,10 @@ impl HardwarePlacementRule {
                 match matches.as_slice() {
                     [only] => indices.push(*only),
                     _ => {
-                        tracing::debug!(field = %field.name(), "skipping HashJoinExec: projected field is ambiguous");
+                        self.skip(
+                            "HashJoinExec",
+                            format_args!("the projected field `{}` is ambiguous", field.name()),
+                        );
                         return Ok(None);
                     }
                 }
@@ -276,7 +301,10 @@ impl HardwarePlacementRule {
         )?
         .with_projection(Some(ours))?;
         if exec.schema() != join.schema() {
-            tracing::debug!("skipping HashJoinExec: rewritten schema differs from the original");
+            self.skip(
+                "HashJoinExec",
+                "the rewritten schema differs from the original",
+            );
             return Ok(None);
         }
         Ok(Some(self.instrument(exec, GpuHashJoinExec::with_telemetry)))
@@ -310,8 +338,9 @@ impl HardwarePlacementRule {
         }
         let exec = GpuHashJoinExec::try_new(left, right, lk, rk, self.target)?;
         if exec.schema() != join.schema() {
-            tracing::debug!(
-                "skipping SortMergeJoinExec: rewritten schema differs from the original"
+            self.skip(
+                "SortMergeJoinExec",
+                "the rewritten schema differs from the original",
             );
             return Ok(None);
         }
@@ -321,8 +350,12 @@ impl HardwarePlacementRule {
     fn lower_aggregate(&self, agg: &AggregateExec) -> Result<Option<GpuAggregateExec>> {
         let (source, spec) = match agg.mode() {
             AggregateMode::Single | AggregateMode::SinglePartitioned => {
-                let Some(spec) = lower_aggregate_spec(agg) else {
-                    return Ok(None);
+                let spec = match try_lower_aggregate_spec(agg) {
+                    Ok(spec) => spec,
+                    Err(why) => {
+                        self.skip("AggregateExec", why);
+                        return Ok(None);
+                    }
                 };
                 (Arc::clone(agg.input()), spec)
             }
@@ -348,8 +381,12 @@ impl HardwarePlacementRule {
                 {
                     return Ok(None);
                 }
-                let Some(spec) = lower_aggregate_spec(partial) else {
-                    return Ok(None);
+                let spec = match try_lower_aggregate_spec(partial) {
+                    Ok(spec) => spec,
+                    Err(why) => {
+                        self.skip("AggregateExec", why);
+                        return Ok(None);
+                    }
                 };
                 (Arc::clone(partial.input()), spec)
             }
@@ -374,7 +411,10 @@ impl HardwarePlacementRule {
                 self.instrument(exec, GpuAggregateExec::with_telemetry),
             )),
             Err(err) => {
-                tracing::debug!(error = %err, "skipping AggregateExec: output schema not representable");
+                self.skip(
+                    "AggregateExec",
+                    format_args!("the output schema is not representable: {err}"),
+                );
                 Ok(None)
             }
         }
@@ -429,40 +469,92 @@ fn literal(expr: &Arc<dyn PhysicalExpr>) -> Option<Lit> {
 /// Lowers a DataFusion predicate into the bounded v1 grammar, or `None` when
 /// any part of it is outside that grammar.
 pub fn lower_predicate(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Option<Predicate> {
-    let binary = as_any(expr).downcast_ref::<BinaryExpr>()?;
+    try_lower_predicate(expr, schema).ok()
+}
+
+/// [`lower_predicate`], keeping the reason so it can be shown (#32).
+///
+/// The public function stays `Option`-shaped; this is the same walk with the
+/// refusal named, so the two cannot disagree about what is representable.
+fn try_lower_predicate(
+    expr: &Arc<dyn PhysicalExpr>,
+    schema: &Schema,
+) -> std::result::Result<Predicate, String> {
+    let Some(binary) = as_any(expr).downcast_ref::<BinaryExpr>() else {
+        return Err(format!(
+            "`{expr}` is not a binary comparison; the v1 grammar is \
+             column <op> literal, conjoined with AND"
+        ));
+    };
     if *binary.op() == Operator::And {
-        let l = lower_predicate(binary.left(), schema)?;
-        let r = lower_predicate(binary.right(), schema)?;
-        return Some(Predicate::and(l, r));
+        let l = try_lower_predicate(binary.left(), schema)?;
+        let r = try_lower_predicate(binary.right(), schema)?;
+        return Ok(Predicate::and(l, r));
     }
-    let op = comparison(binary.op())?;
+    let Some(op) = comparison(binary.op()) else {
+        return Err(format!(
+            "`{}` is not one of the comparisons the device kernels implement \
+             (=, !=, <, <=, >, >=)",
+            binary.op()
+        ));
+    };
     let (column, lit, op) = match (column_index(binary.left()), literal(binary.right())) {
         (Some(c), Some(l)) => (c, l, op),
         _ => match (literal(binary.left()), column_index(binary.right())) {
             (Some(l), Some(c)) => (c, l, flip(op)),
-            _ => return None,
+            _ => {
+                return Err(format!(
+                    "`{binary}` does not compare a column against an Int64 or \
+                     Float64 literal"
+                ));
+            }
         },
     };
-    let dt = schema.fields().get(column)?.data_type();
-    if *dt != lit.data_type() {
-        return None;
+    let Some(field) = schema.fields().get(column) else {
+        return Err(format!(
+            "column {column} is out of range for the input schema"
+        ));
+    };
+    if *field.data_type() != lit.data_type() {
+        return Err(format!(
+            "`{}` is {} and the literal is {}; the kernels compare a column \
+             against a literal of its own type",
+            field.name(),
+            field.data_type(),
+            lit.data_type()
+        ));
     }
-    Some(Predicate::compare(column, op, lit))
+    Ok(Predicate::compare(column, op, lit))
 }
 
 /// Lowers an `AggregateExec`'s grouping and aggregates into an [`AggregateSpec`].
 pub fn lower_aggregate_spec(agg: &AggregateExec) -> Option<AggregateSpec> {
+    try_lower_aggregate_spec(agg).ok()
+}
+
+/// [`lower_aggregate_spec`], keeping the reason so it can be shown (#32).
+fn try_lower_aggregate_spec(agg: &AggregateExec) -> std::result::Result<AggregateSpec, String> {
     let group = agg.group_expr();
     if !group.is_single() || group.expr().len() != 1 || !group.null_expr().is_empty() {
-        return None;
+        return Err(format!(
+            "the device kernel groups by exactly one column; this groups by {}",
+            group.expr().len()
+        ));
     }
     let input_schema = agg.input().schema();
-    let group_by = column_index(&group.expr()[0].0)?;
-    if input_schema.field(group_by).data_type() != &DataType::Int64 {
-        return None;
+    let Some(group_by) = column_index(&group.expr()[0].0) else {
+        return Err("the grouping key is an expression, not a plain column".to_owned());
+    };
+    let group_field = input_schema.field(group_by);
+    if group_field.data_type() != &DataType::Int64 {
+        return Err(format!(
+            "the grouping key `{}` is {}; the device kernel groups on Int64",
+            group_field.name(),
+            group_field.data_type()
+        ));
     }
     if agg.filter_expr().iter().any(Option::is_some) {
-        return None;
+        return Err("a FILTER clause on an aggregate has no device kernel".to_owned());
     }
     let mut aggregates = Vec::with_capacity(agg.aggr_expr().len());
     for expr in agg.aggr_expr() {
@@ -471,25 +563,44 @@ pub fn lower_aggregate_spec(agg: &AggregateExec) -> Option<AggregateSpec> {
             "count" => AggregateFunction::Count,
             "min" => AggregateFunction::Min,
             "max" => AggregateFunction::Max,
-            _ => return None,
+            other => {
+                return Err(format!(
+                    "`{other}` is not one of the aggregates the device kernels \
+                     implement (sum, count, min, max)"
+                ));
+            }
         };
         if expr.is_distinct() {
-            return None;
+            return Err(format!(
+                "DISTINCT is not implemented for `{}`",
+                expr.fun().name()
+            ));
         }
         let args = expr.expressions();
         if args.len() != 1 {
-            return None;
+            return Err(format!(
+                "`{}` takes {} arguments; the device kernels take one",
+                expr.fun().name(),
+                args.len()
+            ));
         }
-        let column = column_index(&args[0])?;
-        if !matches!(
-            input_schema.field(column).data_type(),
-            DataType::Int64 | DataType::Float64
-        ) {
-            return None;
+        let Some(column) = column_index(&args[0]) else {
+            return Err(format!(
+                "`{}` aggregates an expression, not a plain column",
+                expr.fun().name()
+            ));
+        };
+        let field = input_schema.field(column);
+        if !matches!(field.data_type(), DataType::Int64 | DataType::Float64) {
+            return Err(format!(
+                "`{}` is {}; the device kernels aggregate Int64 and Float64",
+                field.name(),
+                field.data_type()
+            ));
         }
         aggregates.push((func, column));
     }
-    Some(AggregateSpec {
+    Ok(AggregateSpec {
         group_by,
         aggregates,
     })

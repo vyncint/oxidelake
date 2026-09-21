@@ -17,7 +17,7 @@
 //! * a hash join's build side is hashed once ([`JoinBuild`]) and uploaded once
 //!   per operator, then probed by every batch.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -172,6 +172,10 @@ pub struct GpuOperator {
     next_stream: AtomicUsize,
     stats: Option<Arc<OperatorStats>>,
     device_build: OnceLock<Arc<DeviceBuild>>,
+    /// One `warn!` per operator instance, not one per batch: a fallback that
+    /// happens at all usually happens for every batch, and a log line per
+    /// batch would bury the fact it is reporting.
+    warned_fallback: AtomicBool,
 }
 
 impl std::fmt::Debug for GpuOperator {
@@ -183,9 +187,19 @@ impl std::fmt::Debug for GpuOperator {
     }
 }
 
-/// What a device attempt produced: the downloaded batch and the bytes moved
-/// host→device / device→host, or nothing when the backend declined.
-type DeviceOutcome = Option<(RecordBatch, (usize, usize))>;
+/// What a device attempt produced.
+///
+/// The declining case carries *why* rather than being a bare `None` (#32): a
+/// fallback is counted and warned about at the point the decision is made,
+/// and a counter that cannot say what it counted is not much better than the
+/// `debug!` it replaces.
+enum DeviceOutcome {
+    /// It ran on the device: the downloaded batch and the bytes moved
+    /// host→device / device→host.
+    Ran(RecordBatch, (usize, usize)),
+    /// The device path was declined; the CPU reference runs instead.
+    Declined(EngineError),
+}
 
 impl GpuOperator {
     /// Creates an operator on `backend`, optionally reporting into `stats`.
@@ -204,6 +218,7 @@ impl GpuOperator {
             next_stream: AtomicUsize::new(0),
             stats,
             device_build: OnceLock::new(),
+            warned_fallback: AtomicBool::new(false),
         })
     }
 
@@ -232,8 +247,9 @@ impl GpuOperator {
         }
     }
 
-    /// Runs `gpu` on a GPU backend; `Ok(None)` when the backend answered
-    /// `Unsupported` (the caller then takes the CPU reference path).
+    /// Runs `gpu` on a GPU backend; [`DeviceOutcome::Declined`] when the
+    /// backend answered `Unsupported` (the caller then takes the CPU
+    /// reference path).
     fn try_device<G>(&self, gpu: G) -> Result<DeviceOutcome, EngineError>
     where
         G: FnOnce(&DeviceStream) -> Result<(RecordBatch, usize), EngineError>,
@@ -242,14 +258,52 @@ impl GpuOperator {
         match gpu(stream) {
             Ok((batch, h2d)) => {
                 let d2h = batch.get_array_memory_size();
-                Ok(Some((batch, (h2d, d2h))))
+                Ok(DeviceOutcome::Ran(batch, (h2d, d2h)))
             }
-            Err(err) if err.is_unsupported() => {
-                tracing::debug!(backend = %self.backend.kind(), error = %err, "GPU path unsupported for this batch; using the CPU reference");
-                Ok(None)
-            }
+            Err(err) if err.is_unsupported() => Ok(DeviceOutcome::Declined(err)),
             Err(err) => Err(err),
         }
+    }
+
+    /// Why this operator has no device path for an operation, or `None` when
+    /// it has one.
+    ///
+    /// `supported` is the backend's own answer for the specific shape (this
+    /// predicate, a hash join, …), asked before anything is uploaded.
+    fn no_device_path(&self, supported: bool, what: &str) -> Option<EngineError> {
+        let kind = self.backend.kind();
+        if !kind.is_gpu() {
+            Some(EngineError::unsupported(
+                "backend.device",
+                format!(
+                    "the backend selected on this machine is `{kind}`, so an \
+                     operator placed on a device runs the CPU reference"
+                ),
+            ))
+        } else if !supported {
+            Some(EngineError::unsupported(
+                "backend.operation",
+                format!("backend `{kind}` does not support {what}"),
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Counts a batch that took the CPU reference path, and says so once.
+    fn fell_back(&self, why: &EngineError) {
+        if let Some(stats) = &self.stats {
+            stats.record_fallback();
+        }
+        if !self.warned_fallback.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                backend = %self.backend.kind(),
+                reason = %why,
+                "operator placed on a device is running the CPU reference; \
+                 results are correct and unaccelerated"
+            );
+        }
+        tracing::debug!(backend = %self.backend.kind(), reason = %why, "batch on the CPU reference");
     }
 
     /// Uploads `sub`, runs `kernel` on it and downloads the result.
@@ -274,15 +328,18 @@ impl GpuOperator {
         projection: &[usize],
     ) -> Result<RecordBatch, EngineError> {
         let start = Instant::now();
-        let device_ok = self.backend.kind().is_gpu() && self.backend.supports_predicate(predicate);
-        let outcome = if device_ok {
-            self.filter_project_on_device(batch, predicate, projection)?
-        } else {
-            None
+        let outcome = match self
+            .no_device_path(self.backend.supports_predicate(predicate), "this predicate")
+        {
+            Some(why) => DeviceOutcome::Declined(why),
+            None => self.filter_project_on_device(batch, predicate, projection)?,
         };
         let (out, moved) = match outcome {
-            Some((out, moved)) => (out, Some(moved)),
-            None => (kernels::filter_project(batch, predicate, projection)?, None),
+            DeviceOutcome::Ran(out, moved) => (out, Some(moved)),
+            DeviceOutcome::Declined(why) => {
+                self.fell_back(&why);
+                (kernels::filter_project(batch, predicate, projection)?, None)
+            }
         };
         self.record(batch.num_rows(), &out, start, moved);
         Ok(out)
@@ -329,7 +386,7 @@ impl GpuOperator {
         if let Some(pos) = plan.row_id_position() {
             dev_projection.push(pos);
         }
-        let Some((dev_out, moved)) = self.try_device(|stream| {
+        let (dev_out, moved) = match self.try_device(|stream| {
             self.round_trip(stream, &sub, |stream, dev| {
                 self.backend.filter_project(
                     stream,
@@ -340,9 +397,9 @@ impl GpuOperator {
                     },
                 )
             })
-        })?
-        else {
-            return Ok(None);
+        })? {
+            DeviceOutcome::Ran(batch, moved) => (batch, moved),
+            declined => return Ok(declined),
         };
         // Reassemble in projection order: device outputs for eligible columns,
         // host gathers (at the compacted row ids) for the rest.
@@ -365,7 +422,7 @@ impl GpuOperator {
             }
         }
         let out = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
-        Ok(Some((out, moved)))
+        Ok(DeviceOutcome::Ran(out, moved))
     }
 
     /// Inner hash join of one probe batch against a prepared build side. The
@@ -379,18 +436,25 @@ impl GpuOperator {
         projection: Option<&[usize]>,
     ) -> Result<RecordBatch, EngineError> {
         let start = Instant::now();
-        let device_ok = self.backend.kind().is_gpu() && self.backend.supports_hash_join();
-        let outcome = if device_ok {
-            self.hash_join_on_device(left, build, left_key, projection)?
-        } else {
-            None
+        let outcome = match self.no_device_path(self.backend.supports_hash_join(), "hash joins") {
+            Some(why) => DeviceOutcome::Declined(why),
+            None => self.hash_join_on_device(left, build, left_key, projection)?,
         };
         let (out, moved) = match outcome {
-            Some((out, moved)) => (out, Some(moved)),
-            None => (
-                kernels::hash_join_probe(left, left_key, build.batch(), build.table(), projection)?,
-                None,
-            ),
+            DeviceOutcome::Ran(out, moved) => (out, Some(moved)),
+            DeviceOutcome::Declined(why) => {
+                self.fell_back(&why);
+                (
+                    kernels::hash_join_probe(
+                        left,
+                        left_key,
+                        build.batch(),
+                        build.table(),
+                        projection,
+                    )?,
+                    None,
+                )
+            }
         };
         self.record(left.num_rows(), &out, start, moved);
         Ok(out)
@@ -479,7 +543,7 @@ impl GpuOperator {
         let left_sub = left_plan.sub_batch(left)?;
         let left_key_pos = left_plan.position(left_key).unwrap_or(0);
         let right_key_pos = right_plan.position(build.key()).unwrap_or(0);
-        let Some((dev_out, moved)) = self.try_device(|stream| {
+        let (dev_out, moved) = match self.try_device(|stream| {
             let dev_build = self.device_build(stream, build, &right_plan)?;
             self.round_trip(stream, &left_sub, |stream, dev_left| {
                 self.backend.hash_join(
@@ -492,9 +556,9 @@ impl GpuOperator {
                     },
                 )
             })
-        })?
-        else {
-            return Ok(None);
+        })? {
+            DeviceOutcome::Ran(batch, moved) => (batch, moved),
+            declined => return Ok(declined),
         };
         // Device output = left sub-batch columns ++ right sub-batch columns
         // (each with its row-id column last when present).
@@ -532,7 +596,7 @@ impl GpuOperator {
             }
         }
         let out = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
-        Ok(Some((out, moved)))
+        Ok(DeviceOutcome::Ran(out, moved))
     }
 
     /// Grouped aggregation of one (complete) input batch.
@@ -542,15 +606,16 @@ impl GpuOperator {
         spec: &AggregateSpec,
     ) -> Result<RecordBatch, EngineError> {
         let start = Instant::now();
-        let device_ok = self.backend.kind().is_gpu() && self.backend.supports_aggregate();
-        let outcome = if device_ok {
-            self.aggregate_on_device(batch, spec)?
-        } else {
-            None
+        let outcome = match self.no_device_path(self.backend.supports_aggregate(), "aggregation") {
+            Some(why) => DeviceOutcome::Declined(why),
+            None => self.aggregate_on_device(batch, spec)?,
         };
         let (out, moved) = match outcome {
-            Some((out, moved)) => (out, Some(moved)),
-            None => (kernels::aggregate(batch, spec)?, None),
+            DeviceOutcome::Ran(out, moved) => (out, Some(moved)),
+            DeviceOutcome::Declined(why) => {
+                self.fell_back(&why);
+                (kernels::aggregate(batch, spec)?, None)
+            }
         };
         self.record(batch.num_rows(), &out, start, moved);
         Ok(out)
@@ -603,17 +668,19 @@ impl GpuOperator {
         output_name: &str,
     ) -> Result<RecordBatch, EngineError> {
         let start = Instant::now();
-        let outcome = if self.backend.kind().is_gpu() {
-            self.vector_distance_on_device(batch, column, query, metric, output_name)?
-        } else {
-            None
+        let outcome = match self.no_device_path(true, "vector distance") {
+            Some(why) => DeviceOutcome::Declined(why),
+            None => self.vector_distance_on_device(batch, column, query, metric, output_name)?,
         };
         let (out, moved) = match outcome {
-            Some((out, moved)) => (out, Some(moved)),
-            None => (
-                kernels::vector_distance(batch, column, query, metric, output_name)?,
-                None,
-            ),
+            DeviceOutcome::Ran(out, moved) => (out, Some(moved)),
+            DeviceOutcome::Declined(why) => {
+                self.fell_back(&why);
+                (
+                    kernels::vector_distance(batch, column, query, metric, output_name)?,
+                    None,
+                )
+            }
         };
         self.record(batch.num_rows(), &out, start, moved);
         Ok(out)
@@ -634,7 +701,7 @@ impl GpuOperator {
             row_ids: false,
         };
         let sub = plan.sub_batch(batch)?;
-        let Some((dev_out, moved)) = self.try_device(|stream| {
+        let (dev_out, moved) = match self.try_device(|stream| {
             self.round_trip(stream, &sub, |stream, dev| {
                 self.backend.vector_distance(
                     stream,
@@ -647,9 +714,9 @@ impl GpuOperator {
                     },
                 )
             })
-        })?
-        else {
-            return Ok(None);
+        })? {
+            DeviceOutcome::Ran(batch, moved) => (batch, moved),
+            declined => return Ok(declined),
         };
         let distance = Arc::clone(dev_out.column(dev_out.num_columns() - 1));
         let mut fields: Vec<FieldRef> = batch.schema().fields().iter().cloned().collect();
@@ -657,7 +724,7 @@ impl GpuOperator {
         let mut columns = batch.columns().to_vec();
         columns.push(distance);
         let out = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
-        Ok(Some((out, moved)))
+        Ok(DeviceOutcome::Ran(out, moved))
     }
 }
 
@@ -665,8 +732,131 @@ impl GpuOperator {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use arrow::array::StringArray;
+    use oxidelake_core::telemetry::TelemetryHub;
+    use oxidelake_core::{BackendKind, DeviceId};
+    use oxidelake_device::{CpuBackend, DeviceBuffer, HostBuffer, MemoryInfo};
 
     use super::*;
+
+    /// A backend that *claims* to be a GPU and runs the CPU kernels.
+    ///
+    /// This is the only way to test the fallback counter (#32) on a machine
+    /// with no device: the counter's whole purpose is to distinguish a plan
+    /// placed on a device from the work that actually ran there, and both
+    /// halves of that need a backend that reports `cuda` while declining some
+    /// shapes. `float_predicates` is the knob the Metal backend really has —
+    /// it has no f64, so a `Float64` comparison is declined before anything
+    /// is uploaded.
+    #[derive(Debug)]
+    struct FakeGpu {
+        inner: CpuBackend,
+        float_predicates: bool,
+    }
+
+    impl FakeGpu {
+        fn shared(float_predicates: bool) -> Arc<dyn GpuBackend> {
+            Arc::new(Self {
+                inner: CpuBackend::new(),
+                float_predicates,
+            })
+        }
+    }
+
+    /// Exhaustive on purpose: `Predicate` is plan vocabulary, so a variant
+    /// added to it must be classified here rather than falling into a `_`
+    /// arm that would quietly report "no float" for a float predicate.
+    fn mentions_float(predicate: &Predicate) -> bool {
+        use oxidelake_core::params::Literal;
+        match predicate {
+            Predicate::Compare { literal, .. } => matches!(literal, Literal::Float64(_)),
+            Predicate::And(a, b) => mentions_float(a) || mentions_float(b),
+        }
+    }
+
+    impl GpuBackend for FakeGpu {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Cuda
+        }
+        fn device_id(&self) -> DeviceId {
+            DeviceId::new(BackendKind::Cuda, 0)
+        }
+        fn memory_info(&self) -> Result<MemoryInfo, EngineError> {
+            self.inner.memory_info()
+        }
+        fn alloc_device(&self, bytes: usize) -> Result<DeviceBuffer, EngineError> {
+            self.inner.alloc_device(bytes)
+        }
+        fn alloc_pinned_host(&self, bytes: usize) -> Result<HostBuffer, EngineError> {
+            self.inner.alloc_pinned_host(bytes)
+        }
+        fn create_stream(&self) -> Result<DeviceStream, EngineError> {
+            self.inner.create_stream()
+        }
+        fn copy_h2d(
+            &self,
+            stream: &DeviceStream,
+            src: &HostBuffer,
+            dst: &mut DeviceBuffer,
+        ) -> Result<(), EngineError> {
+            self.inner.copy_h2d(stream, src, dst)
+        }
+        fn copy_d2h(
+            &self,
+            stream: &DeviceStream,
+            src: &DeviceBuffer,
+            dst: &mut HostBuffer,
+        ) -> Result<(), EngineError> {
+            self.inner.copy_d2h(stream, src, dst)
+        }
+        fn synchronize(&self, stream: &DeviceStream) -> Result<(), EngineError> {
+            self.inner.synchronize(stream)
+        }
+        fn upload(
+            &self,
+            stream: &DeviceStream,
+            batch: &RecordBatch,
+        ) -> Result<DeviceBatch, EngineError> {
+            self.inner.upload(stream, batch)
+        }
+        fn download(
+            &self,
+            stream: &DeviceStream,
+            batch: &DeviceBatch,
+        ) -> Result<RecordBatch, EngineError> {
+            self.inner.download(stream, batch)
+        }
+        fn filter_project(
+            &self,
+            stream: &DeviceStream,
+            args: FilterProjectArgs<'_>,
+        ) -> Result<DeviceBatch, EngineError> {
+            self.inner.filter_project(stream, args)
+        }
+        fn hash_join(
+            &self,
+            stream: &DeviceStream,
+            args: HashJoinArgs<'_>,
+        ) -> Result<DeviceBatch, EngineError> {
+            self.inner.hash_join(stream, args)
+        }
+        fn aggregate(
+            &self,
+            stream: &DeviceStream,
+            args: AggregateArgs<'_>,
+        ) -> Result<DeviceBatch, EngineError> {
+            self.inner.aggregate(stream, args)
+        }
+        fn vector_distance(
+            &self,
+            stream: &DeviceStream,
+            args: VectorDistanceArgs<'_>,
+        ) -> Result<DeviceBatch, EngineError> {
+            self.inner.vector_distance(stream, args)
+        }
+        fn supports_predicate(&self, predicate: &Predicate) -> bool {
+            self.float_predicates || !mentions_float(predicate)
+        }
+    }
 
     fn batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
@@ -751,5 +941,97 @@ mod tests {
         assert!(build.table().matches(2).is_empty());
         assert_eq!(build.key(), 0);
         assert_eq!(build.batch().num_rows(), 4);
+    }
+
+    // --- the CPU-fallback counter (#32) ------------------------------------
+
+    fn int_predicate() -> Predicate {
+        Predicate::compare(
+            0,
+            oxidelake_core::params::Comparison::Gt,
+            oxidelake_core::params::Literal::Int64(1),
+        )
+    }
+
+    fn float_predicate() -> Predicate {
+        Predicate::compare(
+            2,
+            oxidelake_core::params::Comparison::Lt,
+            oxidelake_core::params::Literal::Float64(3.0),
+        )
+    }
+
+    fn run_filter(backend: Arc<dyn GpuBackend>, predicate: &Predicate) -> (u64, u64, RecordBatch) {
+        let hub = TelemetryHub::new();
+        let stats = hub.register_operator("GpuFilterExec", backend.kind());
+        let op = GpuOperator::new(backend, Some(Arc::clone(&stats))).unwrap();
+        let b = batch();
+        let out = op.filter_project(&b, predicate, &[0, 2]).unwrap();
+        let snapshot = stats.snapshot();
+        (snapshot.batches, snapshot.fallback_batches, out)
+    }
+
+    /// A predicate the backend accepts runs on the device: no fallback.
+    #[test]
+    fn a_supported_predicate_counts_no_fallback() {
+        let (batches, fallbacks, _) = run_filter(FakeGpu::shared(true), &float_predicate());
+        assert_eq!(batches, 1);
+        assert_eq!(fallbacks, 0);
+    }
+
+    /// A predicate the backend declines is counted, and the answer is still
+    /// right — which is exactly why the counter has to exist: nothing else
+    /// about the query changes.
+    #[test]
+    fn a_declined_predicate_counts_a_fallback_and_still_answers() {
+        let strict = FakeGpu::shared(false);
+        let lenient = FakeGpu::shared(true);
+        let (batches, fallbacks, declined) = run_filter(strict, &float_predicate());
+        assert_eq!(batches, 1);
+        assert_eq!(fallbacks, 1, "a declined predicate is a counted fallback");
+        let (_, accepted_fallbacks, accepted) = run_filter(lenient, &float_predicate());
+        assert_eq!(accepted_fallbacks, 0);
+        assert_eq!(declined, accepted, "the two paths must agree on the rows");
+
+        // The same backend with an Int64 predicate has nothing to decline.
+        let (_, int_fallbacks, _) = run_filter(FakeGpu::shared(false), &int_predicate());
+        assert_eq!(int_fallbacks, 0);
+    }
+
+    /// The shape #32 is about: an operator placed on a device on a machine
+    /// that has none. Every batch is a fallback, and the snapshot says so in
+    /// one call.
+    #[test]
+    fn a_cpu_machine_running_a_gpu_plan_falls_back_entirely() {
+        let hub = TelemetryHub::new();
+        let stats = hub.register_operator("GpuFilterExec", BackendKind::Cuda);
+        let op = GpuOperator::new(Arc::new(CpuBackend::new()), Some(Arc::clone(&stats))).unwrap();
+        let b = batch();
+        for _ in 0..3 {
+            op.filter_project(&b, &int_predicate(), &[0, 2]).unwrap();
+        }
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.batches, 3);
+        assert_eq!(snapshot.fallback_batches, 3);
+        assert!(snapshot.fell_back_entirely());
+    }
+
+    /// Aggregation and vector distance count too, not just the filter.
+    #[test]
+    fn every_operator_counts_its_fallbacks() {
+        let hub = TelemetryHub::new();
+        let b = batch();
+
+        let stats = hub.register_operator("GpuAggregateExec", BackendKind::Cuda);
+        let op = GpuOperator::new(Arc::new(CpuBackend::new()), Some(Arc::clone(&stats))).unwrap();
+        op.aggregate(
+            &b,
+            &oxidelake_core::params::AggregateSpec {
+                group_by: 0,
+                aggregates: vec![(oxidelake_core::params::AggregateFunction::Count, 2)],
+            },
+        )
+        .unwrap();
+        assert_eq!(stats.snapshot().fallback_batches, 1);
     }
 }
