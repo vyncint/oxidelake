@@ -51,7 +51,7 @@ pub use oxidelake_core::params::{
 #[cfg(feature = "predict")]
 pub mod predict;
 #[cfg(feature = "predict")]
-pub use predict::{Model, ModelSpec, PREDICT, predict_udf};
+pub use predict::{ACTIVATION_KEY, Activation, Model, ModelSpec, PREDICT, predict_udf};
 
 pub use udf::{
     COSINE_DISTANCE, L2_DISTANCE, cosine_distance_udf, distance_metric_for, distance_udf_name,

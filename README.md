@@ -70,9 +70,14 @@ pulls in a tensor library.
 ```bash
 cargo build --release -p oxidelake-runtime --features predict
 
-# an oxmera Sequential/Linear model saved with safetensors
+# an oxmera Sequential/Linear model saved with safetensors, whose header
+# declares {"__metadata__": {"oxidelake.activation": "relu"}}
 ./target/release/oxide sql --table t=data/ \
   -q "SELECT id, predict('scorer.safetensors', emb) AS logits FROM t LIMIT 5"
+
+# a checkpoint whose header says nothing: state the activation in the query
+./target/release/oxide sql --table t=data/ \
+  -q "SELECT id, predict('scorer.safetensors', emb, 'gelu') AS logits FROM t LIMIT 5"
 ```
 
 ```
@@ -97,8 +102,15 @@ could not score them.
 
 The model file is read for its architecture, not just its weights: `predict`
 rebuilds an `oxmera::nn::Sequential` of `Linear` layers from the `0.weight`,
-`1.weight`, … naming, with ReLU between them. That assumption, the CPU-only
-execution, and why this is a UDF rather than an operator are recorded in
+`1.weight`, … naming, and takes the activation between them from the
+safetensors `__metadata__` key `oxidelake.activation` — `relu`, `gelu`,
+`sigmoid`, `tanh` or `none`, applied between layers and never after the last.
+A file that declares nothing is **refused**, because the alternative is
+scoring it with an activation it was not trained with and returning a
+confident wrong number; the third argument `predict(path, features, 'relu')`
+is how you say it yourself, and it must agree with the file when the file has
+an opinion. The CPU-only execution, and why this is a UDF rather than an
+operator, are recorded in
 [ADR-0015](docs/decisions/ADR-0015-in-database-inference-at-the-udf-layer.md).
 
 `--target cpu|cuda|metal` picks the *placement* target; execution always uses the hardware that is present (operators planned for an absent GPU take the per-batch CPU path — exactly what cluster executors do with a scheduler's plan).

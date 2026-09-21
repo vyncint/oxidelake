@@ -110,7 +110,7 @@ the break is in a type we re-export. It is the release manager's to declare.
 
 Public enums are `#[non_exhaustive]` where a new variant is a thing the world
 gains — `BackendKind`, `Compression`, `SessionMode`, `MemoryClass`,
-`MemoryTier`, `Tier`, `ModelSpec`, and the TUI's `Panel`/`KeyInput`/
+`MemoryTier`, `Tier`, `ModelSpec`, `Activation`, and the TUI's `Panel`/`KeyInput`/
 `Transition`. Adding to those is then a minor bump rather than a break, and a
 consumer's `match` needs a `_` arm.
 

@@ -1,6 +1,6 @@
 # ADR-0015: In-database inference belongs at the UDF layer, not the operator layer
 
-- Status: accepted (prototype)
+- Status: accepted (prototype); the activation section revised 2026-09-21 for 0.2.0 (#47)
 - Date: 2026-09-06
 
 ## Context
@@ -63,12 +63,26 @@ convention `oxmera::nn::Sequential` already writes — `0.weight`, `0.bias`,
 shape `[out, in]` is layer `N`. Layers must be numbered `0..n` with no gaps
 and consecutive widths must compose, or the file is refused.
 
-**The activation is the one real assumption**: ReLU between layers, nothing
-after the last. That covers an MLP scorer and nothing else, and a model whose
-activations differ will produce confidently wrong numbers rather than an
-error. `ModelSpec` exists as the enum where an explicit description goes when
-a second shape is needed; today it has one variant and the assumption is
-documented at the call site.
+**The activation is read too, and never assumed** (revised for 0.2.0, #47).
+A safetensors header carries free-form metadata, so a model declares its own
+activation there under `oxidelake.activation` (`relu`, `gelu`, `sigmoid`,
+`tanh` or `none`), applied between the `Linear` layers and never after the
+last. A query may state it instead — `predict(path, features, 'relu')` —
+which is how a checkpoint someone else wrote is used; when the file also
+declares one, the two must agree or the query is refused.
+
+The original decision here was to assume ReLU and document the assumption.
+That was wrong twice over. The loader in fact pushed bare `Linear` layers and
+applied no activation at all, so *every* non-linear model returned a linear
+model's numbers; and the only test of the numbers compared them against the
+same bare stack, so nothing could see it. An assumption that produces silent
+wrong output is not made safe by an ADR paragraph admitting it — reading the
+value, or refusing, is the only version of this that a user can trust. The
+`none` case is now compared against oxmera's own `Sequential::forward`, which
+does not share the loader's loop.
+
+`ModelSpec` remains the enum where a second *architecture* goes; the
+activation is a field on its one variant rather than a new one.
 
 ## Consequences
 
@@ -86,7 +100,12 @@ documented at the call site.
   the test runs the same model through `oxmera` directly and asserts the SQL
   answer matches within `1e-5`. A wrong architecture inference is the failure
   mode this guards.
+- A model file that predates 0.2.0 no longer runs until it declares an
+  activation or the query states one. That is deliberate: those files were
+  being scored as linear models whatever they were trained as, so continuing
+  to accept them silently is the bug, not the compatibility.
 - Not addressed: GPU inference (the model runs on the CPU), model cache
   invalidation (a file that changes under a running process keeps serving the
-  old weights — right for a query engine, wrong for a notebook), and any model
-  that is not an MLP.
+  old weights — right for a query engine, wrong for a notebook), per-layer
+  activations (one value covers the whole stack), and any model that is not
+  an MLP.

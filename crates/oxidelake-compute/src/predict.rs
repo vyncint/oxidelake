@@ -29,11 +29,25 @@
 //! `0.bias`, `1.weight`, … — and rebuilds a stack of `Linear` layers from the
 //! shapes. `N.weight` of shape `[out, in]` is layer `N`.
 //!
-//! **The activation is the prototype's one real assumption**: ReLU between
-//! layers, nothing after the last. That covers an MLP scorer and nothing else,
-//! and a model whose activations differ will silently produce wrong numbers —
-//! which is why [`ModelSpec`] exists as the place to put an explicit
-//! description when this graduates. See the module tests for what is pinned.
+//! **The activation comes from the file, never from a guess** (#47). A
+//! `safetensors` header can carry free-form metadata, so a model declares its
+//! own activation there:
+//!
+//! ```json
+//! {"__metadata__": {"oxidelake.activation": "relu"}}
+//! ```
+//!
+//! and a file without that key is refused rather than assumed. The activation
+//! is applied *between* the `Linear` layers and never after the last, so the
+//! output stays logits. A query may state the activation itself —
+//! `predict(path, features, 'relu')` — which is how a file someone else wrote
+//! is used; when the file also declares one, the two must agree.
+//!
+//! This is the difference between an honest error and a confident wrong
+//! number: until 0.2.0 the loader built a stack of bare `Linear` layers and
+//! documented ReLU between them, so every non-linear model it was pointed at
+//! returned the answer of a linear one. See the module tests for what is
+//! pinned.
 //!
 //! ## Cost model
 //!
@@ -55,24 +69,118 @@ use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
 };
 use oxmera::Tensor;
-use oxmera::nn::{Linear, Module, Sequential};
+use oxmera::nn::{Linear, Sequential};
 use safetensors::SafeTensors;
 
 /// Name of the inference UDF.
 pub const PREDICT: &str = "predict";
 
+/// The safetensors `__metadata__` key a model declares its activation under.
+pub const ACTIVATION_KEY: &str = "oxidelake.activation";
+
+/// The activation applied between a model's `Linear` layers.
+///
+/// Never after the last one: the output of `predict` is logits, which is what
+/// a caller composes with `[1]`, a threshold or a sort.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Activation {
+    /// `max(0, x)`.
+    Relu,
+    /// The Gaussian error linear unit.
+    Gelu,
+    /// The logistic function.
+    Sigmoid,
+    /// Hyperbolic tangent.
+    Tanh,
+    /// No activation: the stack is one affine map. Spelled out rather than
+    /// left to a missing key, so a linear model is a statement and not an
+    /// omission.
+    None,
+}
+
+impl Activation {
+    /// Every activation, in the order the error messages list them.
+    pub const ALL: [Activation; 5] = [
+        Activation::Relu,
+        Activation::Gelu,
+        Activation::Sigmoid,
+        Activation::Tanh,
+        Activation::None,
+    ];
+
+    /// The lowercase name used in `__metadata__` and in SQL.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Activation::Relu => "relu",
+            Activation::Gelu => "gelu",
+            Activation::Sigmoid => "sigmoid",
+            Activation::Tanh => "tanh",
+            Activation::None => "none",
+        }
+    }
+
+    /// The names this accepts, for an error that tells the reader what to write.
+    fn names() -> String {
+        Self::ALL
+            .iter()
+            .map(|a| a.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn parse(name: &str) -> Result<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|a| a.as_str() == name.trim().to_ascii_lowercase())
+            .ok_or_else(|| {
+                exec(format!(
+                    "{PREDICT}: unknown activation '{name}'; expected one of {}",
+                    Self::names()
+                ))
+            })
+    }
+
+    fn apply(self, x: &Tensor) -> oxmera::Result<Tensor> {
+        match self {
+            Activation::Relu => x.relu(),
+            Activation::Gelu => x.gelu(),
+            Activation::Sigmoid => x.sigmoid(),
+            Activation::Tanh => x.tanh(),
+            Activation::None => Ok(x.clone()),
+        }
+    }
+}
+
+impl std::fmt::Display for Activation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// How a model file is interpreted.
 ///
-/// One variant today. It is an enum rather than a bare `load_mlp` so that the
-/// activation assumption documented above has somewhere to go when a second
-/// shape is needed: the model path stays the SQL surface, and what changes is
-/// this description of it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// One shape today. It is an enum rather than a bare `load_mlp` so that a
+/// second architecture has somewhere to go: the model path stays the SQL
+/// surface, and what changes is this description of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ModelSpec {
     /// A stack of `Linear` layers named `0.weight`/`0.bias`, `1.weight`/…,
-    /// ReLU between them and nothing after the last.
-    SequentialMlpRelu,
+    /// with an activation between them and nothing after the last.
+    SequentialMlp {
+        /// The activation the caller asserts. `None` means "take it from the
+        /// file's `__metadata__`", which is the only way that does not guess.
+        /// When both are present they must agree — a query that states the
+        /// wrong activation for a file is a mistake worth an error, not a
+        /// silent override of what the model was trained with.
+        activation: Option<Activation>,
+    },
+}
+
+impl ModelSpec {
+    /// The spec that reads everything, including the activation, from the file.
+    pub const FROM_FILE: ModelSpec = ModelSpec::SequentialMlp { activation: None };
 }
 
 /// A loaded model and the shapes it accepts.
@@ -86,12 +194,29 @@ pub struct Model {
     pub in_features: usize,
     /// Rows the last layer's weight produces.
     pub out_features: usize,
+    /// The activation between layers, as the file (or the query) declared it.
+    pub activation: Activation,
 }
 
 impl Model {
     /// Run `rows x in_features` through the stack.
+    ///
+    /// The layers are stepped by hand rather than through
+    /// `Sequential::forward` so the activation lands *between* them and not
+    /// after the last. The activation is not a child of the `Sequential`
+    /// either: children are numbered `0.`, `1.`, … in `named_parameters`, so
+    /// inserting a parameterless module between the layers would renumber
+    /// every weight and stop the file loading at all.
     fn forward(&self, input: &Tensor) -> oxmera::Result<Tensor> {
-        self.module.forward(input)
+        let last = self.module.len().saturating_sub(1);
+        let mut x = input.clone();
+        for (i, layer) in self.module.iter().enumerate() {
+            x = layer.forward(&x)?;
+            if i != last {
+                x = self.activation.apply(&x)?;
+            }
+        }
+        Ok(x)
     }
 }
 
@@ -104,9 +229,16 @@ impl Model {
 /// process keeps serving the old weights, which is the right default for a
 /// query engine (a plan should not change answers halfway) and the wrong one
 /// for a notebook, so it is stated rather than assumed.
-static MODELS: OnceLock<Mutex<HashMap<String, Arc<Model>>>> = OnceLock::new();
+///
+/// Keyed by the path *and* the spec: two queries over the same file, one
+/// asserting an activation and one not, must both be checked against the
+/// header rather than the second silently inheriting the first's answer.
+static MODELS: OnceLock<Mutex<ModelCache>> = OnceLock::new();
 
-fn cache() -> &'static Mutex<HashMap<String, Arc<Model>>> {
+/// The cache's contents: a loaded model per path and asserted activation.
+type ModelCache = HashMap<(String, ModelSpec), Arc<Model>>;
+
+fn cache() -> &'static Mutex<ModelCache> {
     MODELS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -120,18 +252,21 @@ pub fn model(path: &str, spec: ModelSpec) -> Result<Arc<Model>> {
     let mut guard = cache()
         .lock()
         .map_err(|_| DataFusionError::Execution(format!("{PREDICT}: model cache poisoned")))?;
-    if let Some(found) = guard.get(path) {
+    let key = (path.to_string(), spec);
+    if let Some(found) = guard.get(&key) {
         return Ok(Arc::clone(found));
     }
     let loaded = Arc::new(load(path, spec)?);
-    guard.insert(path.to_string(), Arc::clone(&loaded));
+    guard.insert(key, Arc::clone(&loaded));
     Ok(loaded)
 }
 
 /// Rebuild the architecture from the tensor names and shapes, then fill it.
 fn load(path: &str, spec: ModelSpec) -> Result<Model> {
-    let ModelSpec::SequentialMlpRelu = spec;
-    let shapes = layer_shapes(path)?;
+    let ModelSpec::SequentialMlp { activation } = spec;
+    let bytes = std::fs::read(path).map_err(|e| exec(format!("{PREDICT}: reading {path}: {e}")))?;
+    let activation = resolve_activation(path, &bytes, activation)?;
+    let shapes = layer_shapes(path, &bytes)?;
     // Destructured together so the "not empty" check happens once and the
     // compiler carries it, rather than a first()? followed by a last() that
     // is unreachable-but-fallible.
@@ -158,7 +293,48 @@ fn load(path: &str, spec: ModelSpec) -> Result<Model> {
         module: stack,
         in_features: first_in,
         out_features: last_out,
+        activation,
     })
+}
+
+/// The activation to use, from the file's `__metadata__`, the query, or both.
+///
+/// A file that declares nothing and a query that asserts nothing is the one
+/// case with no answer, and it is an error. Guessing there is what made every
+/// non-linear model load and return a linear model's numbers before 0.2.0, so
+/// the message names the key and both ways of supplying it.
+fn resolve_activation(
+    path: &str,
+    bytes: &[u8],
+    asserted: Option<Activation>,
+) -> Result<Activation> {
+    let declared = declared_activation(path, bytes)?;
+    match (declared, asserted) {
+        (Some(declared), Some(asserted)) if declared != asserted => Err(exec(format!(
+            "{PREDICT}: {path} declares `{ACTIVATION_KEY}: {declared}` but the query              asks for '{asserted}'; the model was trained with one of them, so              change the query or the file rather than running the other"
+        ))),
+        (Some(declared), _) => Ok(declared),
+        (None, Some(asserted)) => Ok(asserted),
+        (None, None) => Err(exec(format!(
+            "{PREDICT}: {path} does not declare `{ACTIVATION_KEY}` in its              safetensors `__metadata__`, so the activation between its Linear              layers is unknown and assuming one would return confident wrong              numbers. Either save the file with that key (`safetensors::serialize`              takes a metadata map; `oxmera::nn::serialize::save` does not write              one as of oxmera 0.5), or state it in the query:              predict('{path}', features, 'relu'). Accepted values: {}",
+            Activation::names()
+        ))),
+    }
+}
+
+/// The `oxidelake.activation` value in the file's header, if it has one.
+fn declared_activation(path: &str, bytes: &[u8]) -> Result<Option<Activation>> {
+    let (_, metadata) = SafeTensors::read_metadata(bytes)
+        .map_err(|e| exec(format!("{PREDICT}: {path} is not a safetensors file: {e}")))?;
+    metadata
+        .metadata()
+        .as_ref()
+        .and_then(|entries| entries.get(ACTIVATION_KEY))
+        .map(|name| {
+            Activation::parse(name)
+                .map_err(|e| exec(format!("{PREDICT}: {path}: `{ACTIVATION_KEY}`: {e}")))
+        })
+        .transpose()
 }
 
 /// `(in_features, out_features)` per layer, in layer order.
@@ -168,9 +344,8 @@ fn load(path: &str, spec: ModelSpec) -> Result<Model> {
 /// Layers must be numbered `0..n` with no gaps — a gap means this is not the
 /// `Sequential` layout, and guessing at that point would build a model that
 /// loads and computes something else.
-fn layer_shapes(path: &str) -> Result<Vec<(usize, usize)>> {
-    let bytes = std::fs::read(path).map_err(|e| exec(format!("{PREDICT}: reading {path}: {e}")))?;
-    let file = SafeTensors::deserialize(&bytes)
+fn layer_shapes(path: &str, bytes: &[u8]) -> Result<Vec<(usize, usize)>> {
+    let file = SafeTensors::deserialize(bytes)
         .map_err(|e| exec(format!("{PREDICT}: {path} is not a safetensors file: {e}")))?;
 
     let mut by_index: HashMap<usize, (usize, usize)> = HashMap::new();
@@ -244,22 +419,33 @@ impl ScalarUDFImpl for PredictUdf {
         &self.signature
     }
 
-    /// `predict(model_path, features)`: a Utf8 literal and a list of numbers.
+    /// `predict(model_path, features)` or `predict(model_path, features,
+    /// activation)`: a Utf8 literal, a list of numbers, and optionally the
+    /// activation as a string.
     ///
     /// The features are coerced to `FixedSizeList<Float32>` exactly as the
     /// distance UDFs do, so a column written as `List<Float64>` still works
     /// and the dimension is known before execution.
     fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
-        let [path, features] = arg_types else {
-            return Err(DataFusionError::Plan(format!(
-                "{PREDICT} takes 2 arguments (model path, features), got {}",
-                arg_types.len()
-            )));
+        let (path, features, activation) = match arg_types {
+            [path, features] => (path, features, None),
+            [path, features, activation] => (path, features, Some(activation)),
+            other => {
+                return Err(DataFusionError::Plan(format!(
+                    "{PREDICT} takes 2 or 3 arguments (model path, features                      [, activation]), got {}",
+                    other.len()
+                )));
+            }
         };
-        if !matches!(
-            path,
-            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
-        ) {
+        if let Some(activation) = activation
+            && !is_string(activation)
+        {
+            return Err(DataFusionError::Plan(format!(
+                "{PREDICT}: the third argument is the activation as a string                  ({}), got {activation:?}",
+                Activation::names()
+            )));
+        }
+        if !is_string(path) {
             return Err(DataFusionError::Plan(format!(
                 "{PREDICT}: the first argument is the model path as a string, got {path:?}"
             )));
@@ -273,10 +459,14 @@ impl ScalarUDFImpl for PredictUdf {
                 )));
             }
         };
-        Ok(vec![
+        let mut coerced = vec![
             DataType::Utf8,
             DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),
-        ])
+        ];
+        if activation.is_some() {
+            coerced.push(DataType::Utf8);
+        }
+        Ok(coerced)
     }
 
     /// A vector out, one element per output feature — the model's width is
@@ -291,14 +481,20 @@ impl ScalarUDFImpl for PredictUdf {
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
-        let [path, features] = args.args.as_slice() else {
-            return Err(exec(format!(
-                "{PREDICT} takes 2 arguments, got {}",
-                args.args.len()
-            )));
+        let (path, features, activation) = match args.args.as_slice() {
+            [path, features] => (path, features, None),
+            [path, features, activation] => (path, features, Some(activation)),
+            other => {
+                return Err(exec(format!(
+                    "{PREDICT} takes 2 or 3 arguments, got {}",
+                    other.len()
+                )));
+            }
         };
         let path = model_path(path)?;
-        let model = model(&path, ModelSpec::SequentialMlpRelu)?;
+        let activation = activation.map(activation_argument).transpose()?;
+        let activation = activation.as_deref().map(Activation::parse).transpose()?;
+        let model = model(&path, ModelSpec::SequentialMlp { activation })?;
         let list = feature_list(features)?;
         let (values, dim) = feature_values(&list)?;
         if dim != model.in_features {
@@ -348,19 +544,43 @@ impl ScalarUDFImpl for PredictUdf {
     }
 }
 
-fn model_path(value: &ColumnarValue) -> Result<String> {
+fn is_string(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+    )
+}
+
+/// A literal string argument, or `None` when it is not one.
+fn constant_string(value: &ColumnarValue) -> Option<String> {
     match value {
         ColumnarValue::Scalar(ScalarValue::Utf8(Some(s)))
         | ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(s)))
-        | ColumnarValue::Scalar(ScalarValue::Utf8View(Some(s))) => Ok(s.clone()),
-        // Deliberately refused rather than supported. A per-row model path
-        // means a per-row model load, and the cache would grow without bound
-        // on a column of distinct paths — a query that quietly consumes the
-        // machine is worse than one that will not plan.
-        _ => Err(DataFusionError::Plan(format!(
-            "{PREDICT}: the model path must be a constant string, not a column"
-        ))),
+        | ColumnarValue::Scalar(ScalarValue::Utf8View(Some(s))) => Some(s.clone()),
+        _ => None,
     }
+}
+
+fn model_path(value: &ColumnarValue) -> Result<String> {
+    // Deliberately refused rather than supported. A per-row model path means a
+    // per-row model load, and the cache would grow without bound on a column
+    // of distinct paths — a query that quietly consumes the machine is worse
+    // than one that will not plan.
+    constant_string(value).ok_or_else(|| {
+        DataFusionError::Plan(format!(
+            "{PREDICT}: the model path must be a constant string, not a column"
+        ))
+    })
+}
+
+/// The activation argument, which must be a literal for the same reason the
+/// path must: it selects which model is built and cached.
+fn activation_argument(value: &ColumnarValue) -> Result<String> {
+    constant_string(value).ok_or_else(|| {
+        DataFusionError::Plan(format!(
+            "{PREDICT}: the activation must be a constant string, not a column"
+        ))
+    })
 }
 
 fn feature_list(value: &ColumnarValue) -> Result<FixedSizeListArray> {
