@@ -4,6 +4,7 @@ use std::fmt;
 
 /// How a host buffer was allocated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum MemoryClass {
     /// Page-locked memory registered with the device driver: eligible for DMA
     /// without staging copies.

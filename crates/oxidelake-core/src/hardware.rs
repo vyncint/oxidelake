@@ -13,6 +13,7 @@ use crate::EngineError;
 /// backends are opt-in cargo features and are selected at runtime by the
 /// hardware detector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum BackendKind {
     /// Vectorized CPU execution through Arrow/DataFusion kernels and rayon.
     CpuSimd,

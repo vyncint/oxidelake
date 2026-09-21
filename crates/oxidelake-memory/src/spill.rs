@@ -30,6 +30,7 @@ pub type BatchId = u64;
 
 /// Where a batch currently lives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Tier {
     /// Device memory.
     Device,

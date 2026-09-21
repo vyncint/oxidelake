@@ -21,6 +21,7 @@ use crate::cluster;
 
 /// Where a session executes.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SessionMode {
     /// In-process DataFusion with the placement rule targeting the local backend.
     Embedded {

@@ -13,6 +13,7 @@ use crate::BackendKind;
 
 /// The three memory tiers tracked by the spill manager.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum MemoryTier {
     /// Device (VRAM) memory.
     Device,

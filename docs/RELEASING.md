@@ -89,6 +89,39 @@ Nine crates version together; a bump anywhere is a bump everywhere.
   a backend newly supported, a kernel that computes the same thing faster.
 - **MSRV bumps are minor**, never patch, and the lockfile is the floor.
 
+### The DataFusion coupling
+
+ADR-0009 makes DataFusion the public vocabulary: `OxideFrame::new` and
+`into_inner` take and return a DataFusion `DataFrame`, and
+`oxidelake_api::prelude` re-exports DataFusion types. A consumer therefore
+compiles against *our* DataFusion, not one of their choosing.
+
+**A DataFusion, Arrow or Ballista major bump is a minor bump of OxideLake
+before 1.0, and a major bump after.** It is breaking whether or not a single
+line of our own code changes, because a consumer holding DataFusion 54 types
+cannot pass them to a build linked against 55. The chain moves as one unit
+(`docs/dependencies.md`), so one bump, one version, one CHANGELOG entry that
+names the upstream versions — never folded into a patch alongside other work.
+
+`cargo-semver-checks` will not see this one: our signatures are unchanged and
+the break is in a type we re-export. It is the release manager's to declare.
+
+### Enums that may grow, and vocabulary that may not
+
+Public enums are `#[non_exhaustive]` where a new variant is a thing the world
+gains — `BackendKind`, `Compression`, `SessionMode`, `MemoryClass`,
+`MemoryTier`, `Tier`, `ModelSpec`, and the TUI's `Panel`/`KeyInput`/
+`Transition`. Adding to those is then a minor bump rather than a break, and a
+consumer's `match` needs a `_` arm.
+
+The plan vocabulary is **deliberately exhaustive**: `Predicate`, `Comparison`,
+`Literal`, `AggregateFunction`, `DistanceMetric` and the codec's `GpuNode`.
+Every kernel must handle every variant, and the CPU reference is the thing
+the GPU paths are checked against — so a `_` arm there is not forward
+compatibility, it is a wrong answer that compiles. Adding a variant to those
+is a break on purpose, and the compiler naming every kernel that has not
+implemented it is the feature.
+
 ## If something fails mid-release
 
 - **Before publish**: fix, delete the tag (`git push --delete origin vX.Y.Z`),

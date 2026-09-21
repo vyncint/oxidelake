@@ -89,6 +89,17 @@ impl HardwareDetector {
                 }
                 instantiate_metal()
             }
+            // `BackendKind` is `#[non_exhaustive]`, so a backend added to
+            // oxidelake-core compiles here rather than breaking this crate.
+            // It cannot be instantiated without a backend implementation, so
+            // it is a typed error naming the kind — never a silent fallback
+            // to the CPU, which would report work as accelerated that ran on
+            // the reference path.
+            other => Err(EngineError::plan(format!(
+                "backend `{other}` has no implementation in this build of \
+                 oxidelake-device; it was added to BackendKind without a \
+                 backend behind it"
+            ))),
         }
     }
 }

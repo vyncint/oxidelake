@@ -68,6 +68,7 @@ pub const PREDICT: &str = "predict";
 /// shape is needed: the model path stays the SQL surface, and what changes is
 /// this description of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ModelSpec {
     /// A stack of `Linear` layers named `0.weight`/`0.bias`, `1.weight`/…,
     /// ReLU between them and nothing after the last.

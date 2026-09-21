@@ -36,6 +36,12 @@ fn backend_tag(backend: BackendKind) -> Span<'static> {
         BackendKind::Cuda => ("[CUDA]", Color::Green),
         BackendKind::Metal => ("[Metal]", Color::Magenta),
         BackendKind::CpuSimd => ("[CPU]", Color::Blue),
+        // `BackendKind` is `#[non_exhaustive]`, so a backend added to
+        // oxidelake-core compiles here instead of breaking the dashboard.
+        // It renders as a question rather than as nothing: a tag the
+        // dashboard does not recognise is worth seeing, and silently
+        // drawing it as `[CPU]` would misreport where the work ran.
+        _ => ("[?]", Color::Yellow),
     };
     Span::styled(
         text,

@@ -20,7 +20,12 @@ workspace = true
 features = ["io-uring"]
 
 [features]
-default = []
+# `datagen` is the demo-table generator behind `oxide gen-data`. It is on by
+# default so the binaries and the test suites get it without asking, and it is
+# a feature so a library consumer can leave the demo data out of their build
+# -- `oxidelake-api` does (#41).
+default = ["datagen"]
+datagen = []
 io-uring = ["dep:io-uring", "dep:async-trait"]
 
 [dependencies]
