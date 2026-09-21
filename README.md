@@ -214,7 +214,7 @@ error, never a silent fallback.
 | Path | Purpose |
 |---|---|
 | [`crates/oxidelake-core`](crates/oxidelake-core) | `EngineError`, `BackendKind`, operator parameter types, `TelemetryHub` |
-| [`crates/oxidelake-memory`](crates/oxidelake-memory) | 64/128-byte-aligned buffers, pinned/UMA allocators, 3-tier `SpillManager`, Arrow IPC codec |
+| [`crates/oxidelake-memory`](crates/oxidelake-memory) | 64/128-byte-aligned buffers, pinned/UMA allocators, 3-tier `SpillManager` (a library: no query path registers batches with it in 0.x — see [architecture](docs/architecture.md#memory-model-and-spill-tiers)), Arrow IPC codec |
 | [`crates/oxidelake-device`](crates/oxidelake-device) | object-safe `GpuBackend`; CPU reference, CUDA (NVRTC) and Metal (MSL) backends; `HardwareDetector` |
 | [`crates/oxidelake-compute`](crates/oxidelake-compute) | the four `Gpu*Exec` operators, per-batch CPU fallback, `l2_distance`/`cosine_distance` UDFs, conformance suite |
 | [`crates/oxidelake-storage`](crates/oxidelake-storage) | Parquet writer/pruning config with *proofs*, Arrow IPC spill files, io_uring `ObjectStore` (Linux — implemented and conformance-tested, not yet used by sessions), `gen-data` generator |

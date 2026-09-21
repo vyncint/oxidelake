@@ -3,7 +3,7 @@
 
 use oxidelake_core::BackendKind;
 use oxidelake_core::telemetry::{
-    OperatorSnapshot, PlanNodeSummary, SpillSnapshot, TelemetrySnapshot, TierSnapshot,
+    OperatorSnapshot, PlanNodeSummary, SpillSnapshot, TelemetrySnapshot, TierCapacity, TierSnapshot,
 };
 
 /// Profiling summary of one column for the Describe panel.
@@ -133,6 +133,15 @@ pub fn demo_model() -> DashboardModel {
                 reloaded_bytes: 256 * 1024 * 1024,
             },
             plan,
+            // The demo is what a spill manager on the query path would look
+            // like, which is why its capacities are real numbers and its
+            // flag is set. A live session reports what its backend says and
+            // leaves the flag false until a query registers a batch (#25).
+            capacity: TierCapacity {
+                device_bytes: Some(8 * 1024 * 1024 * 1024),
+                host_bytes: Some(4 * 1024 * 1024 * 1024),
+                spill_on_query_path: true,
+            },
         },
         profiles: vec![
             ColumnProfile {

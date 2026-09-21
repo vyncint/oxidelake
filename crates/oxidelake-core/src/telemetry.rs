@@ -265,6 +265,27 @@ impl SpillCounters {
     }
 }
 
+/// What the engine knows about the size of each memory tier, and whether
+/// anything on the query path fills them (#25).
+///
+/// `None` is "this engine has no number", which is different from zero and
+/// different from a plausible constant. The gauges used to be drawn against
+/// fixed reference capacities, which made a dashboard that looked like a
+/// bounded memory model over an engine that had none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct TierCapacity {
+    /// Device memory the local backend reports, when it drives a device.
+    pub device_bytes: Option<u64>,
+    /// Host memory the local backend reports.
+    pub host_bytes: Option<u64>,
+    /// Whether a [`crate::telemetry::SpillCounters`] writer is on the query
+    /// path. `false` means the tier gauges and spill counters below can only
+    /// be moved by a caller using the spill manager as a library — no query
+    /// registers a batch with it — so a reading of zero says nothing about
+    /// the query's memory use.
+    pub spill_on_query_path: bool,
+}
+
 /// Snapshot of the spill counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct SpillSnapshot {
@@ -327,6 +348,7 @@ pub struct TelemetryHub {
     spill: SpillCounters,
     plan: RwLock<Vec<PlanNodeSummary>>,
     skips: RwLock<Vec<PlacementSkip>>,
+    capacity: RwLock<TierCapacity>,
 }
 
 /// The process-wide hub.
@@ -414,6 +436,20 @@ impl TelemetryHub {
         *self.plan.write().unwrap_or_else(PoisonError::into_inner) = nodes;
     }
 
+    /// Records what the backend says the tiers hold, and whether anything on
+    /// the query path fills them.
+    pub fn set_capacity(&self, capacity: TierCapacity) {
+        *self
+            .capacity
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = capacity;
+    }
+
+    /// What was last recorded by [`Self::set_capacity`].
+    pub fn capacity(&self) -> TierCapacity {
+        *self.capacity.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Memory tier gauges.
     pub const fn tiers(&self) -> &TierGauges {
         &self.tiers
@@ -443,6 +479,7 @@ impl TelemetryHub {
             tiers: self.tiers.snapshot(),
             spill: self.spill.snapshot(),
             plan,
+            capacity: self.capacity(),
         }
     }
 }
@@ -458,6 +495,8 @@ pub struct TelemetrySnapshot {
     pub spill: SpillSnapshot,
     /// The displayed plan.
     pub plan: Vec<PlanNodeSummary>,
+    /// Tier capacities, and whether the query path fills the tiers at all.
+    pub capacity: TierCapacity,
 }
 
 impl TelemetrySnapshot {

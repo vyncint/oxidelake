@@ -12,7 +12,7 @@ use datafusion::execution::SessionStateBuilder;
 use datafusion::physical_plan::displayable;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use oxidelake_compute::{local_backend, oxide_udfs};
-use oxidelake_core::telemetry::TelemetryHub;
+use oxidelake_core::telemetry::{TelemetryHub, TierCapacity};
 use oxidelake_core::{BackendKind, EngineError};
 use oxidelake_planner::{HardwarePlacementRule, physical_optimizer_rules};
 use oxidelake_storage::{
@@ -36,6 +36,41 @@ pub enum SessionMode {
         /// The scheduler URL.
         scheduler_url: String,
     },
+}
+
+/// What the local backend says its memory tiers hold (#25).
+///
+/// A GPU backend's `memory_info` describes the device; the CPU backend's
+/// describes host RAM. Neither is a guess, and a backend that cannot answer
+/// leaves the field `None` rather than contributing a number the dashboard
+/// would draw a gauge against.
+///
+/// `spill_on_query_path` is `false` and stays false until an operator
+/// registers a batch with a `SpillManager`. Nothing does in 0.2: the hash
+/// join's build side is probed by every batch, so demoting it would trade a
+/// bounded memory claim for an unbounded one in time, and a spilling
+/// aggregate needs the streaming aggregate first. Saying so is the honest
+/// half of this release; see `docs/architecture.md`.
+fn local_capacity() -> TierCapacity {
+    let Ok(backend) = local_backend() else {
+        return TierCapacity::default();
+    };
+    let Ok(info) = backend.memory_info() else {
+        return TierCapacity::default();
+    };
+    if backend.kind().is_gpu() {
+        TierCapacity {
+            device_bytes: Some(info.total_bytes),
+            host_bytes: None,
+            spill_on_query_path: false,
+        }
+    } else {
+        TierCapacity {
+            device_bytes: None,
+            host_bytes: Some(info.total_bytes),
+            spill_on_query_path: false,
+        }
+    }
 }
 
 impl std::fmt::Display for SessionMode {
@@ -136,6 +171,7 @@ impl OxideSession {
             None => local_backend()?.kind(),
         };
         let telemetry = TelemetryHub::new();
+        telemetry.set_capacity(local_capacity());
         let rule = HardwarePlacementRule::new(target).with_telemetry(Arc::clone(&telemetry));
         let config = options.apply(with_pruning(SessionConfig::new()), Some(target))?;
         let state = SessionStateBuilder::new()
@@ -367,6 +403,43 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("at least 1 row"), "{err}");
+    }
+
+    /// The dashboard's memory gauges are drawn against what the backend says,
+    /// and the spill flag stays false until a query path registers a batch —
+    /// which nothing does in 0.2 (#25). Both halves matter: a capacity that
+    /// was a constant and a gauge that could never move made the dashboard
+    /// describe a bounded memory model the engine does not have.
+    #[test]
+    fn a_session_reports_real_capacities_and_an_honest_spill_flag() {
+        let session = OxideSession::local().unwrap();
+        let capacity = session.telemetry().capacity();
+        assert!(
+            !capacity.spill_on_query_path,
+            "no operator registers with a SpillManager in 0.2"
+        );
+        let SessionMode::Embedded { target } = session.mode() else {
+            panic!("local() is embedded");
+        };
+        let reported = if target.is_gpu() {
+            capacity.device_bytes
+        } else {
+            capacity.host_bytes
+        };
+        // The number comes from the machine, so the assertion is on its
+        // shape: present, and not the 4 GiB constant the panel used to draw.
+        assert!(
+            reported.is_some_and(|bytes| bytes > 0),
+            "{target} reported no memory: {capacity:?}"
+        );
+        // The other tier has no backend to ask, and says so rather than
+        // contributing a number.
+        let absent = if target.is_gpu() {
+            capacity.host_bytes
+        } else {
+            capacity.device_bytes
+        };
+        assert_eq!(absent, None);
     }
 
     /// The no-argument constructors and `SessionOptions::default()` are the
