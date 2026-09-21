@@ -19,6 +19,7 @@ use oxidelake_compute::{
     GpuVectorDistanceExec, Predicate,
 };
 use oxidelake_core::BackendKind;
+use oxidelake_core::telemetry::TelemetryHub;
 use serde::{Deserialize, Serialize};
 
 const MAGIC: &[u8; 4] = b"OXGP";
@@ -212,21 +213,31 @@ impl OxidePhysicalCodec {
     }
 
     /// Rebuilds a node from its serialized form and children.
+    ///
+    /// Every node is attached to the process-wide [`TelemetryHub`]. A cluster
+    /// executor never runs the placement rule — the plan arrives here already
+    /// lowered — so this is the only place its operators can be given
+    /// somewhere to report, and without it a worker's `/metrics` would
+    /// describe no work at all (#33).
     pub fn build(
         node: GpuNode,
         inputs: &[Arc<dyn ExecutionPlan>],
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let hub = TelemetryHub::global();
         Ok(match node {
             GpuNode::Filter {
                 target,
                 predicate,
                 projection,
-            } => Arc::new(GpuFilterExec::try_new(
-                Arc::clone(child(inputs, 0, "GpuFilterExec")?),
-                predicate,
-                projection,
-                target,
-            )?),
+            } => Arc::new(
+                GpuFilterExec::try_new(
+                    Arc::clone(child(inputs, 0, "GpuFilterExec")?),
+                    predicate,
+                    projection,
+                    target,
+                )?
+                .with_telemetry(Arc::clone(hub)),
+            ),
             GpuNode::HashJoin {
                 target,
                 left_key,
@@ -240,7 +251,8 @@ impl OxidePhysicalCodec {
                     right_key,
                     target,
                 )?
-                .with_projection(projection)?,
+                .with_projection(projection)?
+                .with_telemetry(Arc::clone(hub)),
             ),
             GpuNode::Aggregate {
                 target,
@@ -266,7 +278,10 @@ impl OxidePhysicalCodec {
                     .zip(output)
                     .map(|(f, (name, nullable))| Field::new(name, f.data_type().clone(), nullable))
                     .collect();
-                Arc::new(exec.with_output_schema(Arc::new(Schema::new(fields)))?)
+                Arc::new(
+                    exec.with_output_schema(Arc::new(Schema::new(fields)))?
+                        .with_telemetry(Arc::clone(hub)),
+                )
             }
             GpuNode::VectorDistance {
                 target,
@@ -274,14 +289,17 @@ impl OxidePhysicalCodec {
                 query,
                 metric,
                 output_name,
-            } => Arc::new(GpuVectorDistanceExec::try_new(
-                Arc::clone(child(inputs, 0, "GpuVectorDistanceExec")?),
-                column,
-                query,
-                metric,
-                output_name,
-                target,
-            )?),
+            } => Arc::new(
+                GpuVectorDistanceExec::try_new(
+                    Arc::clone(child(inputs, 0, "GpuVectorDistanceExec")?),
+                    column,
+                    query,
+                    metric,
+                    output_name,
+                    target,
+                )?
+                .with_telemetry(Arc::clone(hub)),
+            ),
         })
     }
 }

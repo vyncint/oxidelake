@@ -1,9 +1,12 @@
 //! The user-facing session: one query API over embedded and cluster execution.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use ballista::prelude::SessionContextExt;
 use ballista_core::extension::SessionConfigExt;
+use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::dataframe::DataFrame;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::physical_plan::displayable;
@@ -33,6 +36,17 @@ pub enum SessionMode {
         /// The scheduler URL.
         scheduler_url: String,
     },
+}
+
+impl std::fmt::Display for SessionMode {
+    /// `embedded/cuda` or `cluster/df://host:port` — one field in a log line
+    /// rather than two, because the second is only meaningful given the first.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SessionMode::Embedded { target } => write!(f, "embedded/{target}"),
+            SessionMode::Cluster { scheduler_url } => write!(f, "cluster/{scheduler_url}"),
+        }
+    }
 }
 
 /// Knobs a session is built with.
@@ -186,14 +200,57 @@ impl OxideSession {
         &self.ctx
     }
 
-    /// The telemetry hub for this session (local process only).
+    /// The telemetry hub for this session.
+    ///
+    /// **Embedded sessions only.** A cluster session's operators run on
+    /// executors, in other processes; this hub is created for the shape of
+    /// the type and stays empty, so a snapshot of it is not "no work
+    /// happened" but "the work happened somewhere else" (#33). Each worker
+    /// reports into its own process-wide hub, which `oxide-worker
+    /// --metrics-port` exposes as Prometheus text.
     pub fn telemetry(&self) -> &Arc<TelemetryHub> {
         &self.telemetry
     }
 
     /// Plans a SQL statement into a lazily executed [`DataFrame`].
+    ///
+    /// Nothing runs here, so nothing is logged here: see [`Self::collect`]
+    /// for the one-line-per-query record.
     pub async fn sql(&self, query: &str) -> Result<DataFrame, EngineError> {
         Ok(self.ctx.sql(query).await?)
+    }
+
+    /// Runs `query` to completion and logs one `INFO` line describing it
+    /// (#33): the backend it was planned for, the rows it produced, how long
+    /// it took, and how many batches fell back to the CPU reference.
+    ///
+    /// This is the line an operator reads to answer "is the GPU being used
+    /// and how long did the query take" without attaching a dashboard. It is
+    /// on `collect` rather than on [`Self::sql`] because a `DataFrame` has
+    /// not run yet: a line logged at planning time could only report the
+    /// plan, and the interesting half is what the plan then did.
+    /// The schema comes back beside the batches because an empty result has
+    /// no batch to take it from, and a caller rendering CSV still has to
+    /// print the header.
+    pub async fn collect(&self, query: &str) -> Result<(SchemaRef, Vec<RecordBatch>), EngineError> {
+        let started = Instant::now();
+        let frame = self.sql(query).await?;
+        let schema = SchemaRef::from(frame.schema().clone());
+        let batches = frame.collect().await?;
+        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        let operators = self.telemetry.snapshot().operators;
+        let fallback_batches: u64 = operators.iter().map(|o| o.fallback_batches).sum();
+        let accelerated = operators.iter().filter(|o| o.backend.is_gpu()).count();
+        tracing::info!(
+            mode = %self.mode,
+            rows,
+            batches = batches.len(),
+            elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0,
+            gpu_operators = accelerated,
+            fallback_batches,
+            "query finished"
+        );
+        Ok((schema, batches))
     }
 
     /// Registers a Parquet file or directory as `name`.

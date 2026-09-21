@@ -162,6 +162,10 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
+        // Colour only when a person is reading. Logs are usually redirected
+        // to a file or a collector, where escape codes are noise that also
+        // breaks a grep for `field=value` (#33).
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .init();
     let cli = Cli::parse();
     match cli.command {
@@ -192,9 +196,10 @@ async fn main() -> anyhow::Result<()> {
             let session = session(cluster.as_deref(), target, batch_size, &tables).await?;
             // Not `DataFrame::show()`: that is `println!` inside DataFusion,
             // so a closed pipe panics there and the CLI never sees it (#34).
-            let frame = session.sql(&query).await?;
-            let schema = frame.schema().inner().clone();
-            let batches = frame.collect().await?;
+            // `session.collect` rather than the DataFrame's: it logs the one
+            // INFO line per query that `RUST_LOG=info` is for (#33), and
+            // hands back the schema an empty result still has to print.
+            let (schema, batches) = session.collect(&query).await?;
             write_out(&oxidelake_runtime::output::render(
                 &schema, &batches, output,
             )?)?;

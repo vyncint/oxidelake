@@ -611,3 +611,57 @@ fn explain_names_why_a_node_stayed_on_the_cpu() {
     assert!(stdout.contains("GpuAggregateExec[cuda]"), "{stdout}");
     assert!(!stdout.contains("placement notes"), "{stdout}");
 }
+
+// --- observability (#33) ----------------------------------------------------
+
+/// `RUST_LOG=info oxide sql …` prints one line per query with the mode, the
+/// rows, the time and how much of it fell back to the CPU.
+#[test]
+fn a_query_logs_one_line_with_rows_and_elapsed() {
+    let dir = tempfile::tempdir().unwrap();
+    gen_data(dir.path(), 4_096);
+    let table_arg = format!("t={}", dir.path().display());
+
+    let assert = oxide()
+        .env("RUST_LOG", "oxidelake_runtime=info")
+        .args([
+            "sql",
+            "-q",
+            "SELECT k, SUM(v) FROM t WHERE k >= 2 GROUP BY k",
+            "--table",
+            &table_arg,
+            "--target",
+            "cuda",
+        ])
+        .assert()
+        .success();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains("query finished"), "{stderr}");
+    assert!(stderr.contains("mode=embedded/cuda"), "{stderr}");
+    assert!(stderr.contains("rows="), "{stderr}");
+    assert!(stderr.contains("elapsed_ms="), "{stderr}");
+    assert!(stderr.contains("fallback_batches="), "{stderr}");
+
+    // The log goes to stderr, so it never mixes into `--output json`.
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(!stdout.contains("query finished"), "{stdout}");
+}
+
+/// Without the `metrics` feature the flag is refused, not ignored. A worker
+/// that was asked for metrics and quietly served none is the failure the
+/// endpoint exists to prevent.
+#[test]
+#[cfg_attr(feature = "metrics", ignore = "the flag is honoured in this build")]
+fn a_metrics_port_without_the_feature_is_refused() {
+    let assert = Command::cargo_bin("oxide-worker")
+        .unwrap()
+        .args(["--metrics-port", "19999"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("--metrics-port needs the `metrics` feature"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("--features metrics"), "{stderr}");
+}

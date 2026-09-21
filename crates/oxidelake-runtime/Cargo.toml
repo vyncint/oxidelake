@@ -33,6 +33,10 @@ cuda = ["oxidelake-device/cuda", "oxidelake-memory/cuda", "oxidelake-compute/cud
 metal = ["oxidelake-device/metal", "oxidelake-memory/metal", "oxidelake-compute/metal"]
 io-uring = ["oxidelake-storage/io-uring"]
 predict = ["oxidelake-compute/predict"]
+# A Prometheus scrape endpoint on `oxide-worker`/`oxide-scheduler`
+# `--metrics-port`. Off by default: it opens a port, and a port a deployment
+# did not ask for is not something a query engine should open.
+metrics = ["tokio/net", "tokio/io-util"]
 
 [dependencies]
 oxidelake-core.workspace = true

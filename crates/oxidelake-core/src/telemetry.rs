@@ -4,7 +4,7 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -329,10 +329,25 @@ pub struct TelemetryHub {
     skips: RwLock<Vec<PlacementSkip>>,
 }
 
+/// The process-wide hub.
+///
+/// Cluster executors do not build their operators — the plan arrives over the
+/// wire and the codec rebuilds it — so there is no session object to hand a
+/// hub to. This is that hub: the codec attaches it to every `Gpu*Exec` it
+/// decodes, which is what makes a worker's `/metrics` describe the work the
+/// worker actually did rather than an empty struct. Embedded sessions own
+/// their own hub and never touch this one.
+static GLOBAL: OnceLock<Arc<TelemetryHub>> = OnceLock::new();
+
 impl TelemetryHub {
     /// Creates a shared hub.
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// The process-wide hub (see [`GLOBAL`]).
+    pub fn global() -> &'static Arc<TelemetryHub> {
+        GLOBAL.get_or_init(TelemetryHub::new)
     }
 
     /// Registers an operator and returns its live counters. Ids increase
@@ -445,9 +460,161 @@ pub struct TelemetrySnapshot {
     pub plan: Vec<PlanNodeSummary>,
 }
 
+impl TelemetrySnapshot {
+    /// Renders the snapshot as Prometheus text (`text/plain; version=0.0.4`).
+    ///
+    /// Written by hand rather than through a metrics crate: the counters are
+    /// already the right shape, the output is a dozen lines, and a scrape
+    /// endpoint is not worth a dependency tree in a query engine. Operator
+    /// counters carry `operator` and `backend` labels; the tier gauges and
+    /// spill counters carry none.
+    ///
+    /// Label values are escaped per the exposition format, because an
+    /// operator name is `GpuFilterExec` today and a user-supplied string the
+    /// moment someone adds one.
+    pub fn to_prometheus(&self) -> String {
+        let mut out = String::new();
+        let counters: [OperatorCounter; 7] = [
+            ("oxide_operator_rows_in_total", "Input rows.", |o| o.rows_in),
+            ("oxide_operator_rows_out_total", "Output rows.", |o| {
+                o.rows_out
+            }),
+            ("oxide_operator_batches_total", "Batches processed.", |o| {
+                o.batches
+            }),
+            (
+                "oxide_operator_fallback_batches_total",
+                "Batches that ran on the CPU reference although the operator was placed on a device.",
+                |o| o.fallback_batches,
+            ),
+            (
+                "oxide_operator_elapsed_nanoseconds_total",
+                "Processing time.",
+                |o| o.elapsed_ns,
+            ),
+            (
+                "oxide_operator_bytes_h2d_total",
+                "Bytes copied host to device.",
+                |o| o.bytes_h2d,
+            ),
+            (
+                "oxide_operator_bytes_d2h_total",
+                "Bytes copied device to host.",
+                |o| o.bytes_d2h,
+            ),
+        ];
+        for (name, help, value) in counters {
+            out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} counter\n"));
+            for op in &self.operators {
+                out.push_str(&format!(
+                    "{name}{{operator=\"{}\",backend=\"{}\"}} {}\n",
+                    escape_label(&op.name),
+                    op.backend,
+                    value(op)
+                ));
+            }
+        }
+        out.push_str("# HELP oxide_operator_memory_bytes Currently allocated bytes.\n");
+        out.push_str("# TYPE oxide_operator_memory_bytes gauge\n");
+        for op in &self.operators {
+            out.push_str(&format!(
+                "oxide_operator_memory_bytes{{operator=\"{}\",backend=\"{}\"}} {}\n",
+                escape_label(&op.name),
+                op.backend,
+                op.memory_bytes
+            ));
+        }
+        let gauges = [
+            ("oxide_tier_device_bytes", self.tiers.device_bytes),
+            ("oxide_tier_host_bytes", self.tiers.host_bytes),
+            ("oxide_tier_disk_bytes", self.tiers.disk_bytes),
+        ];
+        for (name, value) in gauges {
+            out.push_str(&format!(
+                "# HELP {name} Bytes resident in this memory tier.\n# TYPE {name} gauge\n{name} {value}\n"
+            ));
+        }
+        let spill = [
+            ("oxide_spill_demotions_total", self.spill.demotions),
+            ("oxide_spill_promotions_total", self.spill.promotions),
+            ("oxide_spill_spilled_bytes_total", self.spill.spilled_bytes),
+            (
+                "oxide_spill_reloaded_bytes_total",
+                self.spill.reloaded_bytes,
+            ),
+        ];
+        for (name, value) in spill {
+            out.push_str(&format!(
+                "# HELP {name} Spill manager activity.\n# TYPE {name} counter\n{name} {value}\n"
+            ));
+        }
+        out
+    }
+}
+
+/// One exported operator counter: metric name, HELP text, and how to read it
+/// off a snapshot.
+type OperatorCounter = (&'static str, &'static str, fn(&OperatorSnapshot) -> u64);
+
+/// Escapes a Prometheus label value: backslash, double quote, newline.
+fn escape_label(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_snapshot_renders_as_prometheus_text() {
+        let hub = TelemetryHub::new();
+        let op = hub.register_operator("GpuFilterExec", BackendKind::Cuda);
+        op.record_batch(1_000, 400, Duration::from_millis(3));
+        op.record_transfer(2_048, 512);
+        op.record_fallback();
+        hub.tiers().set(MemoryTier::Disk, 4_096);
+        let text = hub.snapshot().to_prometheus();
+
+        assert!(
+            text.contains(
+                "oxide_operator_rows_in_total{operator=\"GpuFilterExec\",backend=\"cuda\"} 1000"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("oxide_operator_fallback_batches_total{operator=\"GpuFilterExec\",backend=\"cuda\"} 1"),
+            "{text}"
+        );
+        assert!(text.contains("oxide_tier_disk_bytes 4096"), "{text}");
+        // Every metric is declared before it is used, which is what a scraper
+        // needs and what a hand-written exporter is most likely to forget.
+        for line in text.lines().filter(|l| !l.starts_with('#')) {
+            let name = line.split(['{', ' ']).next().unwrap_or_default();
+            assert!(
+                text.contains(&format!("# TYPE {name} ")),
+                "{name} has no TYPE"
+            );
+        }
+    }
+
+    /// An operator name is a Rust type name today and could be anything
+    /// tomorrow; an unescaped quote would produce a file a scraper rejects.
+    #[test]
+    fn label_values_are_escaped() {
+        let hub = TelemetryHub::new();
+        hub.register_operator("we\"ird\\name", BackendKind::CpuSimd);
+        let text = hub.snapshot().to_prometheus();
+        assert!(text.contains("operator=\"we\\\"ird\\\\name\""), "{text}");
+    }
 
     #[test]
     fn operators_register_in_order_and_accumulate() {

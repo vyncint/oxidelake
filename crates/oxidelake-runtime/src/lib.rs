@@ -8,6 +8,8 @@
 
 pub mod cluster;
 pub mod dashboard;
+#[cfg(feature = "metrics")]
+pub mod metrics;
 pub mod output;
 pub mod session;
 

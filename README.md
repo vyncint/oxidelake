@@ -187,6 +187,7 @@ error, never a silent fallback.
 | `--bind-host` | `127.0.0.1` | Address to bind. |
 | `--port` | `50050` | gRPC port. |
 | `--cluster-backend` | `$OXIDE_CLUSTER_BACKEND`, then `cpu` | The capability the cluster declares, which is what placement rewrites against. |
+| `--metrics-port` / `--metrics-host` | off / `127.0.0.1` | As for the worker. A scheduler plans but does not execute, so its counters are empty; the endpoint exists so every process is scraped the same way. |
 
 ### `oxide-worker`
 
@@ -197,6 +198,7 @@ error, never a silent fallback.
 | `--grpc-port` | `50052` | gRPC control port. |
 | `--concurrent-tasks` | available parallelism | Tasks run at once. |
 | `--work-dir` | a temporary directory | Where shuffle files go. |
+| `--metrics-port` / `--metrics-host` | off / `127.0.0.1` | Serve Prometheus metrics at `/metrics` (needs `--features metrics`). Unauthenticated: bind it on a private interface. Without the feature the flag is refused, never ignored. |
 | `--backend` | `$OXIDE_BACKEND`, then detected | The backend this worker executes on. Selected before the first task, so it reaches the operators; a backend the machine cannot provide is a startup error. |
 
 ### Environment
@@ -205,7 +207,7 @@ error, never a silent fallback.
 | --- | --- | --- |
 | `OXIDE_BACKEND` | every process that executes operators | Forces `cpu`, `cuda` or `metal` instead of the detected backend. `oxide-worker --backend` overrides it. |
 | `OXIDE_CLUSTER_BACKEND` | `oxide-scheduler` | The cluster's declared placement capability (default `cpu`: no GPU rewrites). `--cluster-backend` overrides it. |
-| `RUST_LOG` | every binary | `tracing` filter; logs go to stderr, so they never mix into `--output json`. |
+| `RUST_LOG` | every binary | `tracing` filter; logs go to stderr, so they never mix into `--output json`, and are uncoloured when stderr is not a terminal. `RUST_LOG=oxidelake_runtime=info` gives one line per query with the mode, rows, elapsed time and CPU fallbacks. |
 
 ## Repository map
 

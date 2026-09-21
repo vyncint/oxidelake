@@ -195,12 +195,18 @@ impl ExecutionPlan for GpuVectorDistanceExec {
     ) -> Result<SendableRecordBatchStream> {
         let input = self.input.execute(partition, context)?;
         let operator = self.config.operator("GpuVectorDistanceExec")?;
+        let span = self.config.span(
+            "GpuVectorDistanceExec",
+            partition,
+            operator.backend().kind(),
+        );
         let baseline = BaselineMetrics::new(&self.metrics, partition);
         let column = self.column;
         let query = Arc::clone(&self.query);
         let metric = self.metric;
         let output_name = self.output_name.clone();
         let stream = input.map(move |batch| {
+            let _entered = span.enter();
             let batch = batch?;
             let _timer = baseline.elapsed_compute().timer();
             let out = operator.vector_distance(&batch, column, &query, metric, &output_name)?;
