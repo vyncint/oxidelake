@@ -47,11 +47,10 @@ versions (0.x) may contain breaking changes; they are always listed under a
   needs a dataset the other two cannot touch or it restates them: a sorted
   column in a single row group, where min/max cannot exclude the row group
   and there is no Bloom filter. A 1,000-row predicate prunes 198,192 of
-  200,000 rows with no row group pruned at all.
-- `ParquetWriteOptions::data_page_rows`, which is what makes that
-  observable — the page index prunes at page granularity, so pages have to
-  be small enough for a narrow predicate to skip most of them. `None`
-  keeps the `parquet` crate's byte-based default.
+  200,000 rows with no row group pruned at all. The test writes that file
+  with the `parquet` crate directly, because the 1,000-row data page limit
+  it needs is a test's requirement rather than a lake's — no public API
+  changed.
 
 ### Changed
 

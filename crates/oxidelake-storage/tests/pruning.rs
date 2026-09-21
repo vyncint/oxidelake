@@ -5,6 +5,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -18,6 +19,8 @@ use oxidelake_storage::{
     Compression, ParquetWriteOptions, PruningSummary, classify_error, register_parquet_table,
     scan_pruning_metrics, with_pruning, with_pruning_disabled, write_parquet,
 };
+use parquet::arrow::ArrowWriter;
+use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterVersion};
 
 const ROWS: usize = 200_000;
 const ROW_GROUP: usize = 2_000; // 100 row groups
@@ -172,34 +175,44 @@ fn page_index_dataset(dir: &Path) -> PathBuf {
         Field::new("seq", DataType::Int64, false),
         Field::new("v", DataType::Float64, false),
     ]));
-    let mut batches = Vec::new();
+
+    // Written with the `parquet` crate directly rather than through
+    // `write_parquet`, for one setting: pages of 1,000 rows. The page index
+    // prunes at page granularity, so pages have to be small enough for a
+    // narrow predicate to skip most of them — and a row-count page limit is
+    // a test's need, not a lake's, so it stays out of `ParquetWriteOptions`.
+    // (It was a public field for one commit; adding one to a struct callers
+    // can build with a literal is a major change, and this is a patch.)
+    // Everything else matches what `write_parquet` sets: PARQUET_2_0, page
+    // statistics, no compression, one row group for the whole file.
+    let props = WriterProperties::builder()
+        .set_writer_version(WriterVersion::PARQUET_2_0)
+        .set_max_row_group_row_count(Some(ROWS))
+        .set_compression(parquet::basic::Compression::UNCOMPRESSED)
+        .set_statistics_enabled(EnabledStatistics::Page)
+        .set_data_page_row_count_limit(1_000)
+        .build();
+
+    let path = dir.join("page-index.parquet");
+    let file = File::create(&path).unwrap();
+    let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), Some(props)).unwrap();
     for start in (0..ROWS).step_by(CHUNK) {
         let seq: Vec<i64> = (start..start + CHUNK).map(|i| i as i64).collect();
         let v: Vec<f64> = (start..start + CHUNK).map(|i| (i % 97) as f64).collect();
-        batches.push(
-            RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![
-                    Arc::new(Int64Array::from(seq)),
-                    Arc::new(Float64Array::from(v)),
-                ],
+        writer
+            .write(
+                &RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(Int64Array::from(seq)),
+                        Arc::new(Float64Array::from(v)),
+                    ],
+                )
+                .unwrap(),
             )
-            .unwrap(),
-        );
+            .unwrap();
     }
-    let path = dir.join("page-index.parquet");
-    let opts = ParquetWriteOptions {
-        // One row group for the whole file: whatever the page index prunes
-        // here, statistics demonstrably could not have.
-        row_group_rows: ROWS,
-        compression: Compression::None,
-        data_page_rows: Some(1_000),
-        ..Default::default()
-    };
-    assert_eq!(
-        write_parquet(&path, schema, &batches, &opts).unwrap(),
-        ROWS as u64
-    );
+    writer.close().unwrap();
     path
 }
 
