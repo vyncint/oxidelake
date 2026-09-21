@@ -34,7 +34,7 @@ expression: text
 "│latency/batch      1.840 ms                               ││                                                          │"
 "│memory             16.0 MiB                               ││                                                          │"
 "│H2D / D2H    12.4 MiB /  512 B                            ││                                                          │"
-"│                                                          ││                                                          │"
+"│cpu fallback        0 / 100                               ││                                                          │"
 "│                                                          ││                                                          │"
 "│                                                          ││                                                          │"
 "│                                                          ││                                                          │"

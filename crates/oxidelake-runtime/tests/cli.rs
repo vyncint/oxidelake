@@ -565,3 +565,49 @@ fn a_worker_rejects_an_unknown_backend_name() {
     let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
     assert!(stderr.contains("cpu, cuda, metal"), "{stderr}");
 }
+
+/// `oxide explain` names why a node stayed on the CPU (#32).
+///
+/// The plan above the notes shows an ordinary `AggregateExec`, which is
+/// exactly what a node that was never eligible looks like; the difference is
+/// only visible because the rule writes its reason down.
+#[test]
+fn explain_names_why_a_node_stayed_on_the_cpu() {
+    let dir = tempfile::tempdir().unwrap();
+    gen_data(dir.path(), 4_096);
+    let table_arg = format!("t={}", dir.path().display());
+
+    let assert = oxide()
+        .args([
+            "explain",
+            "-q",
+            "SELECT k, AVG(v) FROM t GROUP BY k",
+            "--table",
+            &table_arg,
+            "--target",
+            "cuda",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(stdout.contains("placement notes (target cuda)"), "{stdout}");
+    assert!(stdout.contains("AggregateExec:"), "{stdout}");
+    assert!(stdout.contains("sum, count, min, max"), "{stdout}");
+
+    // A plan that lowers completely has nothing to explain.
+    let assert = oxide()
+        .args([
+            "explain",
+            "-q",
+            "SELECT k, SUM(v) FROM t WHERE k >= 2 GROUP BY k",
+            "--table",
+            &table_arg,
+            "--target",
+            "cuda",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(stdout.contains("GpuAggregateExec[cuda]"), "{stdout}");
+    assert!(!stdout.contains("placement notes"), "{stdout}");
+}

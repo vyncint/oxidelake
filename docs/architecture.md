@@ -91,7 +91,9 @@ flowchart LR
 
 ## Telemetry and TUI
 
-`TelemetryHub` (in `oxidelake-core`) is the only coupling between engine and dashboard; in v1 it observes the local process only. The TUI is a state machine with a pure `render(state, frame)`; repaints are bracketed in DEC 2026 synchronized updates. Four panels: Plan DAG with hardware tags, Inspector, Telemetry gauges, Describe (P25/P50/P99). Tested two ways: in-process with `ratatui::backend::TestBackend` + `insta`, and end-to-end with `termlens` driving the deterministic `oxidelake-tui-demo` binary in a real PTY ([ADR-0011](decisions/ADR-0011-tui-testing-layers.md)).
+`TelemetryHub` (in `oxidelake-core`) is the only coupling between engine and dashboard; in v1 it observes the local process only. The TUI is a state machine with a pure `render(state, frame)`; repaints are bracketed in DEC 2026 synchronized updates. Four panels: Plan DAG with hardware tags, Inspector, Telemetry gauges, Describe (P25/P50/P99).
+
+The Inspector's `cpu fallback` line is the one counter that cannot be inferred from the others (#32). A GPU deployment that runs every batch on the CPU reference produces identical rows and identical `EXPLAIN` tags, so `fallback_batches / batches` is what tells the two apart; it is green at zero, yellow when some batches fell back and red when all of them did. The matching planner-side answer is the `placement notes` section `oxide explain` prints under the plan, naming each node the rule left on the CPU and why — a skipped node is an ordinary DataFusion operator in the plan above it, indistinguishable from one that was never eligible. Tested two ways: in-process with `ratatui::backend::TestBackend` + `insta`, and end-to-end with `termlens` driving the deterministic `oxidelake-tui-demo` binary in a real PTY ([ADR-0011](decisions/ADR-0011-tui-testing-layers.md)).
 
 ## Out of scope for v1
 

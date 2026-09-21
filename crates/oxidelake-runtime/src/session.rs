@@ -205,8 +205,37 @@ impl OxideSession {
     /// mode. In cluster mode this is the client-side plan (`DistributedQueryExec`);
     /// the scheduler's plan is what carries the tags there.
     pub async fn explain(&self, query: &str) -> Result<String, EngineError> {
+        self.telemetry.clear_skips();
         let plan = self.ctx.sql(query).await?.create_physical_plan().await?;
-        Ok(displayable(plan.as_ref()).indent(true).to_string())
+        let mut text = displayable(plan.as_ref()).indent(true).to_string();
+        text.push_str(&self.placement_notes());
+        Ok(text)
+    }
+
+    /// The placement rule's reasons for leaving nodes on the CPU (#32).
+    ///
+    /// A node the rule skipped is an ordinary DataFusion operator in the
+    /// plan above, indistinguishable from one that was never eligible. The
+    /// reason used to live only in a `debug!` line, which is no use to
+    /// someone reading a plan, so it is printed under it.
+    ///
+    /// Empty in cluster mode: the rule runs on the scheduler there, and this
+    /// process only planned the `DistributedQueryExec` wrapper.
+    fn placement_notes(&self) -> String {
+        let skips = self.telemetry.skips();
+        if skips.is_empty() {
+            return String::new();
+        }
+        let mut out = String::from("\nplacement notes (target ");
+        match &self.mode {
+            SessionMode::Embedded { target } => out.push_str(target.as_str()),
+            SessionMode::Cluster { .. } => out.push_str("on the scheduler"),
+        }
+        out.push_str("):\n");
+        for skip in skips {
+            out.push_str(&format!("  {}: {}\n", skip.node, skip.reason));
+        }
+        out
     }
 }
 

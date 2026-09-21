@@ -36,7 +36,7 @@ OxideLake  data/t.parquet — SELECT k, sum(v), count(v) FROM t WHERE k >= 2 AND
 │latency/batch      4.100 ms                               ││                                                          │
 │memory              8.0 MiB                               ││                                                          │
 │H2D / D2H       0 B /    0 B                              ││                                                          │
-│                                                          ││                                                          │
+│cpu fallback        0 / 100                               ││                                                          │
 │                                                          ││                                                          │
 │                                                          ││                                                          │
 │                                                          ││                                                          │

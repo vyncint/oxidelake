@@ -11,6 +11,7 @@ use ratatui::widgets::{
 };
 
 use oxidelake_core::BackendKind;
+use oxidelake_core::telemetry::OperatorSnapshot;
 
 use crate::model::DashboardModel;
 use crate::state::{AppState, Panel};
@@ -172,11 +173,39 @@ fn render_inspector(state: &AppState, model: &DashboardModel, frame: &mut Frame<
                 human_bytes(op.bytes_h2d),
                 human_bytes(op.bytes_d2h)
             )),
+            fallback_line(op),
         ],
         (Some(node), None) => vec![Line::from(node.name.clone()), Line::from("no counters yet")],
         _ => vec![Line::from("no operator selected")],
     };
     frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// The CPU-fallback line (#32).
+///
+/// A GPU deployment that silently runs everything on the CPU produces the
+/// same rows and the same `EXPLAIN` tags as one that does not, so this is the
+/// line that tells them apart. It is coloured rather than merely printed:
+/// zero is the claim being made by the backend tag above it, and any other
+/// number contradicts it.
+fn fallback_line(op: &OperatorSnapshot) -> Line<'static> {
+    let style = if op.fell_back_entirely() {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    } else if op.fallback_batches > 0 {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::Green)
+    };
+    Line::from(vec![
+        Span::raw("cpu fallback "),
+        Span::styled(
+            format!(
+                "{:>14}",
+                format!("{} / {}", op.fallback_batches, op.batches)
+            ),
+            style,
+        ),
+    ])
 }
 
 fn ratio(used: u64, total: u64) -> f64 {

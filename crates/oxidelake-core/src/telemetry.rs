@@ -46,6 +46,7 @@ pub struct OperatorStats {
     bytes_h2d: AtomicU64,
     bytes_d2h: AtomicU64,
     memory_bytes: AtomicU64,
+    fallback_batches: AtomicU64,
 }
 
 impl OperatorStats {
@@ -61,6 +62,7 @@ impl OperatorStats {
             bytes_h2d: AtomicU64::new(0),
             bytes_d2h: AtomicU64::new(0),
             memory_bytes: AtomicU64::new(0),
+            fallback_batches: AtomicU64::new(0),
         }
     }
 
@@ -99,6 +101,22 @@ impl OperatorStats {
         self.memory_bytes.store(bytes, Ordering::Relaxed);
     }
 
+    /// Records one batch that took the CPU reference path although the
+    /// operator was placed on a device (#32).
+    ///
+    /// Identical results and identical `EXPLAIN` tags are exactly what a
+    /// silently-falling-back cluster produces, so this is the number that
+    /// distinguishes "the GPU ran it" from "something ran it". A batch is
+    /// counted once, where the decision is made.
+    pub fn record_fallback(&self) {
+        self.fallback_batches.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Batches that took the CPU reference path.
+    pub fn fallback_batches(&self) -> u64 {
+        self.fallback_batches.load(Ordering::Relaxed)
+    }
+
     /// A point-in-time copy of the counters.
     pub fn snapshot(&self) -> OperatorSnapshot {
         OperatorSnapshot {
@@ -112,6 +130,7 @@ impl OperatorStats {
             bytes_h2d: self.bytes_h2d.load(Ordering::Relaxed),
             bytes_d2h: self.bytes_d2h.load(Ordering::Relaxed),
             memory_bytes: self.memory_bytes.load(Ordering::Relaxed),
+            fallback_batches: self.fallback_batches.load(Ordering::Relaxed),
         }
     }
 }
@@ -139,9 +158,20 @@ pub struct OperatorSnapshot {
     pub bytes_d2h: u64,
     /// Currently allocated bytes.
     pub memory_bytes: u64,
+    /// Batches that ran on the CPU reference although the operator was
+    /// placed on a device. Zero is the claim "this operator is accelerated";
+    /// anything else is the size of the gap between the plan and what ran.
+    pub fallback_batches: u64,
 }
 
 impl OperatorSnapshot {
+    /// `true` when every batch this operator processed took the CPU
+    /// reference path — the shape of a GPU deployment that is not using its
+    /// GPU at all.
+    pub fn fell_back_entirely(&self) -> bool {
+        self.batches > 0 && self.fallback_batches >= self.batches
+    }
+
     /// Mean per-batch latency in milliseconds (zero when nothing ran).
     pub fn mean_batch_latency_ms(&self) -> f64 {
         if self.batches == 0 {
@@ -261,6 +291,26 @@ pub struct PlanNodeSummary {
     pub detail: String,
 }
 
+/// Why the placement rule left a node on the CPU (#32).
+///
+/// A skipped node is invisible in `EXPLAIN`: it is an ordinary DataFusion
+/// operator, indistinguishable from one that was never eligible. The reason
+/// was written to `debug!` and nowhere else, so the only way to find out was
+/// to re-run the query with `RUST_LOG` turned up — which is not available to
+/// someone reading a plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlacementSkip {
+    /// The DataFusion operator that stayed on the CPU, e.g. `HashJoinExec`.
+    pub node: String,
+    /// Why, in one line.
+    pub reason: String,
+}
+
+/// Most placement notes a hub keeps for one plan. A pathological plan should
+/// not grow the hub without bound, and a reader stops reading long before
+/// this.
+pub const MAX_PLACEMENT_SKIPS: usize = 256;
+
 /// Most operator registrations a hub keeps. A hub lives as long as its session
 /// and every `Gpu*Exec` instance registers once, so without a bound a
 /// long-lived session would accumulate one entry per operator of every query
@@ -276,6 +326,7 @@ pub struct TelemetryHub {
     tiers: TierGauges,
     spill: SpillCounters,
     plan: RwLock<Vec<PlanNodeSummary>>,
+    skips: RwLock<Vec<PlacementSkip>>,
 }
 
 impl TelemetryHub {
@@ -309,6 +360,35 @@ impl TelemetryHub {
     /// whose dashboard should not show the previous one's counters).
     pub fn clear_operators(&self) {
         self.operators
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+    }
+
+    /// Records why the placement rule left a node on the CPU.
+    pub fn record_skip(&self, node: impl Into<String>, reason: impl Into<String>) {
+        let mut skips = self.skips.write().unwrap_or_else(PoisonError::into_inner);
+        if skips.len() >= MAX_PLACEMENT_SKIPS {
+            return;
+        }
+        skips.push(PlacementSkip {
+            node: node.into(),
+            reason: reason.into(),
+        });
+    }
+
+    /// The placement notes recorded since the last [`Self::clear_skips`].
+    pub fn skips(&self) -> Vec<PlacementSkip> {
+        self.skips
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Forgets the placement notes (called before planning a fresh query, so
+    /// the notes belong to the plan being looked at).
+    pub fn clear_skips(&self) {
+        self.skips
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
