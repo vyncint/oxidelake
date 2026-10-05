@@ -191,10 +191,15 @@ fn termlens_cli_inspect_drives_the_real_dashboard() {
     assert!(screen.contains("[CUDA]"), "the plan tags its operators");
     // The trailer goes to **stderr** since termlens 0.11 (termlens#340), so
     // what stdout carries is a saved screen the tool reads back unedited.
+    // Which "still running" it is depends on what ended the wait: since
+    // termlens 0.11.3 (#374) a TUI that goes quiet for `--idle` is reported
+    // `still running (killed on exit)`, and only one that keeps printing
+    // until `--timeout` says `at the deadline`. Both mean it did not exit.
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("still running at the deadline"),
-        "the dashboard is a TUI, so inspect reports the deadline rather than \
-         an exit — a binary that fell out of the event loop would say so here: {}",
+        String::from_utf8_lossy(&out.stderr).contains("still running"),
+        "the dashboard is a TUI, so inspect reports it still running rather \
+         than an exit — a binary that fell out of the event loop would say so \
+         here: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
