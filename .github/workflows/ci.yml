@@ -170,7 +170,7 @@ jobs:
           version="$(awk '/^name = "termlens"$/{found=1; next} found && /^version = /{gsub(/[",]/, "", $3); print $3; exit}' Cargo.lock)"
           [ -n "$version" ] || { echo "::error::no termlens version in Cargo.lock"; exit 1; }
           echo "version=$version" >> "$GITHUB_OUTPUT"
-      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         if: matrix.lane.name == 'default'
         with:
           tool: termlens-cli@${{ steps.termlens.outputs.version }}
