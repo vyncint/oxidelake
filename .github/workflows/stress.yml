@@ -48,8 +48,11 @@ jobs:
           # to read one. Every screen a failing wait carries is written here
           # for the report step below (termlens 0.10).
           TERMLENS_ARTIFACT_DIR: ${{ runner.temp }}/termlens
+          # A failing screen snapshot too: insta writes its `.snap.new` on CI
+          # only when told to (termlens 0.11.7, #597).
+          INSTA_UPDATE: new
         run: make stress-tui
-      - uses: vyncint/termlens/.github/actions/report@3926896a407c6c444afb971296337135de94c650 # v0.11.6
+      - uses: vyncint/termlens/.github/actions/report@ff50ffcdf91f3567e4f5b0c2056b8ee02e65c450 # v0.11.7
         if: failure()
         with:
           name: termlens-report-stress-${{ matrix.os }}

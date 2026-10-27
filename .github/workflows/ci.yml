@@ -150,6 +150,10 @@ jobs:
           # a flake in CI used to leave nothing but scrollback (termlens
           # 0.10).
           TERMLENS_ARTIFACT_DIR: ${{ runner.temp }}/termlens
+          # And a failing screen snapshot as a `.snap.new` for the same step:
+          # insta's default writes none once `CI` is set, so the report had
+          # nothing to show for one (termlens 0.11.7, #597).
+          INSTA_UPDATE: new
         run: make "$TARGET"
       # `#[ignore]`d so a plain `cargo test` never installs anything behind a
       # contributor's back — these crates are published. CI is where they
@@ -193,7 +197,7 @@ jobs:
       # This renders every screen the suite left behind — and every insta
       # `.snap.new` — into the job summary, with SVG and HTML uploaded. It
       # installs termlens-cli itself, so nothing else here has to.
-      - uses: vyncint/termlens/.github/actions/report@3926896a407c6c444afb971296337135de94c650 # v0.11.6
+      - uses: vyncint/termlens/.github/actions/report@ff50ffcdf91f3567e4f5b0c2056b8ee02e65c450 # v0.11.7
         if: failure()
         with:
           name: termlens-report-linux-${{ matrix.lane.name }}
@@ -232,6 +236,7 @@ jobs:
       - name: Metal package tests and macOS PTY suite
         env:
           TERMLENS_ARTIFACT_DIR: ${{ runner.temp }}/termlens
+          INSTA_UPDATE: new # a `.snap.new` for the report step, as in `test`
         run: make test-metal
       - name: conformance suite on the Metal device
         env:
@@ -239,7 +244,7 @@ jobs:
         run: make test-metal-device
       # macOS is the leg where the PTY suite times out first, and the one
       # nobody can reproduce locally on a Linux box.
-      - uses: vyncint/termlens/.github/actions/report@3926896a407c6c444afb971296337135de94c650 # v0.11.6
+      - uses: vyncint/termlens/.github/actions/report@ff50ffcdf91f3567e4f5b0c2056b8ee02e65c450 # v0.11.7
         if: failure()
         with:
           name: termlens-report-metal
