@@ -26,8 +26,12 @@ Trusted Publishing.
   checksums; without the secret the job says so and the tap keeps the previous
   version. To refresh the formula for a tag whose release already ran (or ran
   from an older workflow): `gh workflow run binaries.yml --ref main -f tag=vX.Y.Z`
-  — targets whose archive is already on the release are skipped without
-  building, only the missing archives and the formula move.
+  — a target whose four files (archive, alias, and a `.sha256` for each) are
+  all attached is skipped, one with only some of them is completed from the
+  attached archive without rebuilding (a rebuild would not reproduce the
+  published bytes, #131), and only a target with no archive is built. A
+  checksum attached without any archive stops the job: delete it with
+  `gh release delete-asset` first.
 - A **`release` GitHub environment** whose deployment branches are restricted
   to `v*` tags, so an OIDC publish token can never be minted from a branch.
 - **`v*` tags protected by a ruleset**, so only a repository admin can create

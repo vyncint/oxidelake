@@ -97,7 +97,9 @@ It also verifies the metadata checker under the platform's Bash and the MSRV
 target with a standalone Cargo ahead of the Rustup proxy on `PATH`, and runs
 the release's crates.io baseline lookup against a local stand-in answering
 200, 404, 429 and 5xx: only a 200 lets `cargo-semver-checks` run, and nothing
-skips it.
+skips it. `binaries.yml`'s re-run steps run as they stand in the workflow
+against a fake `gh`: a target missing any of its four files is completed from
+the attached archive, never rebuilt.
 `make stress-tui` builds release test targets once per OS, then runs thread
 counts 1, 4 and 16 with 20/40/40 percent of `ITERS` (default 100), at least once
 per count. The first failing build or iteration fails the workflow.

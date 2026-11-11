@@ -419,6 +419,13 @@ versions (0.x) may contain breaking changes; they are always listed under a
   now fails unless crates.io confirms the baseline, after retrying a 429 or
   a 5xx; a release that hits an outage is re-run rather than published
   unchecked (#130).
+- **Re-running `binaries.yml` repairs a partly attached target.** The re-run
+  guard looked for a target's archive alone, so a run that uploaded the
+  archive and died before its `.sha256` or its unversioned alias left that
+  target skipped on every re-run — and the Homebrew formula job failing on
+  the missing checksum, without printing which. A target now counts as
+  attached only when all four of its files are; the missing ones are
+  recovered from the attached archive's own bytes, never rebuilt (#131).
 
 ### Security
 

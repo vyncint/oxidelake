@@ -9,9 +9,11 @@ import io
 import json
 import os
 from pathlib import Path
+import hashlib
 import socket
 import subprocess
 import tempfile
+import textwrap
 import threading
 import unittest
 from unittest.mock import patch
@@ -33,6 +35,35 @@ def workflow_job(workflow, job):
                 if lines[i].startswith("  ") and not lines[i].startswith("   ") and lines[i].strip()
                 and not lines[i].lstrip().startswith("#")), len(lines))
     return lines[start:end]
+
+
+def workflow_step(workflow, name):
+    """The lines of the step called `name` in .github/workflows/`workflow`."""
+    lines = (ROOT / ".github/workflows" / workflow).read_text().splitlines()
+    start = lines.index(next(line for line in lines if line.strip() == f"- name: {name}"))
+    indent = len(lines[start]) - len(lines[start].lstrip())
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].strip()
+                and len(lines[i]) - len(lines[i].lstrip()) <= indent), len(lines))
+    return lines[start:end]
+
+
+def step_condition(workflow, name):
+    """The step's `if:` expression, or None."""
+    return next((line.strip()[len("if: "):] for line in workflow_step(workflow, name)
+                 if line.strip().startswith("if: ")), None)
+
+
+def step_script(workflow, name):
+    """The step's `run: |` block, dedented: the script the runner executes."""
+    lines = workflow_step(workflow, name)
+    start = next(i for i, line in enumerate(lines) if line.strip() == "run: |")
+    key = len(lines[start]) - len(lines[start].lstrip())
+    body = []
+    for line in lines[start + 1:]:
+        if line.strip() and len(line) - len(line.lstrip()) <= key:
+            break
+        body.append(line)
+    return textwrap.dedent("\n".join(body)) + "\n"
 
 
 @contextmanager
@@ -398,6 +429,165 @@ class SemverBaselineTests(unittest.TestCase):
         self.assertTrue(any("obi1kenobi/cargo-semver-checks-action@" in line for line in job))
         conditions = [line.strip() for line in job if line.strip().startswith("if:")]
         self.assertEqual(conditions, [], "no step of the semver job may be skipped")
+
+
+FAKE_GH = r'''#!/usr/bin/env python3
+"""The three `gh release` calls binaries.yml makes, against a directory."""
+import os, shutil, sys
+from pathlib import Path
+
+release = Path(os.environ["FAKE_RELEASE"])
+args = sys.argv[1:]
+with open(os.environ["FAKE_GH_LOG"], "a") as log:
+    log.write(" ".join(args) + "\n")
+
+
+def option(name, default=None):
+    return args[args.index(name) + 1] if name in args else default
+
+
+if args[:2] == ["release", "view"]:
+    for asset in sorted(release.iterdir()):
+        print(asset.name)
+elif args[:2] == ["release", "upload"]:
+    upload = Path(args[3])
+    if (release / upload.name).exists():
+        sys.exit(f"asset under the same name already exists: {upload.name}")
+    shutil.copy(upload, release / upload.name)
+elif args[:2] == ["release", "download"]:
+    name = option("--pattern")
+    if not (release / name).exists():
+        sys.exit(f"no assets match the file pattern {name}")
+    shutil.copy(release / name, Path(option("--dir", ".")) / name)
+else:
+    sys.exit(f"fake gh: unexpected call {args}")
+'''
+
+
+class BinariesRepairTests(unittest.TestCase):
+    """binaries.yml completes a partly attached target from what is attached (#131).
+
+    The steps run verbatim out of the workflow, against a fake `gh` whose
+    release is a directory. The job's `if:` conditions are mirrored in
+    `run_job`, and `test_the_build_runs_only_when_nothing_is_attached`
+    holds the workflow to that mirror.
+    """
+
+    TAG = "v0.3.0"
+    TARGET = "x86_64-unknown-linux-musl"
+    ARCHIVE = "oxidelake-0.3.0-x86_64-unknown-linux-musl.tar.gz"
+    ALIAS = "oxidelake-x86_64-unknown-linux-musl.tar.gz"
+    STATUS = "Already on the release?"
+    RECOVER = "Recover the missing files from the attached archive"
+    ATTACH = "Attach to the release"
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        for name in ("bin", "release", "work"):
+            (self.root / name).mkdir()
+        gh = self.root / "bin" / "gh"
+        gh.write_text(FAKE_GH)
+        gh.chmod(0o755)
+        self.release = self.root / "release"
+        self.log = self.root / "gh.log"
+        self.log.touch()
+
+    def attach(self, name, data):
+        (self.release / name).write_bytes(data)
+
+    def step(self, name):
+        output = self.root / "github_output"
+        output.write_text("")
+        run = subprocess.run(
+            ["bash", "-e", "-c", step_script("binaries.yml", name)], cwd=self.root / "work",
+            text=True, capture_output=True,
+            env={**os.environ, "PATH": str(self.root / "bin") + os.pathsep + os.environ["PATH"],
+                 "TAG": self.TAG, "TARGET": self.TARGET, "GITHUB_REPOSITORY": "vyncint/oxidelake",
+                 "GITHUB_OUTPUT": str(output), "GH_TOKEN": "unused", "FAKE_RELEASE": str(self.release),
+                 "FAKE_GH_LOG": str(self.log)},
+        )
+        outputs = dict(line.split("=", 1) for line in output.read_text().splitlines() if "=" in line)
+        return run, outputs
+
+    def run_job(self):
+        """The matrix job for one target, with nothing to build."""
+        run, outputs = self.step(self.STATUS)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        state = outputs.get("state")
+        self.assertIn(state, {"complete", "repair", "build"}, run.stdout)
+        if state == "build":
+            self.fail("this target needs a build, which a test cannot run")
+        for name in ((self.RECOVER, self.ATTACH) if state == "repair" else ()):
+            run, _ = self.step(name)
+            self.assertEqual(run.returncode, 0, f"{name}:\n{run.stdout}{run.stderr}")
+        return state
+
+    def sha256_line(self, name):
+        digest = hashlib.sha256((self.release / name).read_bytes()).hexdigest()
+        return f"{digest}  {name}\n"
+
+    def test_an_archive_without_its_checksum_and_alias_is_completed(self):
+        # The run the issue describes: the archive uploaded, then the step died.
+        self.attach(self.ARCHIVE, b"the archive that was published")
+        self.assertEqual(self.run_job(), "repair")
+        names = sorted(p.name for p in self.release.iterdir())
+        self.assertEqual(names, sorted([self.ARCHIVE, self.ARCHIVE + ".sha256",
+                                        self.ALIAS, self.ALIAS + ".sha256"]))
+        self.assertEqual((self.release / self.ARCHIVE).read_bytes(), b"the archive that was published")
+        self.assertEqual((self.release / self.ALIAS).read_bytes(), b"the archive that was published",
+                         "the alias is the published archive, not a rebuild")
+        self.assertEqual((self.release / f"{self.ARCHIVE}.sha256").read_text(), self.sha256_line(self.ARCHIVE))
+        self.assertEqual((self.release / f"{self.ALIAS}.sha256").read_text(), self.sha256_line(self.ALIAS))
+        # And a second re-run finds nothing left to do.
+        self.assertEqual(self.run_job(), "complete")
+
+    def test_each_missing_file_alone_is_restored_without_touching_the_rest(self):
+        published = b"published bytes"
+        everything = {self.ARCHIVE: published, self.ALIAS: published,
+                      f"{self.ARCHIVE}.sha256": None, f"{self.ALIAS}.sha256": None}
+        for missing in everything:
+            with self.subTest(missing=missing):
+                for asset in self.release.iterdir():
+                    asset.unlink()
+                for name, data in everything.items():
+                    if name != missing:
+                        self.attach(name, data if data is not None else
+                                    f"{hashlib.sha256(published).hexdigest()}  {name[:-len('.sha256')]}\n".encode())
+                before = {p.name: p.read_bytes() for p in self.release.iterdir()}
+                self.assertEqual(self.run_job(), "repair")
+                after = {p.name: p.read_bytes() for p in self.release.iterdir()}
+                self.assertEqual(set(after), set(everything))
+                for name, data in before.items():
+                    self.assertEqual(after[name], data, f"{name} was attached already and must not change")
+
+    def test_a_complete_target_is_left_alone(self):
+        for name in (self.ARCHIVE, self.ALIAS):
+            self.attach(name, b"bytes")
+            self.attach(f"{name}.sha256", self.sha256_line(name).encode())
+        self.assertEqual(self.run_job(), "complete")
+        self.assertNotIn("release upload", self.log.read_text())
+
+    def test_an_empty_release_is_built(self):
+        _, outputs = self.step(self.STATUS)
+        self.assertEqual(outputs.get("state"), "build")
+
+    def test_a_checksum_without_any_archive_is_refused(self):
+        # A rebuilt archive cannot match a checksum somebody already downloaded.
+        self.attach(f"{self.ARCHIVE}.sha256", b"0" * 64 + b"  " + self.ARCHIVE.encode() + b"\n")
+        run, outputs = self.step(self.STATUS)
+        self.assertNotEqual(run.returncode, 0, run.stdout)
+        self.assertIn("::error::", run.stdout)
+        self.assertNotIn("state", outputs)
+
+    def test_the_build_runs_only_when_nothing_is_attached(self):
+        for name in ("Add the target's standard library", "Build", "Package"):
+            self.assertEqual(step_condition("binaries.yml", name), "steps.published.outputs.state == 'build'", name)
+        self.assertEqual(step_condition("binaries.yml", "musl linker (Linux)"),
+                         "steps.published.outputs.state == 'build' && contains(matrix.target, 'musl')")
+        self.assertEqual(step_condition("binaries.yml", self.RECOVER), "steps.published.outputs.state == 'repair'")
+        self.assertEqual(step_condition("binaries.yml", self.ATTACH), "steps.published.outputs.state != 'complete'")
 
 
 if __name__ == "__main__":
