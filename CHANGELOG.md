@@ -8,6 +8,21 @@ versions (0.x) may contain breaking changes; they are always listed under a
 
 ## [Unreleased]
 
+### Security
+
+- **Vulnerable crates in the locked graph updated** (the lockfile is what
+  `cargo install --locked` and the release binaries build from): rustls
+  0.23.46 (RUSTSEC-2026-0346 to -0349: TLS secrets in `Debug` output, up to
+  1 GiB allocated by Brotli certificate decompression before
+  authentication, an ECH data leak and a key-exchange downgrade),
+  rustls-webpki 0.103.16 (RUSTSEC-2026-0382), tokio 1.54.1
+  (RUSTSEC-2026-0386), the patched zstd 0.13.4 / zstd-safe 7.4 / zstd-sys
+  2.1.2 line (RUSTSEC-2026-0391, -0398, -0403, -0410), ctutils 0.4.8
+  (RUSTSEC-2026-0385), pulldown-cmark 0.13.6 (a build dependency;
+  RUSTSEC-2026-0414, -0433), and the AWS SDK crates Ballista bundles, whose
+  current releases no longer pull the unmaintained `pin-utils`
+  (RUSTSEC-2026-0441).
+
 ## [0.2.0] - 2026-09-21
 
 The observability release. A GPU deployment that silently ran everything on
