@@ -56,6 +56,17 @@ versions (0.x) may contain breaking changes; they are always listed under a
   `FilterExec: GpuFilterExec predicate has 65 comparisons; at most 64 are
   supported` under the plan. Decoded plans are still refused.
 
+- **`COUNT(*)` over a GPU-placed filter or join plans again** (#87).
+  `COUNT(*)` reads no column, so DataFusion gives the filter or join under
+  it an empty projection; the device operators return at least one column,
+  the placement rule passed their refusal up, and `SELECT count(*) FROM t
+  WHERE k > 3` failed with `GpuFilterExec: projection must select at least
+  one column` on `--target cuda|metal` (the detected target on a CUDA
+  machine) and on a GPU cluster; the join form failed the same way. The
+  node now keeps one column it reads anyway (the first predicate column,
+  the probe key) and an empty `ProjectionExec: expr=[]` above it drops the
+  column again, so the filter and the join still run on the device.
+
 ### Security
 
 - **thrift is out of the dependency graph** (#4, #54). parquet 59 decodes

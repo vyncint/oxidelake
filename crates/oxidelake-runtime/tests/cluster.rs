@@ -264,4 +264,31 @@ async fn the_static_planner_runs_lowered_nodes_correctly() {
         ran_since(since, "GpuFilterExec").0 > 0,
         "{sql}: no GpuFilterExec ran"
     );
+
+    // COUNT(*) reads no column, so the filter and the join under it have
+    // nothing to project; the filter failed planning on the scheduler (#87).
+    // The lowered node ran and produced exactly the rows counted.
+    for (sql, lowered) in [
+        ("SELECT count(*) FROM t WHERE k >= 3", "GpuFilterExec"),
+        (
+            "SELECT count(*) FROM t JOIN r ON t.k = r.rk",
+            "GpuHashJoinExec",
+        ),
+    ] {
+        let since = next_operator_id();
+        let batches = cluster.sql(sql).await.unwrap().collect().await.unwrap();
+        let local = embedded.sql(sql).await.unwrap().collect().await.unwrap();
+        assert_eq!(sorted_rows(&batches), sorted_rows(&local), "{sql}");
+        let counted = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        let (ran, rows) = ran_since(since, lowered);
+        assert!(
+            ran > 0 && i64::try_from(rows) == Ok(counted),
+            "{sql}: {ran} {lowered} produced {rows} rows, {counted} counted"
+        );
+    }
 }

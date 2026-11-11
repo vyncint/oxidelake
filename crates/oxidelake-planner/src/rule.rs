@@ -17,7 +17,7 @@ use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::joins::{HashJoinExec, SortMergeJoinExec};
 use datafusion::physical_plan::limit::LocalLimitExec;
-use datafusion::physical_plan::projection::ProjectionExec;
+use datafusion::physical_plan::projection::{ProjectionExec, ProjectionExpr};
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
@@ -103,12 +103,12 @@ impl HardwarePlacementRule {
     /// The replacement for `node`, or `None` when it stays as it is.
     fn lower(&self, node: &Arc<dyn ExecutionPlan>) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         if let Some(filter) = node.downcast_ref::<FilterExec>()
-            && let Some(gpu) = self.lower_filter(filter)?
+            && let Some(lowered) = self.lower_filter(filter)?
         {
-            return Ok(Some(Arc::new(gpu)));
+            return Ok(Some(lowered));
         }
         if let Some(projection) = node.downcast_ref::<ProjectionExec>() {
-            if let Some(gpu) = self.fuse_projection(projection)? {
+            if let Some(gpu) = self.fuse_projection(projection) {
                 return Ok(Some(Arc::new(gpu)));
             }
             if let Some(gpu) = self.lower_vector_distance(projection) {
@@ -116,9 +116,9 @@ impl HardwarePlacementRule {
             }
         }
         if let Some(join) = node.downcast_ref::<HashJoinExec>()
-            && let Some(gpu) = self.lower_join(join)?
+            && let Some(lowered) = self.lower_join(join)?
         {
-            return Ok(Some(Arc::new(gpu)));
+            return Ok(Some(lowered));
         }
         if let Some(join) = node.downcast_ref::<SortMergeJoinExec>()
             && let Some(gpu) = self.lower_sort_merge_join(join)?
@@ -133,7 +133,7 @@ impl HardwarePlacementRule {
         Ok(None)
     }
 
-    fn lower_filter(&self, filter: &FilterExec) -> Result<Option<GpuFilterExec>> {
+    fn lower_filter(&self, filter: &FilterExec) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         let input = filter.input();
         let schema = input.schema();
         let predicate = match try_lower_predicate(filter.predicate(), &schema) {
@@ -147,6 +147,17 @@ impl HardwarePlacementRule {
             Some(p) => p.iter().copied().collect(),
             None => (0..schema.fields().len()).collect(),
         };
+        // COUNT(*) reads no column, so DataFusion leaves the filter an empty
+        // projection, and the device filter returns at least one column
+        // (#87). It keeps the first column the predicate reads, which is on
+        // the device for the comparison anyway, and an empty projection
+        // above drops it again, leaving only the row count.
+        let count_only = projection.is_empty();
+        let projection = if count_only {
+            predicate.columns().into_iter().take(1).collect()
+        } else {
+            projection
+        };
         // The constructor's checks exist for plans decoded off the network
         // (the predicate's leaf cap is audit S5's); at planning time a node
         // they refuse stays on the CPU rather than failing the query (#133).
@@ -158,28 +169,56 @@ impl HardwarePlacementRule {
                     return Ok(None);
                 }
             };
-        if exec.schema() != filter.schema() {
+        let exec: Arc<dyn ExecutionPlan> =
+            Arc::new(self.instrument(exec, GpuFilterExec::with_telemetry));
+        let lowered = if count_only {
+            match self.row_count_only("FilterExec", exec) {
+                Some(lowered) => lowered,
+                None => return Ok(None),
+            }
+        } else {
+            exec
+        };
+        if lowered.schema() != filter.schema() {
             self.skip("FilterExec", "the fused schema differs from the original");
             return Ok(None);
         }
-        Ok(Some(self.instrument(exec, GpuFilterExec::with_telemetry)))
+        Ok(Some(lowered))
+    }
+
+    /// `exec` under an empty projection, which keeps its row count and none
+    /// of its columns: what a COUNT(*) above reads (#87). `None`, with a
+    /// note, if DataFusion refuses the projection.
+    fn row_count_only(
+        &self,
+        node: &str,
+        exec: Arc<dyn ExecutionPlan>,
+    ) -> Option<Arc<dyn ExecutionPlan>> {
+        match ProjectionExec::try_new(Vec::<ProjectionExpr>::new(), exec) {
+            Ok(projection) => Some(Arc::new(projection)),
+            Err(err) => {
+                self.skip(node, refusal(&err));
+                None
+            }
+        }
     }
 
     /// `ProjectionExec` of plain columns over an already-lowered `GpuFilterExec`
-    /// folds into the filter's projection when no column is renamed.
-    fn fuse_projection(&self, projection: &ProjectionExec) -> Result<Option<GpuFilterExec>> {
-        let Some(filter) = projection.input().downcast_ref::<GpuFilterExec>() else {
-            return Ok(None);
-        };
+    /// folds into the filter's projection when no column is renamed. An
+    /// empty projection (COUNT(*)) stays where it is: the device filter
+    /// returns at least one column (#87).
+    fn fuse_projection(&self, projection: &ProjectionExec) -> Option<GpuFilterExec> {
+        let filter = projection.input().downcast_ref::<GpuFilterExec>()?;
+        if projection.expr().is_empty() {
+            return None;
+        }
         let filter_schema = projection.input().schema();
         let mut fused = Vec::with_capacity(projection.expr().len());
         for expr in projection.expr() {
-            let Some(column) = as_any(&expr.expr).downcast_ref::<Column>() else {
-                return Ok(None);
-            };
+            let column = as_any(&expr.expr).downcast_ref::<Column>()?;
             let field = filter_schema.field(column.index());
             if field.name() != &expr.alias {
-                return Ok(None);
+                return None;
             }
             fused.push(filter.projection()[column.index()]);
         }
@@ -188,11 +227,10 @@ impl HardwarePlacementRule {
             filter.predicate().clone(),
             fused,
             self.target,
-        )?;
-        if exec.schema() != projection.schema() {
-            return Ok(None);
-        }
-        Ok(Some(self.instrument(exec, GpuFilterExec::with_telemetry)))
+        )
+        .ok()?;
+        (exec.schema() == projection.schema())
+            .then(|| self.instrument(exec, GpuFilterExec::with_telemetry))
     }
 
     /// A `ProjectionExec` that passes every input column through unchanged and
@@ -255,7 +293,7 @@ impl HardwarePlacementRule {
     /// `left ++ right` column order (plus any projection pushed into the join)
     /// is re-expressed as a projection over our `probe ++ build` order, so the
     /// output schema is identical.
-    fn lower_join(&self, join: &HashJoinExec) -> Result<Option<GpuHashJoinExec>> {
+    fn lower_join(&self, join: &HashJoinExec) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         if *join.join_type() != JoinType::Inner
             || join.filter().is_some()
             || join.null_equality() != NullEquality::NullEqualsNothing
@@ -311,22 +349,43 @@ impl HardwarePlacementRule {
             .iter()
             .map(|&i| if i < bl { pl + i } else { i - bl })
             .collect();
-        let exec = GpuHashJoinExec::try_new(
+        // COUNT(*) over a join reads no column either (#87): keep the probe
+        // key, which the device join reads anyway, and drop it again above.
+        let count_only = ours.is_empty();
+        let ours = if count_only { vec![probe_key] } else { ours };
+        let exec = match GpuHashJoinExec::try_new(
             Arc::clone(probe),
             Arc::clone(build),
             probe_key,
             build_key,
             self.target,
-        )?
-        .with_projection(Some(ours))?;
-        if exec.schema() != join.schema() {
+        )
+        .and_then(|exec| exec.with_projection(Some(ours)))
+        {
+            Ok(exec) => exec,
+            Err(err) => {
+                self.skip("HashJoinExec", refusal(&err));
+                return Ok(None);
+            }
+        };
+        let exec: Arc<dyn ExecutionPlan> =
+            Arc::new(self.instrument(exec, GpuHashJoinExec::with_telemetry));
+        let lowered = if count_only {
+            match self.row_count_only("HashJoinExec", exec) {
+                Some(lowered) => lowered,
+                None => return Ok(None),
+            }
+        } else {
+            exec
+        };
+        if lowered.schema() != join.schema() {
             self.skip(
                 "HashJoinExec",
                 "the rewritten schema differs from the original",
             );
             return Ok(None);
         }
-        Ok(Some(self.instrument(exec, GpuHashJoinExec::with_telemetry)))
+        Ok(Some(lowered))
     }
 
     /// `SortMergeJoinExec` (what DataFusion plans when hash joins are not
@@ -355,7 +414,13 @@ impl HardwarePlacementRule {
         {
             return Ok(None);
         }
-        let exec = GpuHashJoinExec::try_new(left, right, lk, rk, self.target)?;
+        let exec = match GpuHashJoinExec::try_new(left, right, lk, rk, self.target) {
+            Ok(exec) => exec,
+            Err(err) => {
+                self.skip("SortMergeJoinExec", refusal(&err));
+                return Ok(None);
+            }
+        };
         if exec.schema() != join.schema() {
             self.skip(
                 "SortMergeJoinExec",

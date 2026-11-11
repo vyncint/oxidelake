@@ -13,8 +13,11 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::util::display::{ArrayFormatter, FormatOptions};
+use datafusion::config::ConfigOptions;
 use datafusion::datasource::MemTable;
 use datafusion::execution::SessionStateBuilder;
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_plan::projection::{ProjectionExec, ProjectionExpr};
 use datafusion::physical_plan::{ExecutionPlan, collect, displayable};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_proto::physical_plan::{DefaultPhysicalProtoConverter, PhysicalExtensionCodec};
@@ -432,6 +435,83 @@ async fn a_predicate_over_the_device_cap_stays_on_the_cpu_with_a_note() {
         ]
     );
     assert_same_results(&query(64), BackendKind::Cuda, Some("GpuFilterExec[cuda]")).await;
+}
+
+/// `COUNT(*)` reads no column, so DataFusion gives the filter or join under it
+/// an empty projection. The rule handed that to the `Gpu*Exec` constructor,
+/// which refuses it, and the whole query failed to plan on every GPU target
+/// (#87). The node is lowered now with one column it already has on the
+/// device, and an empty projection above drops it again.
+#[tokio::test]
+async fn count_star_over_a_lowered_filter_or_join_plans_and_counts() {
+    for (sql, lowered) in [
+        (
+            "SELECT count(*) FROM t WHERE k >= 2",
+            "GpuFilterExec[cuda]: k >= 2, projection=[k]",
+        ),
+        (
+            "SELECT count(*) FROM n WHERE k > 3",
+            "GpuFilterExec[cuda]: k > 3, projection=[k]",
+        ),
+        (
+            "SELECT count(*) FROM t JOIN r ON t.k = r.rk",
+            "GpuHashJoinExec[cuda]",
+        ),
+        (
+            "SELECT count(*) FROM n JOIN d ON n.k = d.bk",
+            "GpuHashJoinExec[cuda]",
+        ),
+    ] {
+        // The shape this pins: the stock node has nothing to project.
+        let (_, stock) = plan_and_text(&plain_ctx(), sql).await;
+        assert!(
+            stock.lines().any(|l| {
+                let l = l.trim_start();
+                (l.starts_with("FilterExec:") || l.starts_with("HashJoinExec:"))
+                    && l.contains("projection=[]")
+            }),
+            "{sql}: the stock node no longer has an empty projection, so this no \
+             longer covers #87:\n{stock}"
+        );
+        let plan = assert_same_results(sql, BackendKind::Cuda, Some(lowered)).await;
+        let text = displayable(plan.as_ref()).indent(true).to_string();
+        let above = parent_of(
+            &plan,
+            if sql.contains("JOIN") {
+                "GpuHashJoinExec"
+            } else {
+                "GpuFilterExec"
+            },
+        );
+        assert_eq!(
+            above.map(|p| (p.name().to_owned(), p.schema().fields().len())),
+            Some(("ProjectionExec".to_owned(), 0)),
+            "{sql}: an empty projection drops the column the device kept:\n{text}"
+        );
+    }
+}
+
+/// An empty projection above a filter the rule already lowered stays where
+/// it is: the device filter returns at least one column, and folding the
+/// projection into it failed the query the same way (#87).
+#[tokio::test]
+async fn an_empty_projection_over_a_lowered_filter_stays() {
+    let ctx = ctx_with_rule(BackendKind::Cuda);
+    let (lowered, text) = plan_and_text(&ctx, "SELECT k FROM t WHERE k >= 2").await;
+    assert_eq!(lowered.name(), "GpuFilterExec", "{text}");
+    let counted: Arc<dyn ExecutionPlan> =
+        Arc::new(ProjectionExec::try_new(Vec::<ProjectionExpr>::new(), lowered).unwrap());
+    let plan = HardwarePlacementRule::new(BackendKind::Cuda)
+        .optimize(counted, &ConfigOptions::default())
+        .unwrap();
+    assert_eq!(plan.name(), "ProjectionExec");
+    let rows: usize = collect(plan, ctx.task_ctx())
+        .await
+        .unwrap()
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum();
+    assert_eq!(rows, 5);
 }
 
 #[tokio::test]

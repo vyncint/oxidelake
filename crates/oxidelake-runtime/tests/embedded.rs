@@ -14,7 +14,7 @@ use oxidelake_core::BackendKind;
 use oxidelake_runtime::OxideSession;
 use oxidelake_storage::{Compression, demo_write_options, write_demo_table};
 
-const QUERIES: [&str; 5] = [
+const QUERIES: [&str; 7] = [
     "SELECT k, sum(v), count(v), min(v), max(v) FROM t GROUP BY k",
     "SELECT a.id, b.s FROM (SELECT id, k FROM t WHERE id < 100) a \
      JOIN (SELECT k, s FROM t WHERE id >= 900) b ON a.k = b.k",
@@ -23,6 +23,10 @@ const QUERIES: [&str; 5] = [
      JOIN (SELECT k, s FROM t WHERE id < 500) b ON a.k = b.k GROUP BY b.s",
     "SELECT id, l2_distance(emb, [1.0, 0.0, -1.0, 2.0, 0.5, 0.0, 1.5, -0.5]) AS d \
      FROM t WHERE k >= 50 ORDER BY d, id LIMIT 20",
+    // COUNT(*) reads no column, so the filter and the join have nothing to
+    // project; both used to fail to plan on a GPU target (#87).
+    "SELECT count(*) FROM t WHERE k >= 2",
+    "SELECT count(*) FROM t a JOIN t b ON a.k = b.k",
 ];
 
 fn sorted_rows(batches: &[RecordBatch]) -> Vec<String> {
