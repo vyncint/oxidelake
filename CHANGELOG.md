@@ -357,6 +357,18 @@ versions (0.x) may contain breaking changes; they are always listed under a
   for them; after 30 seconds it stops waiting and lets them finish in the
   background. A file that cannot be deleted is logged at `warn`.
 
+### Fixed
+
+- **Cluster mode returns the right rows for `NOT IN (subquery)`** (#91).
+  Under Ballista 54 a cluster session (`prefer_hash_join = false`) had
+  DataFusion plan the null-aware anti join as a `SortMergeJoinExec`, which is
+  not null-aware, so rows whose key was NULL came back where embedded mode
+  returns none — no GPU operator involved (0.2.0, a 5000-row table: 4859
+  rows on the cluster, 4759 embedded). The move to the 55 chain fixes it
+  twice over: DataFusion 55 never gives a null-aware anti join to the merge
+  join, and Ballista 55's client rewrites `NOT IN` into a plain anti join
+  and a count. Both NULL cases are now in the cluster equality suite.
+
 ### Security
 
 - **thrift is out of the dependency graph** (#4, #54). parquet 59 decodes

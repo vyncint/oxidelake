@@ -101,12 +101,21 @@ fn sorted_rows(batches: &[RecordBatch]) -> Vec<String> {
     rows
 }
 
-const QUERIES: [&str; 4] = [
+const QUERIES: [&str; 5] = [
     "SELECT k, sum(v), count(v), min(v), max(v) FROM t GROUP BY k",
     "SELECT t.k, t.s, r.name FROM t JOIN r ON t.k = r.rk",
     "SELECT s, k FROM t WHERE k >= 2 AND v < 4.0",
     "SELECT r.name, count(*) FROM t JOIN r ON t.k = r.rk WHERE t.v > 1.0 GROUP BY r.name",
+    // Every 11th `t.k` is NULL, and a NULL is never `NOT IN` a non-empty
+    // set, so those rows must not come back (#91).
+    NOT_IN_NULL_PROBE,
 ];
+
+/// `NOT IN` over a subquery with no NULLs, probed by a column with NULLs.
+const NOT_IN_NULL_PROBE: &str =
+    "SELECT k, s FROM t WHERE k NOT IN (SELECT rk FROM r WHERE rk IS NOT NULL)";
+/// `NOT IN` over a subquery that contains a NULL: no row can qualify.
+const NOT_IN_NULL_BUILD: &str = "SELECT k, s FROM t WHERE k NOT IN (SELECT rk FROM r)";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn distributed_results_equal_embedded_results() {
@@ -131,6 +140,58 @@ async fn distributed_results_equal_embedded_results() {
         assert!(!local.is_empty(), "{sql}");
         assert_eq!(distributed, local, "{sql}");
     }
+}
+
+/// `NOT IN (subquery)` keeps SQL's three-valued semantics on a cluster (#91).
+///
+/// No GPU operator is involved, so the cluster plans for `cpu`. Under
+/// Ballista 54 the cluster session's `prefer_hash_join = false` made
+/// DataFusion plan this as a `SortMergeJoinExec: LeftAnti`, which is not
+/// null-aware: the NULL-key rows of `t` came back, where embedded mode
+/// (stock DataFusion) returns none of them. The second query is the other
+/// half of the semantics: one NULL in the subquery and nothing qualifies.
+///
+/// Two upstream changes each fix it on the 55 chain: DataFusion 55's planner
+/// never gives a null-aware anti join to the merge join, and Ballista 55's
+/// client rewrites `NOT IN` into a plain anti join and a count before one is
+/// needed. This pins the answer, not either mechanism.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn not_in_a_subquery_is_null_aware_on_a_cluster() {
+    let dir = tempfile::tempdir().unwrap();
+    let (t_path, r_path) = write_dataset(dir.path());
+
+    let addr = start_standalone(BackendKind::CpuSimd, 2, 2).await.unwrap();
+    let cluster = OxideSession::connect(&format!("df://{addr}"))
+        .await
+        .unwrap();
+    cluster.register_parquet("t", &t_path).await.unwrap();
+    cluster.register_parquet("r", &r_path).await.unwrap();
+    let embedded = OxideSession::local().unwrap();
+    embedded.register_parquet("t", &t_path).await.unwrap();
+    embedded.register_parquet("r", &r_path).await.unwrap();
+
+    let distributed = rows_of(&cluster, NOT_IN_NULL_PROBE).await;
+    let null_keys = distributed
+        .iter()
+        .filter(|r| r.starts_with("NULL|"))
+        .count();
+    assert_eq!(null_keys, 0, "a NULL key is never NOT IN a non-empty set");
+    let local = rows_of(&embedded, NOT_IN_NULL_PROBE).await;
+    assert!(!local.is_empty());
+    assert_eq!(distributed, local);
+
+    assert_eq!(
+        rows_of(&cluster, NOT_IN_NULL_BUILD).await,
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        rows_of(&embedded, NOT_IN_NULL_BUILD).await,
+        Vec::<String>::new()
+    );
+}
+
+async fn rows_of(session: &OxideSession, sql: &str) -> Vec<String> {
+    sorted_rows(&session.sql(sql).await.unwrap().collect().await.unwrap())
 }
 
 /// The plan the scheduler builds for the cluster (its session builder with
