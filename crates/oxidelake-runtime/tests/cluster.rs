@@ -17,7 +17,7 @@ use datafusion::prelude::SessionContext;
 use oxidelake_core::BackendKind;
 use oxidelake_core::telemetry::TelemetryHub;
 use oxidelake_runtime::cluster::{build_session_state, session_config, start_standalone};
-use oxidelake_runtime::{OxideSession, SessionMode};
+use oxidelake_runtime::{OxideSession, SessionMode, SessionOptions};
 use oxidelake_storage::{Compression, ParquetWriteOptions, write_parquet};
 
 fn write_dataset(dir: &Path) -> (String, String) {
@@ -192,6 +192,75 @@ async fn not_in_a_subquery_is_null_aware_on_a_cluster() {
 
 async fn rows_of(session: &OxideSession, sql: &str) -> Vec<String> {
     sorted_rows(&session.sql(sql).await.unwrap().collect().await.unwrap())
+}
+
+/// One `Int64` column of `rows` values in one row group of one file small
+/// enough to be one scan partition, so the only thing that cuts the scan into
+/// batches is the batch size (the Parquet reader never spans row groups).
+fn write_rows(dir: &Path, rows: i64) -> String {
+    let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from_iter_values(0..rows))],
+    )
+    .unwrap();
+    let path = dir.join("w.parquet");
+    let opts = ParquetWriteOptions {
+        row_group_rows: usize::try_from(rows).unwrap(),
+        compression: Compression::None,
+        ..Default::default()
+    };
+    write_parquet(&path, schema, &[batch], &opts).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+/// The largest batch a cluster session returns for a plain scan of `w`.
+async fn largest_batch(session: &OxideSession, path: &str) -> usize {
+    session.register_parquet("w", path).await.unwrap();
+    let batches = session
+        .sql("SELECT x FROM w")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        20_000
+    );
+    batches.iter().map(RecordBatch::num_rows).max().unwrap()
+}
+
+/// The batch size a client asks for reaches a GPU cluster (#93).
+///
+/// The scheduler's session builder used to put the GPU default (65 536) over
+/// whatever the client sent whenever the cluster's target was a GPU, so
+/// `oxide sql --cluster … --batch-size 7` came back in one batch of every
+/// row. 8192 is DataFusion's own default, which a client asking for exactly
+/// that cannot be told apart from by the value alone — the case a
+/// "default means unset" rule would get wrong.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_batch_size_a_client_asks_for_reaches_a_gpu_cluster() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_rows(dir.path(), 20_000);
+    let addr = start_standalone(BackendKind::Cuda, 2, 2).await.unwrap();
+    let url = format!("df://{addr}");
+
+    for rows in [7, 8_192] {
+        let options = SessionOptions::new().with_batch_size(rows);
+        let session = OxideSession::connect_with_options(&url, &options)
+            .await
+            .unwrap();
+        let largest = largest_batch(&session, &path).await;
+        assert!(
+            largest <= rows,
+            "asked for {rows}-row batches, got {largest}"
+        );
+    }
+
+    // Nobody asked: the GPU default, so all 20 000 rows fit one batch.
+    let session = OxideSession::connect(&url).await.unwrap();
+    assert_eq!(largest_batch(&session, &path).await, 20_000);
 }
 
 /// The plan the scheduler builds for the cluster (its session builder with

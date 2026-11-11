@@ -99,7 +99,9 @@ pub struct SessionOptions {
     /// Plan for this backend instead of the detected one (embedded only).
     pub target: Option<BackendKind>,
     /// Rows per record batch. `None` leaves DataFusion's default (8192), or
-    /// [`oxidelake_storage::GPU_BATCH_SIZE`] when the placement target is a GPU.
+    /// [`oxidelake_storage::GPU_BATCH_SIZE`] when the placement target is a GPU
+    /// (on a cluster, the scheduler's target). A size set here is kept on a
+    /// GPU target too, a cluster's included.
     pub batch_size: Option<usize>,
 }
 
@@ -210,8 +212,13 @@ impl OxideSession {
         scheduler_url: &str,
         options: &SessionOptions,
     ) -> Result<Self, EngineError> {
+        // The scheduler picks the batch size a GPU cluster runs with, so it
+        // has to be told when this one is a choice rather than a default (#93).
         let config = with_pruning(SessionConfig::new_with_ballista())
-            .with_ballista_physical_extension_codec(cluster::oxide_codec());
+            .with_ballista_physical_extension_codec(cluster::oxide_codec())
+            .with_option_extension(cluster::ClientOptions {
+                explicit_batch_size: options.batch_size.is_some(),
+            });
         let config = options.apply(config, None)?;
         let state = SessionStateBuilder::new()
             .with_default_features()

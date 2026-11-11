@@ -369,6 +369,17 @@ versions (0.x) may contain breaking changes; they are always listed under a
   join, and Ballista 55's client rewrites `NOT IN` into a plain anti join
   and a count. Both NULL cases are now in the cluster equality suite.
 
+- **`oxide sql --cluster --batch-size` reaches a GPU cluster** (#93). The
+  scheduler raised every query's batch size to the GPU default (65536)
+  whenever its target was a GPU, so the flag — and
+  `SessionOptions::with_batch_size` with `connect_with_options` — did
+  nothing there: `--batch-size 7` came back as one batch of every row. A
+  cluster client now tells the scheduler when the size is its own choice
+  (the `oxidelake.explicit_batch_size` session setting), and the GPU
+  default applies only to a size nobody chose. A size set with `SET
+  datafusion.execution.batch_size` is kept as well, unless it is 8192,
+  which the scheduler cannot tell from the default.
+
 ### Security
 
 - **thrift is out of the dependency graph** (#4, #54). parquet 59 decodes
