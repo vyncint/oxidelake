@@ -273,6 +273,15 @@ versions (0.x) may contain breaking changes; they are always listed under a
   DataFusion's exchange between them, and each `GpuAggregateExec` declares
   the partitioning of the node it replaces.
 
+### Fixed
+
+- **`predict` scores a feature vector with a NULL element as NULL** (#97).
+  Only the vector's own validity was checked, so a NULL element was read
+  from the values buffer as whatever lay there, 0.0 from every Arrow
+  builder: `[1.0, NULL]` scored exactly like `[1.0, 0.0]`. Such a row now
+  returns NULL, as a NULL vector always did. A query that relied on the old
+  number fills the element in before calling `predict`.
+
 ### Security
 
 - **thrift is out of the dependency graph** (#4, #54). parquet 59 decodes

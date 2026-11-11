@@ -706,3 +706,106 @@ async fn a_layer_larger_than_its_file_is_refused_before_allocating() {
         "the child ran no test:\n{stdout}"
     );
 }
+
+// --- NULL elements (#97) ----------------------------------------------------
+
+/// `id` and `features` from rows whose elements may each be NULL, as well as
+/// the row itself.
+fn batch_with_elements(rows: &[Option<[Option<f32>; IN]>]) -> RecordBatch {
+    let mut values = Vec::new();
+    let mut validity = Vec::new();
+    for row in rows {
+        match row {
+            Some(elements) => {
+                values.extend_from_slice(elements);
+                validity.push(true);
+            }
+            None => {
+                values.extend(std::iter::repeat_n(Some(0.0), IN));
+                validity.push(false);
+            }
+        }
+    }
+    let field = Arc::new(Field::new("item", DataType::Float32, true));
+    let list = FixedSizeListArray::new(
+        Arc::clone(&field),
+        IN as i32,
+        Arc::new(Float32Array::from(values)),
+        Some(validity.into()),
+    );
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("features", DataType::FixedSizeList(field, IN as i32), true),
+    ]);
+    RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(Int32Array::from((0..rows.len() as i32).collect::<Vec<_>>())),
+            Arc::new(list),
+        ],
+    )
+    .expect("batch")
+}
+
+/// A NULL element is as missing as a NULL row (#97).
+///
+/// Under a NULL element the values buffer holds whatever the builder left
+/// there — 0.0 from every Arrow builder — and the model used to read it as
+/// data: `[-1.0, NULL, 0.0, 2.0]` scored exactly like `[-1.0, 0.0, 0.0, 2.0]`.
+/// The rows after the NULL ones are checked too, so masking a row cannot
+/// shift where the next one is read from.
+#[tokio::test]
+async fn a_null_element_gives_a_null_output() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (model, path) = model_on_disk(dir.path());
+    let rows = [
+        Some([Some(-1.0), Some(0.0), Some(0.0), Some(2.0)]),
+        Some([Some(-1.0), None, Some(0.0), Some(2.0)]),
+        None,
+        Some([None, None, None, None]),
+        Some([Some(-1.0), Some(3.0), Some(0.0), Some(2.0)]),
+    ];
+    let ctx = SessionContext::new();
+    ctx.register_udf(predict_udf());
+    ctx.register_batch("t", batch_with_elements(&rows))
+        .expect("register");
+    let out = ctx
+        .sql(&format!(
+            "SELECT predict('{path}', features) AS y FROM t ORDER BY id"
+        ))
+        .await
+        .expect("plan")
+        .collect()
+        .await
+        .expect("execute");
+    let y = outputs(&out, 0);
+    assert_eq!(y.len(), rows.len());
+
+    for (row, input) in rows.iter().enumerate() {
+        let complete = input.and_then(|elements| {
+            let mut values = [0.0; IN];
+            for (value, element) in values.iter_mut().zip(elements) {
+                *value = element?;
+            }
+            Some(values)
+        });
+        let Some(values) = complete else {
+            assert!(
+                y.is_null(row),
+                "row {row} ({input:?}) has a NULL in it, so its output is NULL, got {:?}",
+                row_values(&y, row)
+            );
+            continue;
+        };
+        assert!(!y.is_null(row), "row {row} is complete and must score");
+        let want = reference(&model, &values, "relu");
+        let got = row_values(&y, row);
+        for (i, expected) in want.iter().enumerate() {
+            assert!(
+                (got[i] - expected).abs() < 1e-5,
+                "row {row}, output {i}: SQL gave {} and the model gives {expected}",
+                got[i]
+            );
+        }
+    }
+}

@@ -109,8 +109,10 @@ A file that declares nothing is **refused**, because the alternative is
 scoring it with an activation it was not trained with and returning a
 confident wrong number; the third argument `predict(path, features, 'relu')`
 is how you say it yourself, and it must agree with the file when the file has
-an opinion. The CPU-only execution, and why this is a UDF rather than an
-operator, are recorded in
+an opinion. A NULL feature vector scores NULL, and so does one with a NULL
+element: no number is made up to stand in for the missing value. The
+CPU-only execution, and why this is a UDF rather than an operator, are
+recorded in
 [ADR-0015](docs/decisions/ADR-0015-in-database-inference-at-the-udf-layer.md).
 
 `--target cpu|cuda|metal` picks the *placement* target; execution always uses the hardware that is present (operators planned for an absent GPU take the per-batch CPU path — exactly what cluster executors do with a scheduler's plan).

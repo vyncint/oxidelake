@@ -49,6 +49,14 @@
 //! returned the answer of a linear one. See the module tests for what is
 //! pinned.
 //!
+//! ## NULLs
+//!
+//! A NULL feature vector gives a NULL output, and so does a vector with a
+//! NULL element (#97). A tensor has no NULL, so the only alternative is a
+//! number standing in for the missing value, and the model would turn that
+//! number into a confident score. A query that means a value fills the
+//! element in before calling `predict`.
+//!
 //! ## Cost model
 //!
 //! Models are loaded once per path and cached for the life of the process
@@ -553,7 +561,7 @@ impl ScalarUDFImpl for PredictUdf {
         let activation = activation.as_deref().map(Activation::parse).transpose()?;
         let model = model(&path, ModelSpec::SequentialMlp { activation })?;
         let list = feature_list(features)?;
-        let (values, dim) = feature_values(&list)?;
+        let (elements, dim) = feature_values(&list)?;
         if dim != model.in_features {
             return Err(exec(format!(
                 "{PREDICT}: {path} expects {} features but the column has {dim}",
@@ -565,15 +573,24 @@ impl ScalarUDFImpl for PredictUdf {
         // fed zeros and masked afterwards: the shapes stay rectangular, which
         // is what makes the batched path worth having, and no null ever
         // reaches the model as a number a user could mistake for data.
+        //
+        // That includes a NULL *element* of a vector that is itself not NULL
+        // (#97). The row's validity said nothing about it, so the model read
+        // whatever the values buffer held under it — 0.0 from every Arrow
+        // builder — and `[1.0, NULL]` scored exactly like `[1.0, 0.0]`.
         let rows = args.number_rows;
+        let values = elements.values();
+        let element_nulls = elements.nulls().filter(|nulls| nulls.null_count() > 0);
         let mut flat = vec![0.0f32; rows * dim];
         let mut null = vec![false; rows];
         for row in 0..rows {
-            if list.is_null(row) {
+            let start = usize::try_from(list.value_offset(row)).unwrap_or(0);
+            if list.is_null(row)
+                || element_nulls.is_some_and(|nulls| nulls.slice(start, dim).null_count() > 0)
+            {
                 null[row] = true;
                 continue;
             }
-            let start = usize::try_from(list.value_offset(row)).unwrap_or(0);
             flat[row * dim..(row + 1) * dim].copy_from_slice(&values[start..start + dim]);
         }
 
@@ -660,7 +677,9 @@ fn feature_list(value: &ColumnarValue) -> Result<FixedSizeListArray> {
     }
 }
 
-fn feature_values(list: &FixedSizeListArray) -> Result<(&[f32], usize)> {
+/// The list's elements — the array, not only its values buffer, because the
+/// elements carry their own validity (#97) — and its fixed width.
+fn feature_values(list: &FixedSizeListArray) -> Result<(&Float32Array, usize)> {
     let values = list
         .values()
         .as_any()
@@ -673,7 +692,7 @@ fn feature_values(list: &FixedSizeListArray) -> Result<(&[f32], usize)> {
         })?;
     let dim = usize::try_from(list.value_length())
         .map_err(|_| exec(format!("{PREDICT}: negative list size")))?;
-    Ok((values.values(), dim))
+    Ok((values, dim))
 }
 
 /// The `predict` scalar UDF.
