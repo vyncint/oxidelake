@@ -18,7 +18,7 @@ flowchart BT
   runtime[oxidelake-runtime<br/>OxideSession · scheduler/worker wrappers · oxide CLI] --> planner
   runtime --> storage
   runtime --> tui
-  runtime --> ballista[Apache DataFusion Ballista 54<br/>scheduler · executors · Flight shuffle]
+  runtime --> ballista[Apache DataFusion Ballista 55<br/>scheduler · executors · Flight shuffle]
   api[oxidelake-api<br/>DataFrame · SQL · optional PyO3] --> runtime
   classDef ext fill:#e5e7eb,stroke:#9ca3af,color:#111827;
   class ballista ext

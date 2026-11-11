@@ -4,8 +4,10 @@ use std::fmt;
 use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::Result;
 use datafusion::execution::TaskContext;
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::execution_plan::EmissionType;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -140,6 +142,17 @@ impl ExecutionPlan for GpuFilterExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
+    }
+
+    // Shallow by contract, and there is nothing to visit: this node's
+    // predicate, keys and aggregates are OxideLake's own plan vocabulary
+    // (`oxidelake_core::params`), not DataFusion `PhysicalExpr`s, and they are
+    // evaluated by the operator layer rather than by expression evaluation.
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(

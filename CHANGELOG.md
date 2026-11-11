@@ -8,7 +8,38 @@ versions (0.x) may contain breaking changes; they are always listed under a
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking: the dependency chain moves to Ballista 55, DataFusion 55 and
+  arrow / parquet 59** (#40). DataFusion is this project's public
+  vocabulary (ADR-0009: `OxideFrame::new`, `into_inner`,
+  `oxidelake_api::prelude`), so a consumer passing DataFusion or arrow types
+  to or from OxideLake must move to DataFusion 55 and arrow 59 in the same
+  change that moves to this release, even though no OxideLake signature
+  changed. `object_store` stays on 0.13 and the minimum Rust stays 1.94.1.
+  Resolved: ballista 55.0.0, datafusion and datafusion-proto 55.2.0, arrow,
+  parquet and arrow-flight 59.3.2.
+- `OxidePhysicalCodec` follows DataFusion 55's `PhysicalExtensionCodec`,
+  whose `try_decode` and `try_encode` now take a
+  `PhysicalProtoConverterExtension`; the codec hands it on to Ballista's. A
+  caller that invokes the codec directly passes one, usually
+  `datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {}`.
+- **Cluster workers run with a bounded memory pool** (Ballista 55). An
+  executor now installs a `FairSpillPool` of 70% of the host's or cgroup's
+  detected memory, split across its concurrent tasks, where Ballista 54 left
+  DataFusion's pool unbounded: a DataFusion operator on a worker that used to
+  grow without limit now spills, or fails with a resources-exhausted error.
+  The `Gpu*Exec` operators do not reserve from it.
+
 ### Security
+
+- **thrift is out of the dependency graph** (#4, #54). parquet 59 decodes
+  footers without the `thrift` crate, so the advisory parquet 58 carried in
+  (CVE-2026-43868, GHSA-2f9f-gq7v-9h6m, RUSTSEC-2026-0435, medium:
+  unbounded allocation from a length read off the wire) no longer applies,
+  and its acceptance is gone from `deny.toml`, `SECURITY.md` and
+  `STATUS.md`. `cargo deny --all-features check` passes with no ignore left
+  unmatched.
 
 - **Vulnerable crates in the locked graph updated** (the lockfile is what
   `cargo install --locked` and the release binaries build from): rustls
