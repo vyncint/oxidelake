@@ -8,6 +8,14 @@ versions (0.x) may contain breaking changes; they are always listed under a
 
 ## [Unreleased]
 
+### Added
+
+- **`operator_stats()` on `GpuFilterExec`, `GpuHashJoinExec`,
+  `GpuAggregateExec` and `GpuVectorDistanceExec`** returns the counters
+  that exec instance has reported to its telemetry hub (`None` before it
+  first executes, or without a hub). It is how a reader pairs a plan node
+  with its own counters: the hub's entries carry only a name (#123).
+
 ### Changed
 
 - **Breaking: `query_literal` now returns a result and rejects empty query
@@ -441,6 +449,12 @@ versions (0.x) may contain breaking changes; they are always listed under a
   type they cannot order (a `Map`) is left out instead of failing the
   profile; every numeric type now gets P25/P50/P99 too, not only `Int64`
   and `Float64` (#121).
+- **The Inspector shows each operator its own counters.** `oxide tui
+  --query` merged the hub's counters by operator name, so two operators of
+  one name — a self-join's two filters — each showed the sum of both: a
+  filter emitting 129 rows and one emitting 1451 both read `6000 in / 1580
+  out`. Each plan node's counters are now read from the node itself
+  (#123).
 
 ### Security
 

@@ -1,11 +1,10 @@
 //! Building a [`DashboardModel`] from a live embedded session: the executed
-//! plan as a DAG with placement tags, per-operator counters aggregated from
-//! the session's [`TelemetryHub`](oxidelake_core::telemetry::TelemetryHub), and
-//! per-column profiles of the registered
-//! tables. This is what `oxide tui --query …` renders; without a query the CLI
-//! falls back to the synthetic demo fixture.
+//! plan as a DAG with placement tags, each operator's own counters as it
+//! reported them to the session's
+//! [`TelemetryHub`](oxidelake_core::telemetry::TelemetryHub), and per-column
+//! profiles of the registered tables. This is what `oxide tui --query …`
+//! renders; without a query the CLI falls back to the synthetic demo fixture.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{RecordBatch, new_empty_array};
@@ -22,35 +21,65 @@ use oxidelake_tui::{ColumnProfile, DashboardModel};
 
 use crate::session::OxideSession;
 
-/// The backend a physical node was planned for: the tag on our `Gpu*Exec`
-/// nodes, CPU for every stock DataFusion node.
-fn node_backend(node: &dyn ExecutionPlan) -> BackendKind {
+/// The backend a physical node was planned for, and the counters it
+/// reported: the tag and the hub entry of our `Gpu*Exec` nodes, CPU and
+/// nothing for every stock DataFusion node, which does not report.
+fn node_placement(node: &dyn ExecutionPlan) -> (BackendKind, Option<OperatorSnapshot>) {
     if let Some(exec) = node.downcast_ref::<GpuFilterExec>() {
-        exec.target()
+        (exec.target(), exec.operator_stats())
     } else if let Some(exec) = node.downcast_ref::<GpuHashJoinExec>() {
-        exec.target()
+        (exec.target(), exec.operator_stats())
     } else if let Some(exec) = node.downcast_ref::<GpuAggregateExec>() {
-        exec.target()
+        (exec.target(), exec.operator_stats())
     } else if let Some(exec) = node.downcast_ref::<GpuVectorDistanceExec>() {
-        exec.target()
+        (exec.target(), exec.operator_stats())
     } else {
-        BackendKind::CpuSimd
+        (BackendKind::CpuSimd, None)
     }
 }
 
-/// The physical plan as the dashboard's DAG rows (pre-order, with depths).
-pub fn plan_summary(plan: &Arc<dyn ExecutionPlan>) -> Vec<PlanNodeSummary> {
-    fn walk(node: &Arc<dyn ExecutionPlan>, depth: usize, out: &mut Vec<PlanNodeSummary>) {
+/// One dashboard row per plan node, pre-order, beside that node's counters
+/// (the Inspector pairs plan row *i* with operator *i*).
+///
+/// The counters are read from the node itself. The hub registers one entry
+/// per exec instance, but an entry carries only a name, and they used to be
+/// merged by it — so every operator showed the sum of all the operators that
+/// shared its name, a self-join's two filters each reporting both (#123).
+fn plan_rows(plan: &Arc<dyn ExecutionPlan>) -> Vec<(PlanNodeSummary, OperatorSnapshot)> {
+    fn walk(
+        node: &Arc<dyn ExecutionPlan>,
+        depth: usize,
+        out: &mut Vec<(PlanNodeSummary, OperatorSnapshot)>,
+    ) {
         let line = displayable(node.as_ref()).one_line().to_string();
         let detail = line
             .split_once(": ")
             .map_or(String::new(), |(_, rest)| rest.trim().to_owned());
-        out.push(PlanNodeSummary {
-            depth,
-            name: node.name().to_owned(),
-            backend: node_backend(node.as_ref()),
-            detail,
+        let name = node.name().to_owned();
+        let (backend, recorded) = node_placement(node.as_ref());
+        let mut counters = recorded.unwrap_or_else(|| OperatorSnapshot {
+            id: 0,
+            name: name.clone(),
+            backend,
+            rows_in: 0,
+            rows_out: 0,
+            batches: 0,
+            elapsed_ns: 0,
+            bytes_h2d: 0,
+            bytes_d2h: 0,
+            memory_bytes: 0,
+            fallback_batches: 0,
         });
+        counters.id = out.len();
+        out.push((
+            PlanNodeSummary {
+                depth,
+                name,
+                backend,
+                detail,
+            },
+            counters,
+        ));
         for child in node.children() {
             walk(child, depth + 1, out);
         }
@@ -60,65 +89,9 @@ pub fn plan_summary(plan: &Arc<dyn ExecutionPlan>) -> Vec<PlanNodeSummary> {
     out
 }
 
-/// Aggregates the hub's per-partition operator counters by operator name and
-/// aligns them with `plan` (the Inspector panel pairs plan row *i* with
-/// operator *i*). Stock DataFusion nodes do not report into the hub and show
-/// zeros.
-fn operators_for_plan(
-    plan: &[PlanNodeSummary],
-    recorded: &[OperatorSnapshot],
-) -> Vec<OperatorSnapshot> {
-    let mut by_name: HashMap<&str, OperatorSnapshot> = HashMap::new();
-    for op in recorded {
-        let entry = by_name
-            .entry(op.name.as_str())
-            .or_insert_with(|| OperatorSnapshot {
-                id: 0,
-                name: op.name.clone(),
-                backend: op.backend,
-                rows_in: 0,
-                rows_out: 0,
-                batches: 0,
-                elapsed_ns: 0,
-                bytes_h2d: 0,
-                bytes_d2h: 0,
-                memory_bytes: 0,
-                fallback_batches: 0,
-            });
-        entry.rows_in += op.rows_in;
-        entry.rows_out += op.rows_out;
-        entry.batches += op.batches;
-        entry.elapsed_ns += op.elapsed_ns;
-        entry.bytes_h2d += op.bytes_h2d;
-        entry.bytes_d2h += op.bytes_d2h;
-        entry.memory_bytes = entry.memory_bytes.max(op.memory_bytes);
-        entry.fallback_batches += op.fallback_batches;
-    }
-    plan.iter()
-        .enumerate()
-        .map(|(id, node)| {
-            let mut op =
-                by_name
-                    .get(node.name.as_str())
-                    .cloned()
-                    .unwrap_or_else(|| OperatorSnapshot {
-                        id: 0,
-                        name: node.name.clone(),
-                        backend: node.backend,
-                        rows_in: 0,
-                        rows_out: 0,
-                        batches: 0,
-                        elapsed_ns: 0,
-                        bytes_h2d: 0,
-                        bytes_d2h: 0,
-                        memory_bytes: 0,
-                        fallback_batches: 0,
-                    });
-            op.id = id;
-            op.backend = node.backend;
-            op
-        })
-        .collect()
+/// The physical plan as the dashboard's DAG rows (pre-order, with depths).
+pub fn plan_summary(plan: &Arc<dyn ExecutionPlan>) -> Vec<PlanNodeSummary> {
+    plan_rows(plan).into_iter().map(|(node, _)| node).collect()
 }
 
 fn render_cell(batch: &RecordBatch, column: usize) -> String {
@@ -238,8 +211,8 @@ pub async fn profile_table(
 }
 
 /// Runs `sql` on `session` to completion and returns the dashboard model for
-/// it: the executed plan with placement tags, the aggregated telemetry the
-/// run produced, and column profiles for `tables`.
+/// it: the executed plan with placement tags, each operator's counters from
+/// the run, and column profiles for `tables`.
 pub async fn query_dashboard(
     session: &OxideSession,
     sql: &str,
@@ -254,10 +227,10 @@ pub async fn query_dashboard(
     collect(Arc::clone(&plan), session.ctx().task_ctx())
         .await
         .map_err(EngineError::from)?;
-    let nodes = plan_summary(&plan);
+    let (nodes, operators): (Vec<_>, Vec<_>) = plan_rows(&plan).into_iter().unzip();
     session.telemetry().set_plan(nodes.clone());
     let mut telemetry = session.telemetry().snapshot();
-    telemetry.operators = operators_for_plan(&nodes, &telemetry.operators);
+    telemetry.operators = operators;
     telemetry.plan = nodes;
     let mut profiles = Vec::new();
     for table in tables {
@@ -499,5 +472,93 @@ mod tests {
             let numeric = ["i32", "u32", "f32", "dec"].contains(&p.name.as_str());
             assert_eq!(!p.p50.is_empty(), numeric, "quantiles iff numeric: {p:?}");
         }
+    }
+
+    /// Two operators of one name are two operators (#123). The Inspector used
+    /// to merge the hub's counters by name and show every `GpuFilterExec` the
+    /// sum of both: here, both filters as reading the table twice and
+    /// emitting both filters' rows.
+    #[tokio::test]
+    async fn two_operators_with_one_name_keep_their_own_counters() {
+        let dir = tempfile::tempdir().unwrap();
+        oxidelake_storage::write_demo_table(
+            dir.path(),
+            3000,
+            7,
+            &oxidelake_storage::demo_write_options(1024, oxidelake_storage::Compression::None),
+        )
+        .unwrap();
+        let path = dir.path().to_str().unwrap();
+        let count = |sql: &'static str| async move {
+            let truth = OxideSession::local_with_target(BackendKind::CpuSimd).unwrap();
+            truth.register_parquet("t", path).await.unwrap();
+            let batches = truth.sql(sql).await.unwrap().collect().await.unwrap();
+            render_cell(&batches[0], 0).parse::<u64>().unwrap()
+        };
+        let (low, high, rows) = (
+            count("SELECT count(*) FROM t WHERE k < 4").await,
+            count("SELECT count(*) FROM t WHERE k >= 50").await,
+            count("SELECT count(*) FROM t").await,
+        );
+        assert_ne!(
+            low, high,
+            "the two filters must be told apart by their counts"
+        );
+
+        let session = OxideSession::local_with_target(BackendKind::Cuda).unwrap();
+        session.register_parquet("t", path).await.unwrap();
+        let model = query_dashboard(
+            &session,
+            "SELECT a.id, b.v FROM (SELECT id, k FROM t WHERE k < 4) a \
+             JOIN (SELECT k, v FROM t WHERE k >= 50) b ON a.id = b.k",
+            &[],
+        )
+        .await
+        .unwrap();
+        let filter = |predicate: &str| {
+            let row = model
+                .plan()
+                .iter()
+                .position(|n| n.name == "GpuFilterExec" && n.detail.contains(predicate))
+                .unwrap_or_else(|| panic!("no GpuFilterExec on `{predicate}`: {:?}", model.plan()));
+            model.operator(row).unwrap().clone()
+        };
+        let (lt, ge) = (filter("< 4"), filter(">= 50"));
+        assert_eq!((lt.rows_in, lt.rows_out), (rows, low), "k < 4: {lt:?}");
+        assert_eq!((ge.rows_in, ge.rows_out), (rows, high), "k >= 50: {ge:?}");
+        assert!(lt.batches > 0 && ge.batches > 0);
+
+        // Every exec type is read the same way: the join above, and a vector
+        // distance in a second query whose operators are new hub entries. The
+        // projection keeps `emb`: the lowering only takes the shape that
+        // appends the distance to its input (planner tests, placement.rs).
+        let joined = count(
+            "SELECT count(*) FROM (SELECT id, k FROM t WHERE k < 4) a \
+             JOIN (SELECT k, v FROM t WHERE k >= 50) b ON a.id = b.k",
+        )
+        .await;
+        let operator = |model: &DashboardModel, name: &str| {
+            let row = model
+                .plan()
+                .iter()
+                .position(|n| n.name == name)
+                .unwrap_or_else(|| panic!("no {name}: {:?}", model.plan()));
+            model.operator(row).unwrap().clone()
+        };
+        let join = operator(&model, "GpuHashJoinExec");
+        assert_eq!(join.rows_out, joined, "{join:?}");
+        let model = query_dashboard(
+            &session,
+            "SELECT id, emb, l2_distance(emb, [1.0, 0.0, -1.0, 2.0, 0.5, 0.0, 1.5, -0.5]) AS d FROM t",
+            &[],
+        )
+        .await
+        .unwrap();
+        let distance = operator(&model, "GpuVectorDistanceExec");
+        assert_eq!(
+            (distance.rows_in, distance.rows_out),
+            (rows, rows),
+            "{distance:?}"
+        );
     }
 }
