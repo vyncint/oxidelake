@@ -7,7 +7,7 @@ use datafusion::arrow::datatypes::{DataType, Schema};
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{JoinType, NullEquality, ScalarValue};
-use datafusion::error::Result;
+use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::Operator;
 use datafusion::physical_expr::expressions::{BinaryExpr, Column, Literal};
 use datafusion::physical_expr::{PhysicalExpr, ScalarFunctionExpr};
@@ -147,7 +147,17 @@ impl HardwarePlacementRule {
             Some(p) => p.iter().copied().collect(),
             None => (0..schema.fields().len()).collect(),
         };
-        let exec = GpuFilterExec::try_new(Arc::clone(input), predicate, projection, self.target)?;
+        // The constructor's checks exist for plans decoded off the network
+        // (the predicate's leaf cap is audit S5's); at planning time a node
+        // they refuse stays on the CPU rather than failing the query (#133).
+        let exec =
+            match GpuFilterExec::try_new(Arc::clone(input), predicate, projection, self.target) {
+                Ok(exec) => exec,
+                Err(err) => {
+                    self.skip("FilterExec", refusal(&err));
+                    return Ok(None);
+                }
+            };
         if exec.schema() != filter.schema() {
             self.skip("FilterExec", "the fused schema differs from the original");
             return Ok(None);
@@ -446,6 +456,15 @@ fn keep_fetch(fetch: Option<usize>, lowered: Arc<dyn ExecutionPlan>) -> Arc<dyn 
             Arc::new(LocalLimitExec::new(lowered, fetch))
         }
         _ => lowered,
+    }
+}
+
+/// A constructor's refusal as a placement note: its own words, without
+/// DataFusion's `Error during planning: ` prefix.
+fn refusal(err: &DataFusionError) -> String {
+    match err {
+        DataFusionError::Plan(reason) => reason.clone(),
+        other => other.to_string(),
     }
 }
 

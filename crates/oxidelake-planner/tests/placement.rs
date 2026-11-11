@@ -132,11 +132,26 @@ fn batches_d() -> Vec<Vec<RecordBatch>> {
     ]]
 }
 
+/// `c0..c64 Int64`: 65 columns, one more than the device filter takes
+/// comparisons (`MAX_PREDICATE_LEAVES`); row `i` holds `i + j` in `cj`.
+fn batches_w() -> Vec<Vec<RecordBatch>> {
+    let width: i64 = 65;
+    let schema = Arc::new(Schema::new(
+        (0..width)
+            .map(|j| Field::new(format!("c{j}"), DataType::Int64, false))
+            .collect::<Vec<_>>(),
+    ));
+    let columns: Vec<Arc<dyn Array>> = (0..width)
+        .map(|j| Arc::new(Int64Array::from_iter_values((0..10).map(|i| i + j))) as _)
+        .collect();
+    vec![vec![RecordBatch::try_new(schema, columns).unwrap()]]
+}
+
 fn register(ctx: &SessionContext) {
     for udf in oxidelake_compute::oxide_udfs() {
         ctx.register_udf(udf.as_ref().clone());
     }
-    for (name, batches) in [("n", batches_n()), ("d", batches_d())] {
+    for (name, batches) in [("n", batches_n()), ("d", batches_d()), ("w", batches_w())] {
         ctx.register_table(
             name,
             Arc::new(MemTable::try_new(batches[0][0].schema(), batches).unwrap()),
@@ -385,6 +400,38 @@ fn parent_of(plan: &Arc<dyn ExecutionPlan>, name: &str) -> Option<Arc<dyn Execut
             parent_of(child, name)
         }
     })
+}
+
+/// The device filter takes at most `MAX_PREDICATE_LEAVES` (64) comparisons,
+/// a cap that guards plans decoded off the network. A longer WHERE used to
+/// fail the whole query on a GPU target; it stays on the CPU with a note now
+/// (#133), and 64 comparisons still lower.
+#[tokio::test]
+async fn a_predicate_over_the_device_cap_stays_on_the_cpu_with_a_note() {
+    let query = |comparisons: i64| {
+        let predicate = (0..comparisons)
+            .map(|j| format!("c{j} >= {}", j + 3))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        format!("SELECT c0, c64 FROM w WHERE {predicate}")
+    };
+    let over = query(65);
+    let plan = assert_same_results(&over, BackendKind::Cuda, None).await;
+    let rows: usize = collect(plan, plain_ctx().task_ctx())
+        .await
+        .unwrap()
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum();
+    assert_eq!(rows, 7, "the comparison must not be vacuous");
+    assert_eq!(
+        placement_notes(&over).await,
+        vec![
+            "FilterExec: GpuFilterExec predicate has 65 comparisons; at most 64 are supported"
+                .to_owned()
+        ]
+    );
+    assert_same_results(&query(64), BackendKind::Cuda, Some("GpuFilterExec[cuda]")).await;
 }
 
 #[tokio::test]

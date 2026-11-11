@@ -47,6 +47,15 @@ versions (0.x) may contain breaking changes; they are always listed under a
   lowered node now keeps the limit as a `LocalLimitExec` directly above it,
   which `oxide explain` shows.
 
+- **A WHERE with more than 64 comparisons runs on the CPU instead of
+  failing** (#133). The device filter takes at most 64 comparison leaves
+  (`MAX_PREDICATE_LEAVES`, a cap that guards plans decoded off the
+  network), and the placement rule turned that refusal into a planning
+  error, so such a query failed on `--target cuda|metal` and on a GPU
+  cluster. The filter now stays on the CPU, and `oxide explain` prints
+  `FilterExec: GpuFilterExec predicate has 65 comparisons; at most 64 are
+  supported` under the plan. Decoded plans are still refused.
+
 ### Security
 
 - **thrift is out of the dependency graph** (#4, #54). parquet 59 decodes

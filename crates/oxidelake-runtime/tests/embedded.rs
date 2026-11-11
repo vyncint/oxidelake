@@ -76,6 +76,70 @@ async fn a_limit_returns_its_row_count_on_every_target() {
     }
 }
 
+/// A WHERE with more comparisons than the device filter takes (64) returns
+/// the CPU answer on every target, and `explain` says why the filter stayed
+/// on the CPU (#133); it used to fail the query on a GPU target.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_predicate_over_the_device_cap_returns_the_cpu_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("w.parquet");
+    let columns = (0..65)
+        .map(|j| format!("CAST(value + {j} AS BIGINT) AS c{j}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    OxideSession::local_with_target(BackendKind::CpuSimd)
+        .unwrap()
+        .sql(&format!(
+            "COPY (SELECT {columns} FROM generate_series(0, 999)) TO '{}' STORED AS PARQUET",
+            path.display()
+        ))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let query = |comparisons: usize| {
+        let predicate = (0..comparisons)
+            .map(|j| format!("c{j} >= {}", j + 3))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        format!("SELECT count(c0), min(c0) FROM w WHERE {predicate}")
+    };
+
+    for target in [BackendKind::CpuSimd, BackendKind::Cuda, BackendKind::Metal] {
+        let session = OxideSession::local_with_target(target).unwrap();
+        session
+            .register_parquet("w", path.to_str().unwrap())
+            .await
+            .unwrap();
+        let rows = sorted_rows(
+            &session
+                .sql(&query(65))
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap(),
+        );
+        assert_eq!(rows, vec!["997|3".to_owned()], "{target}");
+        if target.is_gpu() {
+            let plan = session.explain(&query(65)).await.unwrap();
+            assert!(
+                plan.contains(
+                    "  FilterExec: GpuFilterExec predicate has 65 comparisons; at most 64 \
+                     are supported\n"
+                ),
+                "{target}:\n{plan}"
+            );
+            let plan = session.explain(&query(64)).await.unwrap();
+            assert!(
+                plan.contains("GpuFilterExec"),
+                "{target}: 64 still lower:\n{plan}"
+            );
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gpu_targets_return_cpu_results() {
     let dir = tempfile::tempdir().unwrap();
