@@ -164,6 +164,23 @@ versions (0.x) may contain breaking changes; they are always listed under a
   handle the `None`; a layout built through `BufferLayout::new` always has
   `Some`, since `new` now refuses those lengths up front.
 
+### Fixed
+
+- **A machine with the NVIDIA driver but no NVRTC runs on the CPU instead
+  of panicking** (#106). Detection probed only `libcuda`, so a driver-only
+  host — or a container that has `libcuda` injected by the NVIDIA container
+  toolkit and nothing else — selected CUDA, and the first query's kernel
+  compile panicked inside cudarc (`Unable to dynamically load the "nvrtc"
+  shared library`) with no CPU fallback. NVRTC is now probed before CUDA
+  counts as available: auto-detection selects the next backend and, when a
+  driver is installed, logs why at `warn`; `OXIDE_BACKEND=cuda` and
+  `oxide-worker --backend cuda` fail at startup with an error naming
+  `libnvrtc`, and every `cuda` request that fails now says which piece is
+  missing rather than "no device or driver". To use the GPU there, install
+  the toolkit's NVRTC (the `cuda-nvrtc` package) or put its directory on
+  `LD_LIBRARY_PATH`. New: `CudaBackend::nvrtc_present` and
+  `CudaBackend::probe`.
+
 ### Security
 
 - **thrift is out of the dependency graph** (#4, #54). parquet 59 decodes

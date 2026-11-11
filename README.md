@@ -158,6 +158,11 @@ cargo test -p oxidelake-compute --features metal -- --ignored
 OXIDE_BACKEND=cuda cargo test -p oxidelake-compute --features cuda -- --ignored
 ```
 
+Running the CUDA backend needs the NVIDIA driver **and** NVRTC, which ships
+with the CUDA toolkit rather than the driver (the `cuda-nvrtc` package). A
+machine with the driver alone is detected as a CPU machine — `RUST_LOG=warn`
+says why — and `OXIDE_BACKEND=cuda` there fails at startup naming `libnvrtc`.
+
 ## Configuration
 
 Every knob OxideLake reads, in one table. Flags win over environment

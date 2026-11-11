@@ -42,7 +42,7 @@ impl HardwareDetector {
     /// Probes without instantiating anything. Never panics, even without drivers.
     pub fn availability() -> Availability {
         Availability {
-            cuda: cuda_available(),
+            cuda: cuda_probe().is_ok(),
             metal: metal_available(),
         }
     }
@@ -59,24 +59,44 @@ impl HardwareDetector {
 
     /// Selects a backend, honouring an explicit override value (the contents of
     /// [`BACKEND_ENV`]). Empty or missing means "best available".
+    ///
+    /// When CUDA is passed over although an NVIDIA driver is installed, the
+    /// reason (no NVRTC, no device, …) is logged at `warn`: whoever installed
+    /// the driver probably expected the GPU. An explicit `cuda` request fails
+    /// with that same reason instead.
     pub fn select_with(requested: Option<&str>) -> Result<Arc<dyn GpuBackend>, EngineError> {
-        let availability = Self::availability();
+        let cuda = cuda_probe();
+        let availability = Availability {
+            cuda: cuda.is_ok(),
+            metal: metal_available(),
+        };
         let kind = match requested.map(str::trim).filter(|s| !s.is_empty()) {
             Some(name) => name.parse::<BackendKind>()?,
-            None => availability.best(),
+            None => {
+                let best = availability.best();
+                if let Err(why) = &cuda {
+                    passed_over_cuda(why, best);
+                }
+                best
+            }
         };
-        Self::instantiate(kind, availability)
+        Self::instantiate(kind, availability, cuda.err())
     }
 
     fn instantiate(
         kind: BackendKind,
         availability: Availability,
+        cuda_unavailable: Option<EngineError>,
     ) -> Result<Arc<dyn GpuBackend>, EngineError> {
         match kind {
             BackendKind::CpuSimd => Ok(Arc::new(CpuBackend::new())),
             BackendKind::Cuda => {
                 if !availability.cuda {
-                    return Err(unavailable(kind, cfg!(feature = "cuda")));
+                    return Err(unavailable(
+                        kind,
+                        cfg!(feature = "cuda"),
+                        cuda_unavailable.as_ref(),
+                    ));
                 }
                 instantiate_cuda()
             }
@@ -85,6 +105,7 @@ impl HardwareDetector {
                     return Err(unavailable(
                         kind,
                         cfg!(all(feature = "metal", target_os = "macos")),
+                        None,
                     ));
                 }
                 instantiate_metal()
@@ -106,24 +127,55 @@ impl HardwareDetector {
 
 /// The request can arrive through [`BACKEND_ENV`] or through a command-line
 /// flag that mirrors it (`oxide-worker --backend`), so the message names the
-/// backend and the reason rather than one of the two ways of asking.
-fn unavailable(kind: BackendKind, compiled_in: bool) -> EngineError {
-    let detail = if compiled_in {
-        format!("explicitly requested but no {kind} device or driver is present on this machine")
-    } else {
-        format!("explicitly requested but OxideLake was built without the `{kind}` feature")
+/// backend and the reason rather than one of the two ways of asking. `why`
+/// is the probe's own account when there is one ("libnvrtc could not be
+/// loaded: …"), which says more than "no device or driver".
+fn unavailable(kind: BackendKind, compiled_in: bool, why: Option<&EngineError>) -> EngineError {
+    let detail = match why {
+        _ if !compiled_in => {
+            format!("explicitly requested but OxideLake was built without the `{kind}` feature")
+        }
+        Some(EngineError::Device { detail, .. }) => format!("explicitly requested but {detail}"),
+        Some(other) => format!("explicitly requested but {other}"),
+        None => format!(
+            "explicitly requested but no {kind} device or driver is present on this machine"
+        ),
     };
     EngineError::device(kind, detail)
 }
 
+/// Passing CUDA over is only news when a driver is installed: then someone
+/// probably expected the GPU, and why it was not used — no NVRTC on a
+/// driver-only host (#106), no device — is what they need to read. Without a
+/// driver it is an ordinary CPU machine.
 #[cfg(feature = "cuda")]
-fn cuda_available() -> bool {
-    crate::cuda::CudaBackend::is_available()
+fn passed_over_cuda(why: &EngineError, selected: BackendKind) {
+    if crate::cuda::CudaBackend::driver_present() {
+        tracing::warn!(
+            reason = %why,
+            selected = %selected,
+            "an NVIDIA driver is installed but CUDA cannot run on this machine; \
+             selecting the next backend"
+        );
+    } else {
+        tracing::debug!(reason = %why, selected = %selected, "CUDA not detected");
+    }
 }
 
 #[cfg(not(feature = "cuda"))]
-fn cuda_available() -> bool {
-    false
+fn passed_over_cuda(_why: &EngineError, _selected: BackendKind) {}
+
+#[cfg(feature = "cuda")]
+fn cuda_probe() -> Result<(), EngineError> {
+    crate::cuda::CudaBackend::probe(0)
+}
+
+#[cfg(not(feature = "cuda"))]
+fn cuda_probe() -> Result<(), EngineError> {
+    Err(EngineError::device(
+        BackendKind::Cuda,
+        "OxideLake was built without the `cuda` feature",
+    ))
 }
 
 #[cfg(feature = "cuda")]
@@ -133,7 +185,7 @@ fn instantiate_cuda() -> Result<Arc<dyn GpuBackend>, EngineError> {
 
 #[cfg(not(feature = "cuda"))]
 fn instantiate_cuda() -> Result<Arc<dyn GpuBackend>, EngineError> {
-    Err(unavailable(BackendKind::Cuda, false))
+    Err(unavailable(BackendKind::Cuda, false, None))
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -153,7 +205,7 @@ fn instantiate_metal() -> Result<Arc<dyn GpuBackend>, EngineError> {
 
 #[cfg(not(all(feature = "metal", target_os = "macos")))]
 fn instantiate_metal() -> Result<Arc<dyn GpuBackend>, EngineError> {
-    Err(unavailable(BackendKind::Metal, false))
+    Err(unavailable(BackendKind::Metal, false, None))
 }
 
 #[cfg(test)]

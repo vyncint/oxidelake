@@ -3,7 +3,9 @@
 Device code for the `cuda` backend. These are **source files**, not build inputs:
 `oxidelake-device` embeds them with `include_str!` and compiles them at runtime with
 NVRTC on first use (PTX cached per device). There is no `nvcc` step and no CUDA
-toolkit is needed to build OxideLake; a driver is needed only to *run* them.
+toolkit is needed to build OxideLake. To *run* them a machine needs the NVIDIA driver
+and NVRTC (`libnvrtc`, part of the CUDA toolkit rather than the driver); with the
+driver alone, detection picks the CPU and `OXIDE_BACKEND=cuda` fails naming `libnvrtc`.
 
 Conventions (docs/SPEC.md §2.3):
 

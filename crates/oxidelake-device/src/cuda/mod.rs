@@ -3,9 +3,14 @@
 //! Built on cudarc's driver API in **dynamic-loading** mode: `libcuda` and
 //! `libnvrtc` are `dlopen`ed at runtime, so this module compiles on machines
 //! without a CUDA installation. cudarc *panics* if a symbol is requested while
-//! the library is absent, so nothing here touches the driver before
-//! [`CudaBackend::driver_present`] has confirmed it can be loaded; without a
-//! driver every constructor returns a typed error instead.
+//! its library is absent, so nothing here touches the driver before
+//! [`CudaBackend::driver_present`] has confirmed it can be loaded, nor NVRTC
+//! before [`CudaBackend::nvrtc_present`]; without either, every constructor
+//! returns a typed error instead and [`CudaBackend::is_available`] is `false`.
+//! The two are separate on purpose: NVRTC ships with the CUDA toolkit, not
+//! with the driver, so a driver-only host — or a container that has `libcuda`
+//! injected and nothing else — has a working driver and no way to compile a
+//! kernel (#106).
 //!
 //! Kernels are CUDA C sources (`kernels/cuda/*.cu`, embedded with
 //! `include_str!`) compiled with NVRTC on first use and cached per backend
@@ -55,6 +60,12 @@ pub(crate) fn foreign(what: &str, backend: BackendKind) -> EngineError {
 fn to_u64(n: usize) -> u64 {
     u64::try_from(n).unwrap_or(u64::MAX)
 }
+
+const NO_DRIVER: &str = "libcuda could not be loaded: no NVIDIA driver on this machine";
+
+const NO_NVRTC: &str = "libnvrtc could not be loaded: the NVIDIA driver is installed, but the \
+     CUDA kernels are compiled at run time with NVRTC, which ships with the CUDA toolkit rather \
+     than the driver; install it (the cuda-nvrtc package) or put its directory on LD_LIBRARY_PATH";
 
 /// One column resident in device memory: packed values plus optional validity bitmap.
 ///
@@ -124,6 +135,16 @@ impl CudaBackend {
         unsafe { cudarc::driver::sys::is_culib_present() }
     }
 
+    /// `true` when `libnvrtc` can be loaded. Performs no NVRTC call.
+    ///
+    /// The kernels are compiled with NVRTC on first use, so a backend without
+    /// it would fail — inside cudarc, with a panic — on its first query.
+    pub fn nvrtc_present() -> bool {
+        // SAFETY: `is_culib_present` only attempts to `dlopen` the NVRTC
+        // library; it issues no NVRTC calls and has no preconditions.
+        unsafe { cudarc::nvrtc::sys::is_culib_present() }
+    }
+
     /// Number of CUDA devices, or zero when the driver is absent or fails.
     pub fn device_count() -> usize {
         if !Self::driver_present() {
@@ -135,19 +156,47 @@ impl CudaBackend {
             .unwrap_or(0)
     }
 
-    /// `true` when at least one device can be used.
+    /// Checks, without creating a context, that device `ordinal` has what the
+    /// backend needs: a driver, NVRTC and the device itself. The error says
+    /// which is missing; [`Self::new`] runs the same checks first, and the
+    /// detector reports this error when it passes CUDA over.
+    pub fn probe(ordinal: usize) -> Result<(), EngineError> {
+        if !Self::driver_present() {
+            return Err(EngineError::device(BackendKind::Cuda, NO_DRIVER));
+        }
+        // Before any NVRTC symbol is touched: cudarc resolves them lazily and
+        // panics when the library is missing (#106).
+        if !Self::nvrtc_present() {
+            return Err(EngineError::device(BackendKind::Cuda, NO_NVRTC));
+        }
+        let count = CudaContext::device_count().map_err(|e| {
+            EngineError::device(
+                BackendKind::Cuda,
+                format!("the NVIDIA driver could not be initialised: {e}"),
+            )
+        })?;
+        match usize::try_from(count) {
+            Ok(0) | Err(_) => Err(EngineError::device(
+                BackendKind::Cuda,
+                "the NVIDIA driver is installed but reports no CUDA device",
+            )),
+            Ok(n) if ordinal >= n => Err(EngineError::device(
+                BackendKind::Cuda,
+                format!("CUDA device {ordinal} does not exist: the driver reports {n}"),
+            )),
+            Ok(_) => Ok(()),
+        }
+    }
+
+    /// `true` when device 0 can be used: [`Self::probe`] finds everything the
+    /// backend needs, NVRTC included.
     pub fn is_available() -> bool {
-        Self::device_count() > 0
+        Self::probe(0).is_ok()
     }
 
     /// Opens device `ordinal`.
     pub fn new(ordinal: usize) -> Result<Self, EngineError> {
-        if !Self::driver_present() {
-            return Err(EngineError::device(
-                BackendKind::Cuda,
-                "libcuda could not be loaded: no NVIDIA driver on this machine",
-            ));
-        }
+        Self::probe(ordinal)?;
         let ctx = CudaContext::new(ordinal).map_err(driver_error)?;
         let ordinal = u32::try_from(ordinal)
             .map_err(|_| EngineError::device(BackendKind::Cuda, "device ordinal out of range"))?;
