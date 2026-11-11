@@ -2,18 +2,30 @@
 //! storage boundary: corrupt or truncated files are `Format`, IO failures are
 //! `Io`, our own errors come back unchanged.
 
+use std::sync::Arc;
+
 use datafusion::arrow::error::ArrowError;
 use datafusion::error::DataFusionError;
 use oxidelake_core::EngineError;
 
 /// Classifies a DataFusion error raised while reading or planning over files.
+///
+/// DataFusion rarely hands a scan's failure back bare. A repartitioned scan
+/// fans one error out to every consumer as `Shared`, planning wraps errors in
+/// `Diagnostic`, and some paths collect several into a `Collection` whose
+/// first entry is the one DataFusion itself reports. All three are looked
+/// through here, so a corrupt page found mid-scan is a `Format` error like a
+/// corrupt footer found at registration (#118).
 pub fn classify_error(err: DataFusionError) -> EngineError {
     match err {
         DataFusionError::ParquetError(e) => EngineError::format(format!("parquet: {e}")),
         DataFusionError::ArrowError(e, context) => match *e {
             ArrowError::IoError(_, io) => EngineError::Io(io),
             other => {
-                let ctx = context.map(|c| format!(" ({c})")).unwrap_or_default();
+                let ctx = context
+                    .filter(|c| !c.is_empty())
+                    .map(|c| format!(" ({c})"))
+                    .unwrap_or_default();
                 EngineError::format(format!("arrow: {other}{ctx}"))
             }
         },
@@ -25,7 +37,24 @@ pub fn classify_error(err: DataFusionError) -> EngineError {
             )),
             other => EngineError::Io(std::io::Error::other(other.to_string())),
         },
-        DataFusionError::Context(_, inner) => classify_error(*inner),
+        DataFusionError::Context(_, inner) | DataFusionError::Diagnostic(_, inner) => {
+            classify_error(*inner)
+        }
+        DataFusionError::Collection(errors) => {
+            let mut errors = errors.into_iter();
+            match errors.next() {
+                Some(first) => classify_error(first),
+                None => EngineError::DataFusion(DataFusionError::Collection(Vec::new())),
+            }
+        }
+        DataFusionError::Shared(shared) => match Arc::try_unwrap(shared) {
+            Ok(inner) => classify_error(inner),
+            // Still held by another consumer of the same scan: the error
+            // cannot be moved out, so its class is rebuilt from a borrow,
+            // and anything without one stays as DataFusion delivered it.
+            Err(shared) => classify_shared(&shared)
+                .unwrap_or(EngineError::DataFusion(DataFusionError::Shared(shared))),
+        },
         DataFusionError::External(e) => match e.downcast::<EngineError>() {
             Ok(engine) => *engine,
             Err(e) => EngineError::DataFusion(DataFusionError::External(e)),
@@ -34,9 +63,63 @@ pub fn classify_error(err: DataFusionError) -> EngineError {
     }
 }
 
+/// The `Format`/`Io` class of an error that can only be borrowed, rebuilt
+/// with the same message (and the same `io::ErrorKind`). `None` for errors
+/// that have no storage class; those are reported unchanged.
+fn classify_shared(err: &DataFusionError) -> Option<EngineError> {
+    match err {
+        DataFusionError::ParquetError(e) => Some(EngineError::format(format!("parquet: {e}"))),
+        DataFusionError::ArrowError(e, context) => Some(match e.as_ref() {
+            ArrowError::IoError(_, io) => {
+                EngineError::Io(std::io::Error::new(io.kind(), io.to_string()))
+            }
+            other => {
+                let ctx = context
+                    .as_ref()
+                    .filter(|c| !c.is_empty())
+                    .map(|c| format!(" ({c})"))
+                    .unwrap_or_default();
+                EngineError::format(format!("arrow: {other}{ctx}"))
+            }
+        }),
+        DataFusionError::IoError(io) => Some(EngineError::Io(std::io::Error::new(
+            io.kind(),
+            io.to_string(),
+        ))),
+        DataFusionError::ObjectStore(e) => Some(EngineError::Io(match e.as_ref() {
+            object_store::Error::NotFound { path, source } => {
+                std::io::Error::new(std::io::ErrorKind::NotFound, format!("{path}: {source}"))
+            }
+            other => std::io::Error::other(other.to_string()),
+        })),
+        DataFusionError::Context(_, inner) | DataFusionError::Diagnostic(_, inner) => {
+            classify_shared(inner)
+        }
+        DataFusionError::Collection(errors) => errors.first().and_then(classify_shared),
+        DataFusionError::Shared(inner) => classify_shared(inner),
+        DataFusionError::External(e) => match e.downcast_ref::<EngineError>() {
+            Some(EngineError::Format(m)) => Some(EngineError::Format(m.clone())),
+            Some(EngineError::Io(io)) => Some(EngineError::Io(std::io::Error::new(
+                io.kind(),
+                io.to_string(),
+            ))),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use datafusion::common::Diagnostic;
+
     use super::*;
+
+    fn parquet_error() -> DataFusionError {
+        DataFusionError::ParquetError(Box::new(parquet::errors::ParquetError::General(
+            "Unexpected struct field type 15".into(),
+        )))
+    }
 
     #[test]
     fn parquet_and_arrow_parse_errors_are_format_errors() {
@@ -65,5 +148,86 @@ mod tests {
             ))),
         ));
         assert!(matches!(e, EngineError::Format(_)));
+    }
+
+    /// The three wrappers a scan's error arrives in (#118). Before, each fell
+    /// through to `EngineError::DataFusion` however corrupt the file was.
+    #[test]
+    fn wrapped_scan_errors_keep_their_class() {
+        let shared = DataFusionError::Shared(Arc::new(parquet_error()));
+        let e = classify_error(shared);
+        assert!(
+            matches!(&e, EngineError::Format(m) if m.contains("struct field type 15")),
+            "{e:?}"
+        );
+
+        let diagnostic = DataFusionError::Diagnostic(
+            Box::new(Diagnostic::new_error("while scanning t", None)),
+            Box::new(parquet_error()),
+        );
+        assert!(matches!(classify_error(diagnostic), EngineError::Format(_)));
+
+        let collection = DataFusionError::Collection(vec![
+            DataFusionError::IoError(std::io::Error::other("disk")),
+            parquet_error(),
+        ]);
+        assert!(
+            matches!(classify_error(collection), EngineError::Io(_)),
+            "the first error of a collection is the one DataFusion reports"
+        );
+
+        // Nested: a shared error inside a context inside a diagnostic.
+        let nested = DataFusionError::Diagnostic(
+            Box::new(Diagnostic::new_error("d", None)),
+            Box::new(DataFusionError::Context(
+                "c".into(),
+                Box::new(DataFusionError::Shared(Arc::new(parquet_error()))),
+            )),
+        );
+        assert!(matches!(classify_error(nested), EngineError::Format(_)));
+    }
+
+    /// A repartitioned scan hands the *same* `Arc` to every consumer, so the
+    /// one being classified usually cannot be unwrapped. Its class is still
+    /// found, with the original message and IO error kind.
+    #[test]
+    fn a_shared_error_still_held_elsewhere_keeps_its_class() {
+        let inner = Arc::new(parquet_error());
+        let _other_consumer = Arc::clone(&inner);
+        let e = classify_error(DataFusionError::Shared(inner));
+        assert!(
+            matches!(&e, EngineError::Format(m) if m.contains("struct field type 15")),
+            "{e:?}"
+        );
+
+        let io = Arc::new(DataFusionError::IoError(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "spill dir",
+        )));
+        let _other_consumer = Arc::clone(&io);
+        match classify_error(DataFusionError::Shared(io)) {
+            EngineError::Io(e) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+                assert!(e.to_string().contains("spill dir"));
+            }
+            other => panic!("expected Io, got {other:?}"),
+        }
+
+        let own = Arc::new(DataFusionError::External(Box::new(EngineError::format(
+            "bad block",
+        ))));
+        let _other_consumer = Arc::clone(&own);
+        assert!(matches!(
+            classify_error(DataFusionError::Shared(own)),
+            EngineError::Format(m) if m == "bad block"
+        ));
+
+        // No storage class: delivered unchanged rather than guessed at.
+        let plan = Arc::new(DataFusionError::Plan("no such column".into()));
+        let _other_consumer = Arc::clone(&plan);
+        assert!(matches!(
+            classify_error(DataFusionError::Shared(plan)),
+            EngineError::DataFusion(DataFusionError::Shared(_))
+        ));
     }
 }

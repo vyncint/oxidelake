@@ -308,6 +308,16 @@ versions (0.x) may contain breaking changes; they are always listed under a
   the second run of a query logged twice the first's numbers; it now counts
   that query's operators only.
 
+### Fixed
+
+- **A corrupt page found mid-scan is `EngineError::Format`, as
+  documented.** `classify_error` now looks inside the `Shared`,
+  `Diagnostic` and `Collection` wrappers DataFusion puts around a scan's
+  errors. A corrupt page in a repartitioned scan used to come back as
+  `EngineError::DataFusion(..)` while the same damage in a footer was
+  `Format`; code that matched on `EngineError::DataFusion` for such errors
+  now gets `Format` or `Io` (#118).
+
 ### Security
 
 - **thrift is out of the dependency graph** (#4, #54). parquet 59 decodes
