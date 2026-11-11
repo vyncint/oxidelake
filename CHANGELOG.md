@@ -217,6 +217,20 @@ versions (0.x) may contain breaking changes; they are always listed under a
   answer on an overflow fixture. Nothing to change on your side: the error
   was never DataFusion's behaviour, and no other target raised it.
 
+- **`MIN`/`MAX` over `Float64` follow IEEE 754 totalOrder under a GPU
+  target** (#101), the order Arrow's comparison and sort kernels — and so
+  the CPU filter path — already use: `NaN` is the greatest value, a `NaN`
+  with the sign bit set (which `0.0 / 0.0` produces on x86) the least, and
+  `-0.0` sorts below `0.0`. The CPU reference used IEEE minNum/maxNum, which
+  skip `NaN`: an all-`NaN` group reported `MIN = inf`, `MAX = -inf`, values
+  that are not in the data, and the sign of a zero result was unspecified.
+  The CUDA kernel now reduces the same order on integer keys. **Visible
+  change:** for a group containing `NaN` or a signed zero, a GPU target's
+  answer can differ from `--target cpu`, because stock DataFusion's grouped
+  float `MIN`/`MAX` depends on row order (`MIN` of {1.0, NaN, 3.0} is 3.0
+  there) and lets its starting values through (`MAX` of {-inf} is
+  `f64::MIN`); the GPU target's answer is the order-independent one.
+
 ### Security
 
 - **thrift is out of the dependency graph** (#4, #54). parquet 59 decodes

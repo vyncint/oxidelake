@@ -31,6 +31,7 @@ use crate::args::{
     VectorDistanceArgs,
 };
 use crate::columns;
+use crate::cpu::kernels::from_total_order_key;
 use crate::handles::{
     BatchInner, DeviceBatch, DeviceJoinMatches, DeviceJoinTable, JoinMatchesInner, JoinTableInner,
 };
@@ -853,17 +854,19 @@ fn run_aggregate(
             })
         }
         (AggregateFunction::Min | AggregateFunction::Max, false) => {
+            // The kernel reduces IEEE 754 totalOrder keys, not doubles (#101):
+            // `i64::MAX` / `i64::MIN` are the greatest and least keys, so a
+            // group's first value always replaces them, and a group with no
+            // value is NULL by its count whatever they hold.
             let mut mins = stream
-                .clone_htod(&vec![f64::INFINITY; cap])
+                .clone_htod(&vec![i64::MAX; cap])
                 .map_err(driver_error)?;
             let mut maxs = stream
-                .clone_htod(&vec![f64::NEG_INFINITY; cap])
+                .clone_htod(&vec![i64::MIN; cap])
                 .map_err(driver_error)?;
             let mut counts = alloc::<u32>(stream, cap)?;
-            let mut null_min = stream.clone_htod(&[f64::INFINITY]).map_err(driver_error)?;
-            let mut null_max = stream
-                .clone_htod(&[f64::NEG_INFINITY])
-                .map_err(driver_error)?;
+            let mut null_min = stream.clone_htod(&[i64::MAX]).map_err(driver_error)?;
+            let mut null_max = stream.clone_htod(&[i64::MIN]).map_err(driver_error)?;
             let mut null_count = alloc::<u32>(stream, 1)?;
             if n > 0 {
                 let f = backend.function("aggregation", AGGREGATION_SRC, "oxide_agg_minmax_f64")?;
@@ -882,25 +885,27 @@ fn run_aggregate(
                 launch.arg(&mut null_min);
                 launch.arg(&mut null_max);
                 launch.arg(&mut null_count);
-                // SAFETY: arguments match `oxide_agg_minmax_f64`; per-slot buffers hold `capacity` entries.
+                // SAFETY: arguments match `oxide_agg_minmax_f64` (the `i64` buffers are its
+                // totalOrder keys); per-slot buffers hold `capacity` entries.
                 unsafe { launch.launch(grid_for(n)) }.map_err(driver_error)?;
             }
-            let mut lo = stream.clone_dtoh(&mins).map_err(driver_error)?;
-            lo.truncate(cap);
-            let mut hi = stream.clone_dtoh(&maxs).map_err(driver_error)?;
-            hi.truncate(cap);
+            let decode = |keys: &CudaSlice<i64>| -> Result<Vec<f64>, EngineError> {
+                let mut keys = stream.clone_dtoh(keys).map_err(driver_error)?;
+                keys.truncate(cap);
+                Ok(keys.into_iter().map(from_total_order_key).collect())
+            };
             Ok(HostAgg::MinMaxF {
-                mins: lo,
-                maxs: hi,
+                mins: decode(&mins)?,
+                maxs: decode(&maxs)?,
                 counts: dtoh_u32(&counts)?,
-                null_min: first(
+                null_min: from_total_order_key(first(
                     &stream.clone_dtoh(&null_min).map_err(driver_error)?,
                     "null min",
-                )?,
-                null_max: first(
+                )?),
+                null_max: from_total_order_key(first(
                     &stream.clone_dtoh(&null_max).map_err(driver_error)?,
                     "null max",
-                )?,
+                )?),
                 null_count: first(
                     &stream.clone_dtoh(&null_count).map_err(driver_error)?,
                     "null count",

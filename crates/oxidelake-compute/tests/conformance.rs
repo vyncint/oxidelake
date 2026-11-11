@@ -348,6 +348,7 @@ async fn gpu_aggregate_edges_match_the_reference_when_available() {
         backend.kind()
     );
     check_sum_overflow(Arc::clone(&backend)).await;
+    check_float_min_max(Arc::clone(&backend)).await;
     if backend.supports_aggregate() {
         let hub = TelemetryHub::new();
         let stats = hub.register_operator("GpuAggregateExec", backend.kind());
@@ -367,6 +368,133 @@ async fn gpu_aggregate_edges_match_the_reference_when_available() {
             .unwrap();
         assert_eq!(sorted_rows(&[device]), sorted_rows(&[reference]));
     }
+}
+
+// --- MIN/MAX(Float64) in IEEE 754 totalOrder (#101) -----------------------------
+//
+// Stock DataFusion is not the oracle here: its grouped float MIN/MAX lets a
+// NaN reset the running value (MIN of {1.0, NaN, 3.0} is 3.0) and leaks its
+// starting values (MAX of {-inf} is f64::MIN), so its answer depends on row
+// order. The answers below are Arrow's order — `f64::total_cmp`, the order
+// its comparison and sort kernels (and so the CPU filter path) already use:
+// -NaN < -inf < … < -0.0 < 0.0 < … < inf < NaN.
+
+/// A group key and one of its values.
+type FloatRow = (Option<i64>, f64);
+
+/// A group, its values, and the `(MIN, MAX)` it must come out with.
+type FloatGroup = (Option<i64>, Vec<f64>, (f64, f64));
+
+fn special_float_groups() -> Vec<FloatGroup> {
+    let nan = f64::NAN;
+    vec![
+        // #101's table, row by row.
+        (Some(1), vec![1.0, nan, 3.0], (1.0, nan)),
+        (Some(2), vec![nan, nan], (nan, nan)),
+        (Some(3), vec![0.0, -0.0], (-0.0, 0.0)),
+        (Some(4), vec![-0.0, 0.0], (-0.0, 0.0)),
+        (Some(5), vec![f64::INFINITY, nan], (f64::INFINITY, nan)),
+        // The values DataFusion's starting values would replace.
+        (
+            Some(6),
+            vec![f64::NEG_INFINITY],
+            (f64::NEG_INFINITY, f64::NEG_INFINITY),
+        ),
+        (Some(7), vec![f64::INFINITY], (f64::INFINITY, f64::INFINITY)),
+        // A NaN with the sign bit set — what 0.0 / 0.0 produces on x86 — is the
+        // least value of the order, not the greatest.
+        (Some(8), vec![1.0, -nan], (-nan, 1.0)),
+        (None, vec![nan, 2.0], (2.0, nan)),
+    ]
+}
+
+/// The groups as two batches, the first value of every group in one and the
+/// rest in the other; `reversed` swaps the batches. A result that depends on
+/// which batch comes first is the bug this section exists for.
+fn special_float_batches(reversed: bool) -> Vec<RecordBatch> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, true),
+        Field::new("v", DataType::Float64, false),
+    ]));
+    let (mut first, mut rest): (Vec<FloatRow>, Vec<FloatRow>) = (Vec::new(), Vec::new());
+    for (k, values, _) in special_float_groups() {
+        for (i, v) in values.into_iter().enumerate() {
+            if i == 0 { &mut first } else { &mut rest }.push((k, v));
+        }
+    }
+    let batch = |rows: Vec<FloatRow>| {
+        RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+                )),
+                Arc::new(Float64Array::from(
+                    rows.iter().map(|(_, v)| *v).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap()
+    };
+    let (a, b) = (batch(first), batch(rest));
+    if reversed { vec![b, a] } else { vec![a, b] }
+}
+
+/// MIN/MAX(Float64) per group, compared bit for bit, so `-0.0` is not `0.0`
+/// and a NaN's sign is checked.
+async fn check_float_min_max(backend: Arc<dyn GpuBackend>) {
+    for reversed in [false, true] {
+        let ctx = SessionContext::new();
+        let batches = special_float_batches(reversed);
+        let scan = ctx
+            .read_batches(batches)
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let spec = AggregateSpec {
+            group_by: 0,
+            aggregates: vec![(AggregateFunction::Min, 1), (AggregateFunction::Max, 1)],
+        };
+        let exec = GpuAggregateExec::try_new(scan, spec, backend.kind())
+            .unwrap()
+            .with_backend(Arc::clone(&backend));
+        let out = collect(Arc::new(exec), ctx.task_ctx()).await.unwrap();
+        let mut actual = std::collections::BTreeMap::new();
+        for b in &out {
+            let keys = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            let col = |i: usize| b.column(i).as_any().downcast_ref::<Float64Array>().unwrap();
+            let (mins, maxs) = (col(1), col(2));
+            for row in 0..b.num_rows() {
+                let key = keys.is_valid(row).then(|| keys.value(row));
+                let pair = (mins.value(row).to_bits(), maxs.value(row).to_bits());
+                assert!(actual.insert(key, pair).is_none(), "group {key:?} twice");
+            }
+        }
+        let expected: std::collections::BTreeMap<_, _> = special_float_groups()
+            .into_iter()
+            .map(|(k, _, (min, max))| (k, (min.to_bits(), max.to_bits())))
+            .collect();
+        let show = |m: &std::collections::BTreeMap<Option<i64>, (u64, u64)>| {
+            m.iter()
+                .map(|(k, (lo, hi))| {
+                    format!("{k:?}: {}/{}", f64::from_bits(*lo), f64::from_bits(*hi))
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            actual,
+            expected,
+            "MIN/MAX(Float64), reversed={reversed}\n got: {:?}\nwant: {:?}",
+            show(&actual),
+            show(&expected)
+        );
+    }
+}
+
+#[tokio::test]
+async fn cpu_float_min_max_follow_total_order() {
+    check_float_min_max(cpu()).await;
 }
 
 fn reference_distances(
