@@ -16,7 +16,7 @@ use arrow::util::display::{ArrayFormatter, FormatOptions};
 use datafusion::datasource::MemTable;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::physical_plan::{ExecutionPlan, collect, displayable};
-use datafusion::prelude::SessionContext;
+use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_proto::physical_plan::{DefaultPhysicalProtoConverter, PhysicalExtensionCodec};
 use oxidelake_core::BackendKind;
 use oxidelake_planner::{HardwarePlacementRule, OxidePhysicalCodec, physical_optimizer_rules};
@@ -93,9 +93,55 @@ fn batches_e() -> Vec<Vec<RecordBatch>> {
     ]]
 }
 
+/// `k Int64`, `v Float64`: 100 rows in one partition and one batch, which
+/// DataFusion never splits, however many partitions the session targets.
+fn batches_n() -> Vec<Vec<RecordBatch>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("v", DataType::Float64, false),
+    ]));
+    let k: Vec<i64> = (0..100).collect();
+    let v: Vec<f64> = k.iter().map(|&k| k as f64 / 2.0).collect();
+    vec![vec![
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(k)),
+                Arc::new(Float64Array::from(v)),
+            ],
+        )
+        .unwrap(),
+    ]]
+}
+
+/// `bk Int64`, `y Int64`: every key of `n` four times, one partition.
+fn batches_d() -> Vec<Vec<RecordBatch>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("bk", DataType::Int64, false),
+        Field::new("y", DataType::Int64, false),
+    ]));
+    vec![vec![
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from_iter_values((0..400).map(|i| i % 100))),
+                Arc::new(Int64Array::from_iter_values(0..400)),
+            ],
+        )
+        .unwrap(),
+    ]]
+}
+
 fn register(ctx: &SessionContext) {
     for udf in oxidelake_compute::oxide_udfs() {
         ctx.register_udf(udf.as_ref().clone());
+    }
+    for (name, batches) in [("n", batches_n()), ("d", batches_d())] {
+        ctx.register_table(
+            name,
+            Arc::new(MemTable::try_new(batches[0][0].schema(), batches).unwrap()),
+        )
+        .unwrap();
     }
     let e = batches_e();
     ctx.register_table(
@@ -118,8 +164,13 @@ fn register(ctx: &SessionContext) {
 }
 
 fn ctx_with_rule(target: BackendKind) -> SessionContext {
+    ctx_with_rule_and(target, SessionConfig::new())
+}
+
+fn ctx_with_rule_and(target: BackendKind, config: SessionConfig) -> SessionContext {
     let state = SessionStateBuilder::new()
         .with_default_features()
+        .with_config(config)
         .with_physical_optimizer_rules(physical_optimizer_rules(HardwarePlacementRule::new(target)))
         .build();
     let ctx = SessionContext::new_with_state(state);
@@ -128,7 +179,11 @@ fn ctx_with_rule(target: BackendKind) -> SessionContext {
 }
 
 fn plain_ctx() -> SessionContext {
-    let ctx = SessionContext::new();
+    plain_ctx_with(SessionConfig::new())
+}
+
+fn plain_ctx_with(config: SessionConfig) -> SessionContext {
+    let ctx = SessionContext::new_with_config(config);
     register(&ctx);
     ctx
 }
@@ -242,6 +297,94 @@ async fn join_is_rewritten() {
         Some("GpuHashJoinExec[cuda]: join_type=Inner, on=["),
     )
     .await;
+}
+
+/// DataFusion's `LimitPushdown` hands a LIMIT to the `FilterExec` or
+/// `HashJoinExec` under it as `fetch` and removes the limit node whenever that
+/// node runs in one partition, so the node's `fetch` is the query's only
+/// limit. The lowered plan keeps it (#86); it used to return every matching
+/// row. Two ways a node ends up in one partition: `target_partitions = 1`, or
+/// an input smaller than one batch, which DataFusion never splits (GPU
+/// sessions use 65 536-row batches, so that is every small table).
+#[tokio::test]
+async fn a_limit_pushed_into_a_lowered_node_is_kept() {
+    let filter = "SELECT k, v FROM n WHERE k > 3 LIMIT 5";
+    let join = "SELECT n.k, d.y FROM n JOIN d ON n.k = d.bk LIMIT 3";
+    // (target_partitions, query, lowered node, limit, whether the stock
+    // plan's root is that node, i.e. its fetch is the only limit there is)
+    for (target_partitions, sql, lowered, limit, only_limit) in [
+        (1, filter, "GpuFilterExec", 5, true),
+        (4, filter, "GpuFilterExec", 5, true),
+        (1, join, "GpuHashJoinExec", 3, true),
+        (4, join, "GpuHashJoinExec", 3, true),
+        // Two partitions: each gets the fetch and a global limit above
+        // merges them; the lowered plan must keep the per-partition half.
+        (
+            4,
+            "SELECT k, v FROM t WHERE k >= 2 LIMIT 2",
+            "GpuFilterExec",
+            2,
+            false,
+        ),
+    ] {
+        let config = || SessionConfig::new().with_target_partitions(target_partitions);
+        let context = format!("target_partitions={target_partitions}: {sql}");
+        let (_, stock) = plan_and_text(&plain_ctx_with(config()), sql).await;
+        let fetch = format!("fetch={limit}");
+        let carrier = stock.lines().position(|l| {
+            let l = l.trim_start();
+            (l.starts_with("FilterExec:") || l.starts_with("HashJoinExec:")) && l.contains(&fetch)
+        });
+        assert!(
+            carrier.is_some() && (carrier == Some(0)) == only_limit,
+            "{context}: the stock plan no longer carries the limit the way this \
+             test assumes, so it no longer covers #86:\n{stock}"
+        );
+
+        let ctx = ctx_with_rule_and(BackendKind::Cuda, config());
+        let (plan, text) = plan_and_text(&ctx, sql).await;
+        let rows = sorted_rows(&collect(Arc::clone(&plan), ctx.task_ctx()).await.unwrap());
+        assert_eq!(rows.len(), limit, "{context}:\n{text}");
+        let above = parent_of(&plan, lowered);
+        assert_eq!(
+            above.as_ref().and_then(|p| p.fetch()),
+            Some(limit),
+            "{context}: the node directly above {lowered} carries the fetch:\n{text}"
+        );
+        // Which rows a LIMIT keeps is unspecified; each must still be a row
+        // of the query without it.
+        let unlimited = sql.replace(&format!(" LIMIT {limit}"), "");
+        let all = sorted_rows(
+            &plain_ctx_with(config())
+                .sql(&unlimited)
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap(),
+        );
+        assert!(
+            all.len() > limit,
+            "{context}: the fixture must exceed the limit"
+        );
+        for row in &rows {
+            assert!(
+                all.contains(row),
+                "{context}: `{row}` is not one of its rows"
+            );
+        }
+    }
+}
+
+/// The parent of the first node called `name`, depth first.
+fn parent_of(plan: &Arc<dyn ExecutionPlan>, name: &str) -> Option<Arc<dyn ExecutionPlan>> {
+    plan.children().into_iter().find_map(|child| {
+        if child.name() == name {
+            Some(Arc::clone(plan))
+        } else {
+            parent_of(child, name)
+        }
+    })
 }
 
 #[tokio::test]

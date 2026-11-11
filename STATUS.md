@@ -79,6 +79,7 @@ Resolved 2026-11-11 for the Ballista 55 bump (`cargo tree`, 593 crates in `Cargo
 - Under Ballista's session configuration DataFusion plans `SortMergeJoinExec`; the rule lowers it too (same inner-join semantics) and drops the `SortExec`s inserted for the merge.
 - Final/Partial aggregate pairs are replaced as a unit by one `GpuAggregateExec` over the partial's input, keeping DataFusion's output field names via `with_output_schema`.
 - Our codec wraps Ballista's (`OxidePhysicalCodec::new(BallistaPhysicalExtensionCodec)`): `Gpu*Exec` payloads carry a magic prefix, everything else is delegated, so shuffle nodes keep working.
+- A lowered node keeps the `fetch` of the node it replaced, as a `LocalLimitExec` directly above it (#86). DataFusion's `LimitPushdown` deletes the limit node when a single-partition `FilterExec` or `HashJoinExec` absorbs the limit, so that `fetch` can be the query's only limit; the `LocalLimitExec` makes the same per-partition cut and leaves any global limit above in place. A stock node rather than a `fetch` field on the `Gpu*Exec`s, so the codec's wire format did not change.
 
 - The dashboard renders a `DashboardModel` (telemetry snapshot + column profiles) through a pure `render(state, model, frame)`; the demo binary feeds a fixed fixture and repaints only on input/resize (no clock), which is what makes the PTY snapshots reproducible. Repaints are bracketed in DEC 2026 synchronized updates so termlens `wait_frame` never sees a torn frame.
 

@@ -16,6 +16,7 @@ use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::joins::{HashJoinExec, SortMergeJoinExec};
+use datafusion::physical_plan::limit::LocalLimitExec;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
@@ -93,35 +94,43 @@ impl HardwarePlacementRule {
     }
 
     fn rewrite(&self, node: Arc<dyn ExecutionPlan>) -> Result<Transformed<Arc<dyn ExecutionPlan>>> {
+        Ok(match self.lower(&node)? {
+            Some(lowered) => Transformed::yes(keep_fetch(node.fetch(), lowered)),
+            None => Transformed::no(node),
+        })
+    }
+
+    /// The replacement for `node`, or `None` when it stays as it is.
+    fn lower(&self, node: &Arc<dyn ExecutionPlan>) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         if let Some(filter) = node.downcast_ref::<FilterExec>()
             && let Some(gpu) = self.lower_filter(filter)?
         {
-            return Ok(Transformed::yes(Arc::new(gpu)));
+            return Ok(Some(Arc::new(gpu)));
         }
         if let Some(projection) = node.downcast_ref::<ProjectionExec>() {
             if let Some(gpu) = self.fuse_projection(projection)? {
-                return Ok(Transformed::yes(Arc::new(gpu)));
+                return Ok(Some(Arc::new(gpu)));
             }
             if let Some(gpu) = self.lower_vector_distance(projection) {
-                return Ok(Transformed::yes(Arc::new(gpu)));
+                return Ok(Some(Arc::new(gpu)));
             }
         }
         if let Some(join) = node.downcast_ref::<HashJoinExec>()
             && let Some(gpu) = self.lower_join(join)?
         {
-            return Ok(Transformed::yes(Arc::new(gpu)));
+            return Ok(Some(Arc::new(gpu)));
         }
         if let Some(join) = node.downcast_ref::<SortMergeJoinExec>()
             && let Some(gpu) = self.lower_sort_merge_join(join)?
         {
-            return Ok(Transformed::yes(Arc::new(gpu)));
+            return Ok(Some(Arc::new(gpu)));
         }
         if let Some(agg) = node.downcast_ref::<AggregateExec>()
             && let Some(gpu) = self.lower_aggregate(agg)?
         {
-            return Ok(Transformed::yes(Arc::new(gpu)));
+            return Ok(Some(Arc::new(gpu)));
         }
-        Ok(Transformed::no(node))
+        Ok(None)
     }
 
     fn lower_filter(&self, filter: &FilterExec) -> Result<Option<GpuFilterExec>> {
@@ -418,6 +427,25 @@ impl HardwarePlacementRule {
                 Ok(None)
             }
         }
+    }
+}
+
+/// Re-applies the `fetch` of the node a lowering replaced (#86).
+///
+/// DataFusion's `LimitPushdown` hands a LIMIT to the operator under it as
+/// that operator's `fetch`, and deletes the limit node when the operator runs
+/// in one partition, so the replaced node's `fetch` can be the only limit
+/// the query has. No `Gpu*Exec` has a fetch of its own. A `LocalLimitExec`
+/// makes the same cut the replaced node made — at most `fetch` rows from each
+/// partition — and leaves any global limit DataFusion kept above (the
+/// multi-partition case) in place; as a stock node it also crosses the
+/// cluster codec without a change to the wire format.
+fn keep_fetch(fetch: Option<usize>, lowered: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+    match fetch {
+        Some(fetch) if lowered.fetch() != Some(fetch) => {
+            Arc::new(LocalLimitExec::new(lowered, fetch))
+        }
+        _ => lowered,
     }
 }
 

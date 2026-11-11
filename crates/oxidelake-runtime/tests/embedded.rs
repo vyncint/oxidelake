@@ -48,6 +48,34 @@ fn sorted_rows(batches: &[RecordBatch]) -> Vec<String> {
     rows
 }
 
+/// A LIMIT returns its row count on every target (#86). The demo table is one
+/// small file, so the scan is one partition and DataFusion leaves the limit
+/// only as the `fetch` of the filter or join it pushed it into; the lowered
+/// node used to drop it and return every matching row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_limit_returns_its_row_count_on_every_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = demo_write_options(512, Compression::None);
+    write_demo_table(dir.path(), 4000, 11, &options).unwrap();
+    let path = dir.path().to_str().unwrap();
+
+    for target in [BackendKind::CpuSimd, BackendKind::Cuda, BackendKind::Metal] {
+        let session = OxideSession::local_with_target(target).unwrap();
+        session.register_parquet("t", path).await.unwrap();
+        for (sql, limit) in [
+            ("SELECT id, k FROM t WHERE k >= 2 LIMIT 7", 7),
+            ("SELECT a.id, b.s FROM t a JOIN t b ON a.k = b.k LIMIT 5", 5),
+        ] {
+            let plan = session.explain(sql).await.unwrap();
+            if target != BackendKind::CpuSimd {
+                assert!(plan.contains("Gpu"), "no placement for {sql}:\n{plan}");
+            }
+            let rows = sorted_rows(&session.sql(sql).await.unwrap().collect().await.unwrap());
+            assert_eq!(rows.len(), limit, "{target}: {sql}\n{plan}");
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gpu_targets_return_cpu_results() {
     let dir = tempfile::tempdir().unwrap();

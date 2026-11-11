@@ -35,6 +35,18 @@ versions (0.x) may contain breaking changes; they are always listed under a
   grow without limit now spills, or fails with a resources-exhausted error.
   The `Gpu*Exec` operators do not reserve from it.
 
+### Fixed
+
+- **A LIMIT over a GPU-placed filter or join returns its row count again**
+  (#86). DataFusion pushes a LIMIT into the `FilterExec` or `HashJoinExec`
+  under it as that node's `fetch` and removes the limit node when the node
+  runs in one partition — every input smaller than one batch, and every
+  `target_partitions = 1` session. The placement rule replaced the node
+  without its `fetch`, so `SELECT … WHERE k > 3 LIMIT 5` returned every
+  matching row on `--target cuda|metal`, embedded and on a cluster. A
+  lowered node now keeps the limit as a `LocalLimitExec` directly above it,
+  which `oxide explain` shows.
+
 ### Security
 
 - **thrift is out of the dependency graph** (#4, #54). parquet 59 decodes
