@@ -253,6 +253,84 @@ async fn check_aggregate(backend: Arc<dyn GpuBackend>, seed: u64, rows: usize) {
     assert_eq!(actual, expected, "aggregate seed={seed} rows={rows}");
 }
 
+// --- aggregate edge cases (#100, #46) ----------------------------------------
+//
+// Each fixture below exists to pin one semantic, so it is generated on its
+// own: the filter and join checks above must not change meaning because an
+// aggregate fixture grew a row.
+
+/// `k Int64?`, `x Int64`: every group's `SUM(x)` leaves the Int64 range. Group
+/// 1 is #100's reproduction (`i64::MAX - 1` twice wraps to -4), group 3 wraps
+/// downwards, group 4 overflows on the way and ends back in range, and the
+/// `NULL`-key group overflows too. Stock DataFusion wraps every one of them
+/// (`add_wrapping` in each `SUM` accumulator), and it is the reference.
+fn gen_sum_overflow() -> RecordBatch {
+    let rows = [
+        (Some(1), i64::MAX - 1),
+        (Some(2), 5),
+        (Some(1), i64::MAX - 1),
+        (Some(3), i64::MIN),
+        (Some(4), i64::MAX),
+        (Some(3), -1),
+        (None, i64::MAX),
+        (Some(4), 1),
+        (None, i64::MAX),
+        (Some(4), -2),
+    ];
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, true),
+        Field::new("x", DataType::Int64, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(
+                rows.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                rows.iter().map(|(_, x)| *x).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap()
+}
+
+/// `SUM(Int64)` wraps on overflow on every backend, as stock DataFusion does
+/// (#100; #46 asked for the opposite on a premise that turned out inverted).
+async fn check_sum_overflow(backend: Arc<dyn GpuBackend>) {
+    let ctx = SessionContext::new();
+    let batch = gen_sum_overflow();
+    ctx.register_batch("o", batch.clone()).unwrap();
+    let expected = sql_rows(&ctx, "SELECT k, SUM(x), COUNT(x) FROM o GROUP BY k").await;
+    // Pin the oracle as well as the operator: if DataFusion ever starts
+    // erroring here, this suite should say so rather than follow it.
+    assert_eq!(
+        expected,
+        [
+            "1|-4|2",
+            "2|5|1",
+            "3|9223372036854775807|2",
+            "4|9223372036854775806|3",
+            "NULL|-2|2",
+        ],
+        "stock DataFusion no longer wraps SUM(Int64)"
+    );
+    let spec = AggregateSpec {
+        group_by: 0,
+        aggregates: vec![(AggregateFunction::Sum, 1), (AggregateFunction::Count, 1)],
+    };
+    let exec = GpuAggregateExec::try_new(physical_plan(&ctx, batch).await, spec, backend.kind())
+        .unwrap()
+        .with_backend(backend);
+    let actual = exec_rows(&ctx, Arc::new(exec)).await;
+    assert_eq!(actual, expected, "SUM(Int64) overflow");
+}
+
+#[tokio::test]
+async fn cpu_sum_overflow_wraps_like_datafusion() {
+    check_sum_overflow(cpu()).await;
+}
+
 fn reference_distances(
     batch: &RecordBatch,
     query: &[f32],

@@ -195,6 +195,18 @@ versions (0.x) may contain breaking changes; they are always listed under a
   selects the CPU and logs why, and `OXIDE_BACKEND=cuda` fails at startup
   saying which. New: `CudaBackend::nvrtc_arch`.
 
+### Fixed
+
+- **`SUM(Int64)` wraps on overflow under a GPU target, as it does in stock
+  DataFusion** (#100). The CPU reference — what every operator placed on a
+  device falls back to, and what every GPU kernel is checked against —
+  failed the query with `SUM overflowed Int64`, so a `GROUP BY` that
+  `--target cpu` answered errored under `--target cuda` or `metal` on a
+  machine without the device. It now wraps like DataFusion's `add_wrapping`
+  accumulators, and the conformance suite pins it to DataFusion's wrapped
+  answer on an overflow fixture. Nothing to change on your side: the error
+  was never DataFusion's behaviour, and no other target raised it.
+
 ### Security
 
 - **thrift is out of the dependency graph** (#4, #54). parquet 59 decodes

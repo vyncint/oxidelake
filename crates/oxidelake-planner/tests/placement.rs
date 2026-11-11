@@ -1032,4 +1032,31 @@ async fn a_window_by_the_other_key_runs_over_a_lowered_hash_join() {
             .unwrap();
         assert_eq!(sorted_rows(&actual), sorted_rows(&expected), "{context}");
     }
+
+// --- aggregates ------------------------------------------------------------
+
+/// Plans and runs `sql`, failing with the planner's or the executor's error
+/// (and the plan) rather than a bare `unwrap` panic.
+async fn run(ctx: &SessionContext, sql: &str) -> (String, Vec<RecordBatch>) {
+    let plan = match ctx.sql(sql).await {
+        Ok(df) => df.create_physical_plan().await,
+        Err(err) => Err(err),
+    }
+    .unwrap_or_else(|err| panic!("{sql}\nfailed to plan: {err}"));
+    let text = displayable(plan.as_ref()).indent(true).to_string();
+    let batches = collect(plan, ctx.task_ctx())
+        .await
+        .unwrap_or_else(|err| panic!("{sql}\nfailed to run: {err}\n{text}"));
+    (text, batches)
+}
+
+/// `SUM(Int64)` wraps on overflow under a GPU target as it does in stock
+/// DataFusion; the CPU reference used to fail the query instead (#100).
+#[tokio::test]
+async fn an_overflowing_sum_wraps_on_a_gpu_target() {
+    let sql = "SELECT k, SUM(x) AS s FROM (VALUES (1, 9223372036854775806), \
+               (1, 9223372036854775806), (2, 5)) AS v(k, x) GROUP BY k";
+    let (text, gpu) = run(&ctx_with_rule(BackendKind::Cuda), sql).await;
+    assert!(text.contains("GpuAggregateExec[cuda]"), "{text}");
+    assert_eq!(sorted_rows(&gpu), ["1|-4", "2|5"], "{text}");
 }

@@ -6,6 +6,7 @@
 //! * join: `NULL` keys never match;
 //! * aggregate: `NULL` keys form their own group; `SUM/MIN/MAX` skip `NULL`s
 //!   and are `NULL` for groups with no values; `COUNT` counts non-`NULL`s;
+//!   `SUM` over `Int64` wraps on overflow, as stock DataFusion's does;
 //!   output is sorted by key with the `NULL` group last;
 //! * vector distance: a `NULL` vector yields a `NULL` distance; cosine distance
 //!   is `1 - cos(θ)` and is `NaN` when either norm is zero.
@@ -434,7 +435,7 @@ fn index_u32(i: usize) -> Result<u32, EngineError> {
 enum Acc {
     I64 {
         count: i64,
-        sum: i128,
+        sum: i64,
         min: i64,
         max: i64,
     },
@@ -535,7 +536,12 @@ pub fn aggregate(batch: &RecordBatch, spec: &AggregateSpec) -> Result<RecordBatc
                 ) if arr.is_valid(row) => {
                     let v = arr.value(row);
                     *count += 1;
-                    *sum += i128::from(v);
+                    // Wrapping, like every stock DataFusion `SUM` accumulator
+                    // (`add_wrapping`). This path is the reference the GPU
+                    // kernels are checked against and the one a device
+                    // operator falls back to, so an error here failed on a
+                    // GPU target a query the CPU target answered (#100).
+                    *sum = sum.wrapping_add(v);
                     *min = (*min).min(v);
                     *max = (*max).max(v);
                 }
@@ -585,19 +591,18 @@ pub fn aggregate(batch: &RecordBatch, spec: &AggregateSpec) -> Result<RecordBatc
                         .collect::<Vec<_>>(),
                 )),
             ),
-            (AggregateFunction::Sum, Input::I(_)) => {
-                let mut out = Vec::with_capacity(order.len());
-                for &g in &order {
-                    out.push(match &accs[g][a] {
-                        Acc::I64 { count, sum, .. } if *count > 0 => Some(
-                            i64::try_from(*sum)
-                                .map_err(|_| EngineError::execution("SUM overflowed Int64"))?,
-                        ),
-                        _ => None,
-                    });
-                }
-                (DataType::Int64, Arc::new(Int64Array::from(out)))
-            }
+            (AggregateFunction::Sum, Input::I(_)) => (
+                DataType::Int64,
+                Arc::new(Int64Array::from(
+                    order
+                        .iter()
+                        .map(|&g| match &accs[g][a] {
+                            Acc::I64 { count, sum, .. } if *count > 0 => Some(*sum),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>(),
+                )),
+            ),
             (AggregateFunction::Sum, Input::F(_)) => (
                 DataType::Float64,
                 Arc::new(Float64Array::from(
