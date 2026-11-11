@@ -159,6 +159,11 @@ versions (0.x) may contain breaking changes; they are always listed under a
   `hash_join_gather`, the reference for gathering a range of a probe's
   matches.
 
+- `BufferLayout::padded_len` returns `Option<usize>`: `None` when rounding
+  the length up to the alignment overflows (#104). Where a `usize` was used,
+  handle the `None`; a layout built through `BufferLayout::new` always has
+  `Some`, since `new` now refuses those lengths up front.
+
 ### Security
 
 - **thrift is out of the dependency graph** (#4, #54). parquet 59 decodes
@@ -189,6 +194,16 @@ versions (0.x) may contain breaking changes; they are always listed under a
   duration parsing. None is a known vulnerability and none has a maintained
   release to move to inside the pinned chain; each is listed in `deny.toml`,
   `SECURITY.md` and `STATUS.md` and revisited at the next chain bump.
+
+- **`AlignedBuf` can no longer claim more bytes than it allocated** (#104).
+  Rounding a length within `align` bytes of `usize::MAX` up to the
+  alignment wrapped: a debug build panicked, and a release build returned a
+  64-byte allocation whose `len()` was about 2^64, so `as_slice` — and
+  `CpuBackend::alloc_device` followed by `copy_h2d` — read and wrote far
+  past it from safe code. `AlignedBuf::zeroed` and `BufferLayout::new` now
+  refuse any length whose padded size exceeds `isize::MAX` bytes with
+  `EngineError::Allocation`, in every build profile. No query reached it;
+  the public allocation API did.
 
 ## [0.2.0] - 2026-09-21
 

@@ -16,7 +16,9 @@ pub struct BufferLayout {
 }
 
 impl BufferLayout {
-    /// Builds a layout, validating that `align` is a non-zero power of two.
+    /// Builds a layout, validating that `align` is a non-zero power of two and
+    /// that `len` rounded up to it is a size Rust can allocate (at most
+    /// `isize::MAX` bytes).
     pub fn new(len: usize, align: usize) -> Result<Self, EngineError> {
         if align == 0 || !align.is_power_of_two() {
             return Err(EngineError::allocation(
@@ -25,7 +27,15 @@ impl BufferLayout {
                 "alignment must be a non-zero power of two",
             ));
         }
-        Ok(Self { len, align })
+        let layout = Self { len, align };
+        match layout.padded_len() {
+            Some(padded) if padded <= isize::MAX.unsigned_abs() => Ok(layout),
+            _ => Err(EngineError::allocation(
+                len,
+                align,
+                "the length rounded up to the alignment exceeds isize::MAX bytes",
+            )),
+        }
     }
 
     /// A host-aligned ([`HOST_ALIGN`]) layout.
@@ -59,14 +69,15 @@ impl BufferLayout {
         self.align
     }
 
-    /// The length rounded up to a multiple of the alignment (zero stays zero).
-    pub const fn padded_len(&self) -> usize {
-        let rem = self.len % self.align;
-        if rem == 0 {
-            self.len
-        } else {
-            self.len + (self.align - rem)
-        }
+    /// The length rounded up to a multiple of the alignment (zero stays zero),
+    /// or `None` when that does not fit in a `usize`.
+    ///
+    /// An `Option` because [`Self::host`] and [`Self::device`] accept any
+    /// length: the unchecked sum this used to return wrapped to a small number
+    /// for lengths within `align` of `usize::MAX`, and an allocation sized from
+    /// it was smaller than the length it claimed to hold (#104).
+    pub const fn padded_len(&self) -> Option<usize> {
+        self.len.checked_next_multiple_of(self.align)
     }
 
     /// `true` when `addr` satisfies this layout's alignment.
@@ -89,10 +100,27 @@ mod tests {
 
     #[test]
     fn pads_to_alignment() {
-        assert_eq!(BufferLayout::host(0).padded_len(), 0);
-        assert_eq!(BufferLayout::host(1).padded_len(), 64);
-        assert_eq!(BufferLayout::host(64).padded_len(), 64);
-        assert_eq!(BufferLayout::device(129).padded_len(), 256);
+        assert_eq!(BufferLayout::host(0).padded_len(), Some(0));
+        assert_eq!(BufferLayout::host(1).padded_len(), Some(64));
+        assert_eq!(BufferLayout::host(64).padded_len(), Some(64));
+        assert_eq!(BufferLayout::device(129).padded_len(), Some(256));
+    }
+
+    #[test]
+    fn padding_near_usize_max_is_refused() {
+        // Before #104 the padded length wrapped: usize::MAX - 10 rounded up to 64
+        // was 0 in release (a debug build panicked inside `padded_len`).
+        assert_eq!(BufferLayout::host(usize::MAX - 10).padded_len(), None);
+        assert_eq!(BufferLayout::device(usize::MAX - 126).padded_len(), None);
+        assert!(BufferLayout::new(usize::MAX - 10, 64).is_err());
+        assert!(BufferLayout::new(usize::MAX, 128).is_err());
+        // No wrap, but more than any allocation may be.
+        assert!(BufferLayout::new(usize::MAX - 63, 64).is_err());
+        let max = isize::MAX.unsigned_abs();
+        assert!(BufferLayout::new(max, 64).is_err());
+        // The largest size an allocation may have still builds.
+        let largest = BufferLayout::new(max - 63, 64).unwrap();
+        assert_eq!(largest.padded_len(), Some(max - 63));
     }
 
     #[test]

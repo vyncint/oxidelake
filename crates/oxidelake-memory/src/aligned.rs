@@ -19,9 +19,19 @@ pub struct AlignedBuf {
 
 impl AlignedBuf {
     /// Allocates `len` zeroed bytes aligned to `align` (a non-zero power of two).
+    ///
+    /// Fails with [`EngineError::Allocation`] when `len` rounded up to `align`
+    /// exceeds `isize::MAX` bytes, before anything is allocated.
     pub fn zeroed(len: usize, align: usize) -> Result<Self, EngineError> {
         let wanted = BufferLayout::new(len, align)?;
-        let size = wanted.padded_len().max(align);
+        // `size >= len` is what `as_slice` relies on. It holds because the
+        // padded length is a checked rounding *up*: the unchecked one wrapped
+        // to 0 for lengths within `align` of `usize::MAX`, and a 64-byte
+        // allocation then claimed a length of ~2^64 (#104).
+        let size = wanted
+            .padded_len()
+            .ok_or_else(|| EngineError::allocation(len, align, "padded length overflows usize"))?
+            .max(align);
         let layout = Layout::from_size_align(size, align)
             .map_err(|e| EngineError::allocation(len, align, e.to_string()))?;
         // SAFETY: `layout.size()` is at least `align >= 1`, so it is non-zero as
@@ -145,5 +155,25 @@ mod tests {
     #[test]
     fn rejects_invalid_alignment() {
         assert!(AlignedBuf::zeroed(8, 24).is_err());
+    }
+
+    /// #104: a length within `align` of `usize::MAX` used to wrap when rounded
+    /// up, so a release build returned a 64-byte allocation whose `len()` was
+    /// ~2^64 and `as_slice` reached far past it from safe code. None of these
+    /// sizes reaches the allocator: each is refused while computing the layout.
+    #[test]
+    fn lengths_whose_padding_overflows_are_refused() {
+        for (len, align) in [
+            (usize::MAX, 64),
+            (usize::MAX - 1, 128),
+            (usize::MAX - 63, 64),
+            (isize::MAX.unsigned_abs() + 1, 64),
+        ] {
+            let result = AlignedBuf::zeroed(len, align);
+            assert!(
+                matches!(result, Err(EngineError::Allocation { .. })),
+                "len {len} align {align}: {result:?}"
+            );
+        }
     }
 }
