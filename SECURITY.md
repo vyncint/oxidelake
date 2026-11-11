@@ -60,13 +60,17 @@ re-examined at every chain bump. None is silent: they are listed here, in
 `deny.toml`, and in `STATUS.md`.
 
 - **thrift < 0.23.0 — excessive allocation from a size field during decode**
-  (CVE-2026-43868, GHSA-2f9f-gq7v-9h6m, medium). Reached through `parquet 58 →
-  thrift ^0.17`. The fix is not a thrift bump: `parquet 59` removed the thrift
-  dependency altogether, but it needs DataFusion 55, and the newest Ballista
-  (54.1.0) still requires DataFusion ^54. **Exposure is decoding the footer of
-  a Parquet file** — so until the chain bump lands, do not point this engine at
-  Parquet produced by a party you do not trust; the trust model above already
-  scopes input files to infrastructure you control. Tracked in issue #4.
+  (CVE-2026-43868, GHSA-2f9f-gq7v-9h6m, RUSTSEC-2026-0435, medium). Reached
+  through `parquet 58 → thrift ^0.17`. The fix is not a thrift bump:
+  `parquet 59` removed the thrift dependency altogether, and it needs
+  DataFusion 55, which Ballista reached in 55.0.0 (2026-10-06); that chain
+  bump is #40. RustSec names only the binary protocol's `read_bytes` and
+  `read_string`, which parquet's own compact-protocol footer reader never
+  calls, but the GitHub advisory is broader, so the conservative reading
+  stands: **exposure is decoding the footer of a Parquet file** — until the
+  chain bump lands, do not point this engine at Parquet produced by a party
+  you do not trust; the trust model above already scopes input files to
+  infrastructure you control. Tracked in issue #4.
 - **quick-xml** (RUSTSEC-2026-0194/0195) — reached only by `object_store`'s
   cloud backends, which OxideLake never registers.
 - **paste** (RUSTSEC-2024-0436) — a compile-time proc-macro dependency of

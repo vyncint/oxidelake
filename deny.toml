@@ -35,6 +35,14 @@ ignore = [
     # down rather than going red on every PR the day RustSec catches up.
     # Re-examine at every chain bump; remove when parquet >= 59 is in the lock.
     { id = "GHSA-2f9f-gq7v-9h6m", reason = "thrift 0.17 via parquet 58; fix is parquet 59 (drops thrift), blocked on Ballista > 54; exposure is Parquet footer decode of trusted files" },
+    # RustSec imported the same CVE on 2026-11-02 as RUSTSEC-2026-0435 and names
+    # the functions it affects: `TBinaryInputProtocol::read_bytes` and
+    # `read_string`. parquet 58 reads footers with its own compact-protocol
+    # reader (parquet/src/thrift.rs) and never constructs the binary protocol,
+    # so those functions are not reached; the GHSA entry above stays the
+    # conservative record. Both go together when parquet >= 59 is in the lock
+    # (#40, #54).
+    { id = "RUSTSEC-2026-0435", reason = "thrift 0.17 via parquet 58; RustSec scopes it to TBinaryInputProtocol, which parquet never uses; removed by the parquet 59 chain bump" },
     # quick-xml is reached only through object_store's S3 / Azure / GCS
     # backends. OxideLake registers the local filesystem store exclusively
     # (oxidelake_storage::store), so the vulnerable XML parser is never invoked.
