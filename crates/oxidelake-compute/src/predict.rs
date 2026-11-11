@@ -59,7 +59,7 @@
 //! than one per row.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use arrow::array::{Array, FixedSizeListArray, Float32Array};
 use arrow::datatypes::{DataType, Field};
@@ -223,20 +223,33 @@ impl Model {
 /// Process-wide model cache, keyed by path.
 ///
 /// A UDF is invoked per batch, and a scan has many batches; reading and
-/// parsing a weights file each time would dominate every query. The lock is
-/// held across the load, so two batches racing on a cold path do the work
-/// once. It is never invalidated: a model file that changes under a running
-/// process keeps serving the old weights, which is the right default for a
-/// query engine (a plan should not change answers halfway) and the wrong one
-/// for a notebook, so it is stated rather than assumed.
+/// parsing a weights file each time would dominate every query. It is never
+/// invalidated: a model file that changes under a running process keeps
+/// serving the old weights, which is the right default for a query engine (a
+/// plan should not change answers halfway) and the wrong one for a notebook,
+/// so it is stated rather than assumed.
 ///
 /// Keyed by the path *and* the spec: two queries over the same file, one
 /// asserting an activation and one not, must both be checked against the
 /// header rather than the second silently inheriting the first's answer.
+///
+/// **One lock per model, not one for the cache** (#96). The map's lock is
+/// held only to find or add a key's slot, and the slot's lock across that
+/// key's load, so two batches racing on a cold path still do the work once.
+/// The load used to run under the map's lock: a file that made it panic
+/// poisoned the cache, and every later `predict` in the process failed with
+/// `model cache poisoned` until a restart, whatever model it named. Now a
+/// panic can only poison its own slot, which is still empty, so the next
+/// call clears the poison and loads again; and a slow load holds up only the
+/// queries waiting for the same model. A failed load leaves its slot empty,
+/// so a failure is never cached.
 static MODELS: OnceLock<Mutex<ModelCache>> = OnceLock::new();
 
-/// The cache's contents: a loaded model per path and asserted activation.
-type ModelCache = HashMap<(String, ModelSpec), Arc<Model>>;
+/// One model's slot: empty until its first successful load.
+type ModelSlot = Arc<Mutex<Option<Arc<Model>>>>;
+
+/// The cache's contents: a slot per path and asserted activation.
+type ModelCache = HashMap<(String, ModelSpec), ModelSlot>;
 
 fn cache() -> &'static Mutex<ModelCache> {
     MODELS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -247,18 +260,27 @@ fn cache() -> &'static Mutex<ModelCache> {
 /// # Errors
 ///
 /// [`DataFusionError::Execution`] when the file is missing, is not
-/// safetensors, or does not describe a shape [`ModelSpec`] recognizes.
+/// safetensors, does not describe a shape [`ModelSpec`] recognizes, or
+/// declares layers its own data cannot fill.
 pub fn model(path: &str, spec: ModelSpec) -> Result<Arc<Model>> {
-    let mut guard = cache()
-        .lock()
-        .map_err(|_| DataFusionError::Execution(format!("{PREDICT}: model cache poisoned")))?;
-    let key = (path.to_string(), spec);
-    if let Some(found) = guard.get(&key) {
+    // Nothing that can panic runs under the map's lock, so a poisoned guard
+    // would still hold a consistent map.
+    let slot = Arc::clone(
+        cache()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry((path.to_string(), spec))
+            .or_default(),
+    );
+    // A slot is poisoned only by a load that panicked before storing
+    // anything, so what the guard holds is still the truth: no model yet.
+    let mut loaded = slot.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(found) = loaded.as_ref() {
         return Ok(Arc::clone(found));
     }
-    let loaded = Arc::new(load(path, spec)?);
-    guard.insert(key, Arc::clone(&loaded));
-    Ok(loaded)
+    let model = Arc::new(load(path, spec)?);
+    *loaded = Some(Arc::clone(&model));
+    Ok(model)
 }
 
 /// Rebuild the architecture from the tensor names and shapes, then fill it.
@@ -349,7 +371,10 @@ fn layer_shapes(path: &str, bytes: &[u8]) -> Result<Vec<(usize, usize)>> {
         .map_err(|e| exec(format!("{PREDICT}: {path} is not a safetensors file: {e}")))?;
 
     let mut by_index: HashMap<usize, (usize, usize)> = HashMap::new();
+    // Tensor ranges are disjoint slices of `bytes`, so the sum cannot overflow.
+    let mut held = 0usize;
     for (name, view) in file.tensors() {
+        held += view.data().len();
         let shape = view.shape();
         let Some((index, "weight")) = name.split_once('.') else {
             continue; // biases and anything else carry no shape information we need
@@ -390,7 +415,39 @@ fn layer_shapes(path: &str, bytes: &[u8]) -> Result<Vec<(usize, usize)>> {
             )));
         }
     }
+    check_parameters_fit(path, &shapes, held)?;
     Ok(shapes)
+}
+
+/// Refuses layers that need more memory than the file holds data for (#96).
+///
+/// `Linear::new(in, out)` allocates an `out × in` weight and an `out` bias
+/// before a single value is read from the file, sized by the header alone.
+/// safetensors checks each tensor's byte length against its shape, but a
+/// shape with a zero in it is zero bytes long whatever its other dimension
+/// says: a 136-byte file declaring `0.weight: [2^40, 0]` asked for a 4 TiB
+/// bias, and `[2^62, 0]` for one whose size overflows `usize` — a panic
+/// inside the model cache's lock until 0.3. A model can never need more
+/// parameters than its file fills, so the tensor data the file holds is the
+/// bound, computed with checked arithmetic before anything is built.
+fn check_parameters_fit(path: &str, shapes: &[(usize, usize)], held: usize) -> Result<()> {
+    let needed = shapes.iter().try_fold(0usize, |total, &(inputs, outputs)| {
+        outputs
+            .checked_mul(inputs)?
+            .checked_add(outputs)?
+            .checked_mul(size_of::<f32>())?
+            .checked_add(total)
+    });
+    let needed = match needed {
+        Some(needed) if needed <= held => return Ok(()),
+        Some(needed) => format!("{needed} bytes"),
+        None => "more bytes than a usize can count".to_owned(),
+    };
+    Err(exec(format!(
+        "{PREDICT}: {path}: its layers need {needed} for f32 parameters and the file \
+         holds {held} bytes of tensor data; a model its file cannot fill is refused \
+         before anything is allocated"
+    )))
 }
 
 fn exec(message: String) -> DataFusionError {

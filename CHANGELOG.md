@@ -314,6 +314,20 @@ versions (0.x) may contain breaking changes; they are always listed under a
   `EngineError::Allocation`, in every build profile. No query reached it;
   the public allocation API did.
 
+- **A malformed model file no longer takes `predict` down for the whole
+  process** (#96). A 136-byte safetensors file declaring
+  `0.weight: [2^40, 0]` holds zero bytes of data, which safetensors accepts,
+  and `predict` sized a 4 TiB bias from it before reading a value
+  (`[2^62, 0]` overflowed `usize` instead). Either way the load panicked in the
+  process-wide model-cache lock, and every later `predict` in that process
+  failed with `model cache poisoned` until a restart, whatever model it
+  named; the model path is a SQL argument, so anyone who could run a query
+  could do this to a long-lived worker. Layer shapes are now checked against
+  the tensor data the file holds before anything is allocated, and such a
+  file is refused with an error naming it. The cache also takes one lock per
+  model instead of one for all of them, so a load that fails or panics
+  affects only its own model and is tried again on the next call.
+
 ## [0.2.0] - 2026-09-21
 
 The observability release. A GPU deployment that silently ran everything on

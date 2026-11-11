@@ -28,7 +28,8 @@ use datafusion::prelude::SessionContext;
 use oxidelake_compute::{ACTIVATION_KEY, predict_udf};
 use oxmera::Tensor;
 use oxmera::nn::{Linear, Module, Sequential};
-use safetensors::SafeTensors;
+use safetensors::tensor::TensorView;
+use safetensors::{Dtype, SafeTensors};
 
 const IN: usize = 4;
 const HIDDEN: usize = 3;
@@ -560,4 +561,148 @@ async fn four_arguments_are_refused_naming_the_shape() {
         Ok(df) => df.collect().await.expect_err("four arguments").to_string(),
     };
     assert!(err.contains("2 or 3 arguments"), "{err}");
+}
+
+// --- a malformed model file (#96) ------------------------------------------
+
+/// `run`, with the error kept as a value rather than a panic.
+///
+/// Owned arguments so it can be spawned: a panic inside the UDF then fails
+/// that one task, and the test still reaches the assertions that say which
+/// guard gave way.
+async fn try_run(sql: String, path: String) -> Result<Vec<RecordBatch>, String> {
+    let ctx = SessionContext::new();
+    ctx.register_udf(predict_udf());
+    ctx.register_batch("t", batch())
+        .map_err(|e| e.to_string())?;
+    let frame = ctx
+        .sql(&sql.replace("{model}", &path))
+        .await
+        .map_err(|e| e.to_string())?;
+    frame.collect().await.map_err(|e| e.to_string())
+}
+
+/// A model file whose one layer is `0.weight: [rows, 0]` and nothing else.
+///
+/// Zero elements means zero bytes of data, so safetensors accepts the file
+/// whatever `rows` is — the reviewer's was 136 bytes long. What made it
+/// dangerous is that `Linear::new(0, rows)` sizes a bias of `rows` f32s
+/// before a single value is read from the file.
+fn hollow_model(dir: &Path, name: &str, rows: usize) -> String {
+    let path = dir.join(name);
+    let view = TensorView::new(Dtype::F32, vec![rows, 0], &[]).expect("a zero-element view");
+    let metadata = HashMap::from([(ACTIVATION_KEY.to_owned(), "none".to_owned())]);
+    let bytes =
+        safetensors::serialize([("0.weight".to_owned(), view)], Some(metadata)).expect("serialize");
+    assert!(bytes.len() < 256, "the file is tiny: {} bytes", bytes.len());
+    std::fs::write(&path, bytes).expect("write");
+    path.to_string_lossy().into_owned()
+}
+
+const ONE_ROW: &str = "SELECT predict('{model}', features) AS y FROM t WHERE id = 0";
+
+/// Runs a hollow model, then the same path once the file is fixed, then a
+/// second valid model, and checks all three.
+///
+/// The order of the assertions is the point. "The path loads once the file
+/// is fixed" and "another model still loads" come first, because they are
+/// what a poisoned cache breaks — every later `predict` in the process
+/// answered `model cache poisoned` until a restart. "The malformed file is a
+/// clean error" comes last: it is what the shape check breaks, and checking
+/// it first would hide whether the cache survived.
+async fn malformed_then_valid(dir: &Path, rows: usize) {
+    let hollow = hollow_model(dir, &format!("hollow-{rows}.safetensors"), rows);
+    let first = tokio::spawn(try_run(ONE_ROW.to_owned(), hollow.clone())).await;
+
+    let fixed = two_layer_mlp();
+    save_with_activation(&fixed, Path::new(&hollow), Some("none"));
+    let again = try_run(ONE_ROW.to_owned(), hollow.clone()).await;
+    let (other, other_path) = model_on_disk_with(dir, "other.safetensors", Some("relu"));
+    let elsewhere = try_run(ONE_ROW.to_owned(), other_path).await;
+
+    let input = features()[0].expect("row 0 is not null");
+    for (what, result, model, activation) in [
+        (
+            "the same path, once the file is fixed",
+            &again,
+            &fixed,
+            "none",
+        ),
+        ("another model", &elsewhere, &other, "relu"),
+    ] {
+        let out = result
+            .as_ref()
+            .unwrap_or_else(|e| panic!("{what} must load after a malformed file: {e}"));
+        let got = row_values(&outputs(out, 0), 0);
+        let want = reference(model, &input, activation);
+        for (i, expected) in want.iter().enumerate() {
+            assert!((got[i] - expected).abs() < 1e-5, "{what}, output {i}");
+        }
+    }
+
+    let err = match first {
+        Ok(Err(e)) => e,
+        Ok(Ok(_)) => panic!("a model with [{rows}, 0] weights and no data ran"),
+        Err(e) => panic!("a malformed model file must be an error, not a panic: {e}"),
+    };
+    assert!(err.contains(&hollow), "the error names the file: {err}");
+    assert!(err.contains("cannot fill"), "{err}");
+}
+
+/// `[2^62, 0]`: the bias's byte count overflows `usize`, so nothing can be
+/// allocated even if the bound regresses — which is why this case runs
+/// in-process, on every platform.
+#[tokio::test]
+async fn a_layer_whose_size_overflows_is_an_error_and_predict_keeps_working() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    malformed_then_valid(dir.path(), 1 << 62).await;
+}
+
+/// Set in the child [`a_layer_larger_than_its_file_is_refused_before_allocating`]
+/// spawns, which is the process that may run the malformed load.
+#[cfg(target_os = "linux")]
+const CAPPED_CHILD: &str = "OXIDELAKE_TEST_CAPPED_CHILD";
+
+/// `[2^40, 0]`: a 4 TiB bias, which overflows nothing. Only a bound tied to
+/// the file's own size refuses it, so this is the case that proves there is
+/// one.
+///
+/// Run in a child whose address space is capped at 4 GiB, never in this
+/// process. If the bound ever regresses, `Linear::new` reserves 4 TiB and
+/// then writes zeros into it; on a host with `vm.overcommit_memory = 1` the
+/// reservation succeeds and the writes take the machine down. Inside the cap
+/// the reservation fails instead, and the test reports it. Linux only:
+/// macOS does not enforce `RLIMIT_AS`, so there is no cap to run it under.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_layer_larger_than_its_file_is_refused_before_allocating() {
+    const NAME: &str = "a_layer_larger_than_its_file_is_refused_before_allocating";
+    if std::env::var_os(CAPPED_CHILD).is_some() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        malformed_then_valid(dir.path(), 1 << 40).await;
+        return;
+    }
+    let exe = std::env::current_exe().expect("the test binary");
+    let out = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        // `ulimit -v` counts KiB: 4 GiB, ample for one test and a thousand
+        // times less than the bias.
+        .arg(r#"ulimit -v 4194304 && exec "$0" "$@""#)
+        .arg(exe)
+        .args([NAME, "--exact", "--test-threads=1"])
+        .env(CAPPED_CHILD, "1")
+        .output()
+        .expect("spawn the capped child");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "the capped child failed ({}):\n{stdout}\n{stderr}",
+        out.status
+    );
+    // A filter that matched nothing would pass too.
+    assert!(
+        stdout.contains("1 passed"),
+        "the child ran no test:\n{stdout}"
+    );
 }
