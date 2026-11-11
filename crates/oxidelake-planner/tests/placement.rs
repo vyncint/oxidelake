@@ -655,10 +655,16 @@ async fn ineligible_distance_projections_stay_on_cpu() {
 /// Plans `sql` on a Cuda target with a telemetry hub attached and returns the
 /// `node: reason` notes the rule recorded.
 async fn placement_notes(sql: &str) -> Vec<String> {
+    placement_notes_with(SessionConfig::new(), sql).await
+}
+
+/// [`placement_notes`] in a session configured with `config`.
+async fn placement_notes_with(config: SessionConfig, sql: &str) -> Vec<String> {
     let hub = oxidelake_core::telemetry::TelemetryHub::new();
     let rule = HardwarePlacementRule::new(BackendKind::Cuda).with_telemetry(Arc::clone(&hub));
     let state = SessionStateBuilder::new()
         .with_default_features()
+        .with_config(config)
         .with_physical_optimizer_rules(physical_optimizer_rules(rule))
         .build();
     let ctx = SessionContext::new_with_state(state);
@@ -723,4 +729,70 @@ async fn a_fully_lowered_plan_records_no_notes() {
         placement_notes("SELECT k, sum(v) FROM t WHERE k >= 2 GROUP BY k").await,
         Vec::<String>::new()
     );
+}
+
+/// `!=` has no device comparison; the note used to list it among the ones
+/// the kernels implement (#94).
+#[tokio::test]
+async fn the_not_equal_note_names_only_comparisons_that_exist() {
+    assert_eq!(
+        placement_notes("SELECT k FROM t WHERE k != 2").await,
+        vec![
+            "FilterExec: `!=` is not one of the comparisons the device kernels \
+             implement (=, <, <=, >, >=)"
+                .to_owned()
+        ]
+    );
+}
+
+/// A join the device cannot take says why (#94). It used to record nothing,
+/// which reads as if the rule never looked at it. Every early return of both
+/// join lowerings is covered: the hash join DataFusion plans by default and
+/// the merge join it plans when hash joins are not preferred (Ballista).
+#[tokio::test]
+async fn a_join_left_on_the_cpu_records_why() {
+    for (config, node) in [
+        (SessionConfig::new(), "HashJoinExec"),
+        (merge_join_config(), "SortMergeJoinExec"),
+    ] {
+        for (sql, says) in [
+            (
+                "SELECT n.k, d.y FROM n LEFT JOIN d ON n.k = d.bk",
+                "join has no device kernel; the device join is inner only",
+            ),
+            (
+                "SELECT n.k, d.y FROM n JOIN d ON n.k = d.bk AND n.v < d.y",
+                "a condition besides its key equality",
+            ),
+            (
+                "SELECT t.k FROM t JOIN r ON t.k = r.rk AND t.s = r.name",
+                "2 key pairs; the device join takes exactly one",
+            ),
+            (
+                "SELECT r.name FROM t JOIN r ON t.s = r.name",
+                "is Utf8; the device join takes Int64 keys",
+            ),
+            (
+                "SELECT t.k FROM t JOIN r ON t.k IS NOT DISTINCT FROM r.rk",
+                "matches NULL keys to each other",
+            ),
+        ] {
+            let notes = placement_notes_with(config.clone(), sql).await;
+            assert!(
+                notes
+                    .iter()
+                    .any(|n| n.starts_with(&format!("{node}: ")) && n.contains(says)),
+                "{node}: {sql}: {notes:?}"
+            );
+        }
+    }
+}
+
+/// Ballista's session default, `prefer_hash_join = false`, under which
+/// DataFusion plans `SortMergeJoinExec`; four partitions so the merge join
+/// runs partitioned the way it does on a cluster.
+fn merge_join_config() -> SessionConfig {
+    SessionConfig::new()
+        .with_target_partitions(4)
+        .set_bool("datafusion.optimizer.prefer_hash_join", false)
 }

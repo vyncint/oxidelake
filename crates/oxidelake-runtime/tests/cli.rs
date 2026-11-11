@@ -612,6 +612,45 @@ fn explain_names_why_a_node_stayed_on_the_cpu() {
     assert!(!stdout.contains("placement notes"), "{stdout}");
 }
 
+/// `oxide explain`'s notes are accurate for a `!=` filter and present for a
+/// join the device cannot take (#94). The first listed `!=` among the
+/// comparisons the kernels implement; the second printed no notes section,
+/// as if the rule had never looked at the join.
+#[test]
+fn explain_notes_a_not_equal_filter_and_a_join_left_on_the_cpu() {
+    let dir = tempfile::tempdir().unwrap();
+    gen_data(dir.path(), 4_096);
+    let table_arg = format!("t={}", dir.path().display());
+    let explain = |query: &str| {
+        let assert = oxide()
+            .args([
+                "explain", "-q", query, "--table", &table_arg, "--target", "cuda",
+            ])
+            .assert()
+            .success();
+        String::from_utf8(assert.get_output().stdout.clone()).unwrap()
+    };
+
+    let stdout = explain("SELECT id FROM t WHERE k != 3");
+    assert!(
+        stdout.contains(
+            "placement notes (target cuda):\n  FilterExec: `!=` is not one of the \
+             comparisons the device kernels implement (=, <, <=, >, >=)\n"
+        ),
+        "{stdout}"
+    );
+
+    let stdout = explain("SELECT a.id, b.s FROM t a LEFT JOIN t b ON a.id = b.id");
+    assert!(
+        stdout.contains("placement notes (target cuda):"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("join has no device kernel; the device join is inner only"),
+        "{stdout}"
+    );
+}
+
 // --- observability (#33) ----------------------------------------------------
 
 /// `RUST_LOG=info oxide sql …` prints one line per query with the mode, the

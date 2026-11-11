@@ -67,6 +67,15 @@ versions (0.x) may contain breaking changes; they are always listed under a
   the probe key) and an empty `ProjectionExec: expr=[]` above it drops the
   column again, so the filter and the join still run on the device.
 
+- **`oxide explain`'s placement notes are accurate for `!=` and present for
+  joins** (#94). The note for a `!=` filter listed `!=` among the
+  comparisons the device kernels implement, which have none for it; it now
+  lists `=, <, <=, >, >=`, read from the table the lowering itself uses. A
+  hash or merge join left on the CPU for its join type, a condition besides
+  its keys, NULL-matching keys, more than one key pair or a non-`Int64` key
+  printed no note at all; each now says which, e.g. ``HashJoinExec: a
+  `Left` join has no device kernel; the device join is inner only``.
+
 ### Security
 
 - **thrift is out of the dependency graph** (#4, #54). parquet 59 decodes

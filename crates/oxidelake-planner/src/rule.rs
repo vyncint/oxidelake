@@ -10,7 +10,7 @@ use datafusion::common::{JoinType, NullEquality, ScalarValue};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::Operator;
 use datafusion::physical_expr::expressions::{BinaryExpr, Column, Literal};
-use datafusion::physical_expr::{PhysicalExpr, ScalarFunctionExpr};
+use datafusion::physical_expr::{PhysicalExpr, PhysicalExprRef, ScalarFunctionExpr};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
@@ -294,24 +294,24 @@ impl HardwarePlacementRule {
     /// is re-expressed as a projection over our `probe ++ build` order, so the
     /// output schema is identical.
     fn lower_join(&self, join: &HashJoinExec) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        if *join.join_type() != JoinType::Inner
-            || join.filter().is_some()
-            || join.null_equality() != NullEquality::NullEqualsNothing
-            || join.on().len() != 1
-        {
+        if let Some(why) = join_shape_refusal(
+            *join.join_type(),
+            join.filter().is_some(),
+            join.null_equality(),
+            join.on(),
+        ) {
+            self.skip("HashJoinExec", why);
             return Ok(None);
         }
         let (build, probe) = (join.left(), join.right());
         let (bs, ps) = (build.schema(), probe.schema());
-        let (b, p) = &join.on()[0];
-        let (Some(build_key), Some(probe_key)) = (column_index(b), column_index(p)) else {
-            return Ok(None);
+        let (build_key, probe_key) = match join_key_columns(join.on(), &bs, &ps) {
+            Ok(keys) => keys,
+            Err(why) => {
+                self.skip("HashJoinExec", why);
+                return Ok(None);
+            }
         };
-        if bs.field(build_key).data_type() != &DataType::Int64
-            || ps.field(probe_key).data_type() != &DataType::Int64
-        {
-            return Ok(None);
-        }
         let (bl, pl) = (bs.fields().len(), ps.fields().len());
         // DataFusion's full output order is build ++ probe.
         let full: Vec<_> = bs
@@ -393,27 +393,31 @@ impl HardwarePlacementRule {
     /// `left ++ right`, so no side swap is needed. The `SortExec`s DataFusion
     /// inserted for the merge are dropped when they carry no `LIMIT`.
     fn lower_sort_merge_join(&self, join: &SortMergeJoinExec) -> Result<Option<GpuHashJoinExec>> {
-        if join.join_type() != JoinType::Inner
-            || join.filter().is_some()
-            || join.null_equality() != NullEquality::NullEqualsNothing
-            || join.on().len() != 1
-        {
+        if let Some(why) = join_shape_refusal(
+            join.join_type(),
+            join.filter().is_some(),
+            join.null_equality(),
+            join.on(),
+        ) {
+            self.skip("SortMergeJoinExec", why);
             return Ok(None);
         }
         let (left, right) = (strip_sort(join.left()), strip_sort(join.right()));
         let (ls, rs) = (left.schema(), right.schema());
         if join.schema().fields().len() != ls.fields().len() + rs.fields().len() {
+            self.skip(
+                "SortMergeJoinExec",
+                "the merge join's output is not its two inputs side by side",
+            );
             return Ok(None);
         }
-        let (l, r) = &join.on()[0];
-        let (Some(lk), Some(rk)) = (column_index(l), column_index(r)) else {
-            return Ok(None);
+        let (lk, rk) = match join_key_columns(join.on(), &ls, &rs) {
+            Ok(keys) => keys,
+            Err(why) => {
+                self.skip("SortMergeJoinExec", why);
+                return Ok(None);
+            }
         };
-        if ls.field(lk).data_type() != &DataType::Int64
-            || rs.field(rk).data_type() != &DataType::Int64
-        {
-            return Ok(None);
-        }
         let exec = match GpuHashJoinExec::try_new(left, right, lk, rk, self.target) {
             Ok(exec) => exec,
             Err(err) => {
@@ -559,15 +563,98 @@ fn flip(op: Comparison) -> Comparison {
     }
 }
 
+/// The DataFusion comparisons the device filter implements, with the kernel
+/// comparison each lowers to. The lowering and the note that names what it
+/// accepts both read this table, so the note cannot list an operator the
+/// lowering refuses (it listed `!=`, #94).
+const COMPARISONS: [(Operator, Comparison); 5] = [
+    (Operator::Eq, Comparison::Eq),
+    (Operator::Lt, Comparison::Lt),
+    (Operator::LtEq, Comparison::LtEq),
+    (Operator::Gt, Comparison::Gt),
+    (Operator::GtEq, Comparison::GtEq),
+];
+
 fn comparison(op: &Operator) -> Option<Comparison> {
-    Some(match op {
-        Operator::Eq => Comparison::Eq,
-        Operator::Lt => Comparison::Lt,
-        Operator::LtEq => Comparison::LtEq,
-        Operator::Gt => Comparison::Gt,
-        Operator::GtEq => Comparison::GtEq,
-        _ => return None,
-    })
+    COMPARISONS
+        .iter()
+        .find(|(implemented, _)| implemented == op)
+        .map(|&(_, kernel)| kernel)
+}
+
+/// Why the device join cannot take a join of this shape, whatever its keys
+/// are, or `None` when it can. Each early return of the join lowerings says
+/// which one it was (#94): a skipped join otherwise looks exactly like one
+/// the rule never looked at.
+fn join_shape_refusal(
+    join_type: JoinType,
+    has_filter: bool,
+    null_equality: NullEquality,
+    on: &[(PhysicalExprRef, PhysicalExprRef)],
+) -> Option<String> {
+    if join_type != JoinType::Inner {
+        return Some(format!(
+            "a `{join_type}` join has no device kernel; the device join is inner only"
+        ));
+    }
+    if has_filter {
+        return Some(
+            "the join has a condition besides its key equality, which the device \
+             join cannot evaluate"
+                .to_owned(),
+        );
+    }
+    if null_equality != NullEquality::NullEqualsNothing {
+        return Some(
+            "the join matches NULL keys to each other (IS NOT DISTINCT FROM); the \
+             device join never matches a NULL key"
+                .to_owned(),
+        );
+    }
+    if on.len() != 1 {
+        return Some(format!(
+            "the join has {} key pairs; the device join takes exactly one",
+            on.len()
+        ));
+    }
+    None
+}
+
+/// The column indices of a one-key join's left and right keys, or why the
+/// device join cannot take them.
+fn join_key_columns(
+    on: &[(PhysicalExprRef, PhysicalExprRef)],
+    left: &Schema,
+    right: &Schema,
+) -> std::result::Result<(usize, usize), String> {
+    let [(l, r)] = on else {
+        return Err(format!(
+            "the join has {} key pairs; the device join takes exactly one",
+            on.len()
+        ));
+    };
+    let mut keys = [0; 2];
+    for (slot, (expr, schema)) in keys.iter_mut().zip([(l, left), (r, right)]) {
+        let Some(index) = column_index(expr) else {
+            return Err(format!(
+                "the join key `{expr}` is an expression; the device join takes plain columns"
+            ));
+        };
+        let Some(field) = schema.fields().get(index) else {
+            return Err(format!(
+                "join key column {index} is out of range for its input"
+            ));
+        };
+        if field.data_type() != &DataType::Int64 {
+            return Err(format!(
+                "the join key `{}` is {}; the device join takes Int64 keys",
+                field.name(),
+                field.data_type()
+            ));
+        }
+        *slot = index;
+    }
+    Ok((keys[0], keys[1]))
 }
 
 fn literal(expr: &Arc<dyn PhysicalExpr>) -> Option<Lit> {
@@ -604,10 +691,14 @@ fn try_lower_predicate(
         return Ok(Predicate::and(l, r));
     }
     let Some(op) = comparison(binary.op()) else {
+        let implemented: Vec<&str> = COMPARISONS
+            .iter()
+            .map(|(_, kernel)| kernel.symbol())
+            .collect();
         return Err(format!(
-            "`{}` is not one of the comparisons the device kernels implement \
-             (=, !=, <, <=, >, >=)",
-            binary.op()
+            "`{}` is not one of the comparisons the device kernels implement ({})",
+            binary.op(),
+            implemented.join(", ")
         ));
     };
     let (column, lit, op) = match (column_index(binary.left()), literal(binary.right())) {
