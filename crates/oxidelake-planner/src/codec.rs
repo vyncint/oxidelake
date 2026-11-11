@@ -13,7 +13,9 @@ use datafusion::arrow::datatypes::{Field, Schema};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion_proto::physical_plan::{DefaultPhysicalExtensionCodec, PhysicalExtensionCodec};
+use datafusion_proto::physical_plan::{
+    DefaultPhysicalExtensionCodec, PhysicalExtensionCodec, PhysicalProtoConverterExtension,
+};
 use oxidelake_compute::{
     AggregateSpec, DistanceMetric, GpuAggregateExec, GpuFilterExec, GpuHashJoinExec,
     GpuVectorDistanceExec, Predicate,
@@ -310,6 +312,7 @@ impl PhysicalExtensionCodec for OxidePhysicalCodec {
         buf: &[u8],
         inputs: &[Arc<dyn ExecutionPlan>],
         ctx: &TaskContext,
+        proto_converter: &dyn PhysicalProtoConverterExtension,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if buf.len() > HEADER && &buf[..MAGIC.len()] == MAGIC {
             let version = buf[MAGIC.len()];
@@ -324,10 +327,15 @@ impl PhysicalExtensionCodec for OxidePhysicalCodec {
             })?;
             return Self::build(node, inputs);
         }
-        self.inner.try_decode(buf, inputs, ctx)
+        self.inner.try_decode(buf, inputs, ctx, proto_converter)
     }
 
-    fn try_encode(&self, node: Arc<dyn ExecutionPlan>, buf: &mut Vec<u8>) -> Result<()> {
+    fn try_encode(
+        &self,
+        node: Arc<dyn ExecutionPlan>,
+        buf: &mut Vec<u8>,
+        proto_converter: &dyn PhysicalProtoConverterExtension,
+    ) -> Result<()> {
         match Self::describe(node.as_ref()) {
             Some(gpu) => {
                 buf.extend_from_slice(MAGIC);
@@ -339,7 +347,7 @@ impl PhysicalExtensionCodec for OxidePhysicalCodec {
                 buf.extend_from_slice(&payload);
                 Ok(())
             }
-            None => self.inner.try_encode(node, buf),
+            None => self.inner.try_encode(node, buf, proto_converter),
         }
     }
 }

@@ -7,20 +7,20 @@ The pins live in [SPEC.md §4](SPEC.md). This page records *why* those numbers, 
 1. **The chain has one root: Ballista.** Its documentation states: "Make sure the version of `datafusion` is the same as `ballista`'s!" Ballista fixes the `datafusion` / `datafusion-proto` major; DataFusion fixes `arrow` / `parquet` / `object_store`; `arrow-flight`, `tonic` and `prost` arrive transitively through Ballista and are **not declared directly** ([ADR-0013](decisions/ADR-0013-cluster-mode-on-ballista.md)).
 2. Never depend on `datafusion-*` sub-crates — use `datafusion::` re-exports. Single exception: `datafusion-proto`, required for the plan codec, pinned to the identical version ([ADR-0009](decisions/ADR-0009-datafusion-reexports.md)).
 3. Gate: `cargo tree --workspace -d -e normal` shows no duplicate `arrow-*`, `parquet`, `datafusion*`, `object_store`, `tonic` or `prost` majors.
-4. Bump the whole chain or nothing. DataFusion 55 exists (2026-08) but Ballista is on 54 — Ballista wins until it moves.
-5. `rust-version` is the **lockfile's** floor, not the direct dependencies' (2026-09-02: 1.94.1). `cargo deny check` gates advisories, licenses and sources; an advisory that cannot be fixed within the pinned chain is ignored only with a written reason in `deny.toml` (today: `quick-xml` behind `object_store`'s unused cloud backends, `paste` as a compile-time proc-macro) and re-examined at every chain bump. Dependabot proposes minor/patch updates weekly and is told to leave the chain's majors alone.
+4. Bump the whole chain or nothing, and Ballista decides when: DataFusion 55 was published in 2026-08, but the chain moved only when Ballista 55.0.0 (2026-10-06) did. Ballista wins until it moves.
+5. `rust-version` is the **lockfile's** floor, not the direct dependencies' (2026-09-02: 1.94.1, unchanged by the Ballista 55 bump, whose chain declares 1.94.0). `cargo deny check` gates advisories, licenses and sources; an advisory that cannot be fixed within the pinned chain is ignored only with a written reason in `deny.toml` (today: `quick-xml` behind `object_store`'s unused cloud backends, `paste` as a compile-time proc-macro of the `metal` crate oxmera pulls on macOS; the thrift advisory left with parquet 58 at the Ballista 55 bump, #4) and re-examined at every chain bump. Dependabot proposes minor/patch updates weekly and is told to leave the chain's majors alone.
 
-## Evidence (crates.io, 2026-08-25)
+## Evidence (crates.io, 2026-11-11 — the Ballista 55 bump; the 54 set it replaced was resolved 2026-08-25)
 
 | Crate | Pin | Requires / pairs with | Notes |
 |---|---|---|---|
-| `ballista`, `ballista-core`, `ballista-scheduler`, `ballista-executor` | 54 (54.1.0, 2026-08-09) | `datafusion ^54`, `datafusion-proto ^54`, `arrow-flight ^58.3`, `object_store ^0.13.2`, `tonic ^0.14`, `prost ^0.14` | Declares MSRV 1.88, but `ballista-core` bundles the AWS SDK (`aws-config` → `aws-types` …) whose locked versions need **rustc 1.94.1** — the lockfile's true floor and therefore the workspace `rust-version` (verified by `make msrv` / the `msrv` CI job) |
-| `datafusion` | 54 (54.1.0) | `arrow ^58.3.0`, `parquet ^58.3.0`, `object_store ^0.13.2`, `tokio ^1.52`, `sqlparser ^0.62` | MSRV 1.88 |
-| `datafusion-proto` | 54 (54.1.0) | `arrow ^58.3.0`, `prost ^0.14.1` | `PhysicalExtensionCodec` for `Gpu*Exec` |
-| `arrow` | 58 (58.4.0) | — | default features + `prettyprint`; `ffi` only under `oxidelake-api/python`; MSRV 1.85 |
-| `parquet` | 58 (58.4.0) | — | default features cover arrow, snap, lz4, zstd; Bloom filters and page index are built in; MSRV 1.85 |
+| `ballista`, `ballista-core`, `ballista-scheduler`, `ballista-executor` | 55 (55.0.0, 2026-10-06) | `datafusion ^55`, `datafusion-proto ^55`, `arrow-flight ^59.2`, `object_store ^0.13.2`, `tonic ^0.14`, `prost ^0.14` | Declares MSRV 1.94.0, but `ballista-core` bundles the AWS SDK (`aws-config` → `aws-types` …) whose locked versions need **rustc 1.94.1** — the lockfile's true floor and therefore the workspace `rust-version` (verified by `make msrv` / the `msrv` CI job) |
+| `datafusion` | 55 (55.2.0, 2026-10-07) | `arrow ^59.2.0`, `parquet ^59.2.0`, `object_store ^0.13.2`, `tokio ^1.52`, `sqlparser ^0.62` | MSRV 1.94.0 |
+| `datafusion-proto` | 55 (55.2.0) | `arrow ^59.2.0`, `prost ^0.14.1` | `PhysicalExtensionCodec` for `Gpu*Exec`; since 55 its `try_decode`/`try_encode` take a `PhysicalProtoConverterExtension`, which our codec passes through to Ballista's |
+| `arrow` | 59 (59.3.2) | — | default features + `prettyprint`; `ffi` only under `oxidelake-api/python`; MSRV 1.85 |
+| `parquet` | 59 (59.3.2) | — | default features cover arrow, snap, lz4, zstd; Bloom filters and page index are built in; **no `thrift` dependency** from 59 (58 pulled `thrift ^0.17` and its advisory, #4); MSRV 1.85 |
 | `object_store` | 0.13 | — | `ObjectStore` trait implemented by `UringLocalFileSystem` |
-| `arrow-flight` / `tonic` / `prost` | *(transitive)* | arrow-flight 58.4 → `tonic ^0.14.1`, `prost ^0.14.1` | brought by Ballista; checked only by the duplicate gate |
+| `arrow-flight` / `tonic` / `prost` | *(transitive)* | arrow-flight 59.3 → `tonic ^0.14.1`, `prost ^0.14.1` | brought by Ballista; checked only by the duplicate gate |
 | `tokio` | 1.52+ (`full`) | — | DataFusion's floor |
 | `async-trait` | 0.1 | — | only to implement `object_store`'s `ObjectStore` (a foreign `#[async_trait]` trait); never for our own traits |
 | `ratatui` | 0.30 | `ratatui-crossterm ^0.1.2`; dev-dep `crossterm ^0.29` | enable feature `crossterm_0_29`; MSRV 1.88 |
@@ -39,7 +39,7 @@ The pins live in [SPEC.md §4](SPEC.md). This page records *why* those numbers, 
 | `tracing` / `tracing-subscriber` | 0.1 / 0.3 (`env-filter`) | — | |
 | `rayon`, `futures`, `bytes`, `clap` (`derive`), `serde` (`derive`), `tempfile` | 1 / 0.3 / 1 / 4 / 1 / 3 | — | |
 
-Considered and not adopted in v1: **Lance** 10.0.0 (2026-08-07) requires `datafusion ^54.0.0` and `arrow ^58.0.0` — coherent with this chain today — but adds a third coupling to DataFusion's major and its ANN indices are CPU-side; documented as a v2 option ([ADR-0014](decisions/ADR-0014-parquet-and-arrow-ipc-not-a-custom-format.md)). `async-trait` for our own traits ([ADR-0005](decisions/ADR-0005-object-safe-sync-gpubackend.md)), `std::simd` ([ADR-0002](decisions/ADR-0002-stable-toolchain-no-std-simd.md)), `cuda-oxide` ([ADR-0003](decisions/ADR-0003-cudarc-dynamic-loading-nvrtc.md)), `tokio-uring` ([ADR-0007](decisions/ADR-0007-io-uring-crate-dedicated-thread.md)), `metal` / `metal-rs` ([ADR-0004](decisions/ADR-0004-objc2-metal-target-gated.md)), `memmap2` and `xxhash-rust` (no longer needed without a private format).
+Considered and not adopted in v1: **Lance** 10.0.0 (2026-08-07) required `datafusion ^54.0.0` and `arrow ^58.0.0` — coherent with the chain of the time — but adds a third coupling to DataFusion's major and its ANN indices are CPU-side; documented as a v2 option ([ADR-0014](decisions/ADR-0014-parquet-and-arrow-ipc-not-a-custom-format.md)). `async-trait` for our own traits ([ADR-0005](decisions/ADR-0005-object-safe-sync-gpubackend.md)), `std::simd` ([ADR-0002](decisions/ADR-0002-stable-toolchain-no-std-simd.md)), `cuda-oxide` ([ADR-0003](decisions/ADR-0003-cudarc-dynamic-loading-nvrtc.md)), `tokio-uring` ([ADR-0007](decisions/ADR-0007-io-uring-crate-dedicated-thread.md)), `metal` / `metal-rs` ([ADR-0004](decisions/ADR-0004-objc2-metal-target-gated.md)), `memmap2` and `xxhash-rust` (no longer needed without a private format).
 
 ## Re-deriving the chain
 

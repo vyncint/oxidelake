@@ -156,7 +156,10 @@ pub fn executor_config(
         scheduler_port,
         port,
         grpc_port,
-        concurrent_tasks: concurrent_tasks.unwrap_or(defaults.concurrent_tasks),
+        // Ballista 55 renamed `concurrent_tasks` to `vcores`: still the number
+        // of tasks this executor runs at once, and `0` still means every
+        // available core (`start_executor_process` resolves it).
+        vcores: concurrent_tasks.unwrap_or(defaults.vcores),
         work_dir,
         override_physical_codec: Some(oxide_codec()),
         override_function_registry: Some(Arc::new(function_registry())),

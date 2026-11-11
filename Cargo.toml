@@ -5,8 +5,9 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.2.0"
 edition = "2024"
-# The lockfile's floor (Ballista's bundled AWS SDK crates need 1.94.1), not
-# the 1.88 of the direct dependencies; verified by `make msrv` / the CI job.
+# The lockfile's floor (Ballista's bundled AWS SDK crates need 1.94.1; the
+# chain itself declares 1.94.0), not the direct dependencies'; verified by
+# `make msrv` / the CI job.
 rust-version = "1.94.1"
 license = "Apache-2.0"
 authors = ["Vyncint Ng <vyncint@icloud.com>"]
@@ -34,15 +35,15 @@ oxidelake-runtime = { path = "crates/oxidelake-runtime", version = "0.2.0" }
 oxidelake-tui = { path = "crates/oxidelake-tui", version = "0.2.0" }
 oxidelake-api = { path = "crates/oxidelake-api", version = "0.2.0" }
 
-# data plane — Ballista 54 is the root of this chain
-ballista = "54"                      # client: SessionContext::remote / standalone
-ballista-core = "54"
-ballista-scheduler = "54"
-ballista-executor = "54"
-datafusion = "54"
-datafusion-proto = "54"              # PhysicalExtensionCodec for Gpu*Exec; always identical to datafusion
-arrow = { version = "58", features = ["prettyprint"] }
-parquet = "58"                       # lake format: statistics, page index, Bloom filters
+# data plane — Ballista 55 is the root of this chain
+ballista = "55"                      # client: SessionContext::remote / standalone
+ballista-core = "55"
+ballista-scheduler = "55"
+ballista-executor = "55"
+datafusion = "55"
+datafusion-proto = "55"              # PhysicalExtensionCodec for Gpu*Exec; always identical to datafusion
+arrow = { version = "59", features = ["prettyprint"] }
+parquet = "59"                       # lake format: statistics, page index, Bloom filters
 object_store = "0.13"                # ObjectStore trait; io_uring local store implements it
 # async
 tokio = { version = "1.52", features = ["full"] }

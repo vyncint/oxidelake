@@ -17,7 +17,7 @@ use datafusion::datasource::MemTable;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::physical_plan::{ExecutionPlan, collect, displayable};
 use datafusion::prelude::SessionContext;
-use datafusion_proto::physical_plan::PhysicalExtensionCodec;
+use datafusion_proto::physical_plan::{DefaultPhysicalProtoConverter, PhysicalExtensionCodec};
 use oxidelake_core::BackendKind;
 use oxidelake_planner::{HardwarePlacementRule, OxidePhysicalCodec, physical_optimizer_rules};
 
@@ -290,11 +290,24 @@ async fn codec_round_trips_every_node() {
         while let Some(node) = stack.pop() {
             if OxidePhysicalCodec::describe(node.as_ref()).is_some() {
                 let mut buf = Vec::new();
-                codec.try_encode(Arc::clone(&node), &mut buf).unwrap();
+                codec
+                    .try_encode(
+                        Arc::clone(&node),
+                        &mut buf,
+                        &DefaultPhysicalProtoConverter {},
+                    )
+                    .unwrap();
                 assert!(buf.starts_with(b"OXGP"));
                 let children: Vec<Arc<dyn ExecutionPlan>> =
                     node.children().into_iter().cloned().collect();
-                let back = codec.try_decode(&buf, &children, &ctx.task_ctx()).unwrap();
+                let back = codec
+                    .try_decode(
+                        &buf,
+                        &children,
+                        &ctx.task_ctx(),
+                        &DefaultPhysicalProtoConverter {},
+                    )
+                    .unwrap();
                 assert_eq!(
                     displayable(back.as_ref()).one_line().to_string(),
                     displayable(node.as_ref()).one_line().to_string()
@@ -309,7 +322,12 @@ async fn codec_round_trips_every_node() {
     // Non-Oxide payloads and corrupt magic payloads are handled.
     assert!(
         codec
-            .try_decode(b"OXGP\x09garbage", &[], &ctx.task_ctx())
+            .try_decode(
+                b"OXGP\x09garbage",
+                &[],
+                &ctx.task_ctx(),
+                &DefaultPhysicalProtoConverter {},
+            )
             .is_err()
     );
 }
