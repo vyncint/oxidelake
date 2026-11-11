@@ -94,7 +94,10 @@ invalid classification fails the gate.
 `make ci-scripts` covers source deletion/rename handling, malformed results,
 each required job's failures, Metal build-argument reuse, and stress coverage.
 It also verifies the metadata checker under the platform's Bash and the MSRV
-target with a standalone Cargo ahead of the Rustup proxy on `PATH`.
+target with a standalone Cargo ahead of the Rustup proxy on `PATH`, and runs
+the release's crates.io baseline lookup against a local stand-in answering
+200, 404, 429 and 5xx: only a 200 lets `cargo-semver-checks` run, and nothing
+skips it.
 `make stress-tui` builds release test targets once per OS, then runs thread
 counts 1, 4 and 16 with 20/40/40 percent of `ITERS` (default 100), at least once
 per count. The first failing build or iteration fails the workflow.

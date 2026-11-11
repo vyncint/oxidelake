@@ -1,21 +1,69 @@
 """Regression tests for selective gates, feature reuse, and stress coverage."""
 
 from collections import Counter
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 from copy import deepcopy
+import http.server
 import importlib.util
 import io
 import json
 import os
 from pathlib import Path
+import socket
 import subprocess
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
 
 SCRIPTS = Path(__file__).resolve().parent
 ROOT = SCRIPTS.parent.parent
+
+
+def workflow_job(workflow, job):
+    """The lines of `job` in .github/workflows/`workflow`, its key line included.
+
+    Indentation-based rather than a YAML parse: the standard library has no
+    YAML reader, and these files keep every job at two spaces.
+    """
+    lines = (ROOT / ".github/workflows" / workflow).read_text().splitlines()
+    start = lines.index(f"  {job}:")
+    end = next((i for i in range(start + 1, len(lines))
+                if lines[i].startswith("  ") and not lines[i].startswith("   ") and lines[i].strip()
+                and not lines[i].lstrip().startswith("#")), len(lines))
+    return lines[start:end]
+
+
+@contextmanager
+def stand_in(statuses):
+    """A local HTTP server answering with `statuses` in turn, then the last one.
+
+    Yields its base URL and the list of paths it was asked for.
+    """
+    asked = []
+    remaining = list(statuses)
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            asked.append(self.path)
+            status = remaining.pop(0) if len(remaining) > 1 else remaining[0]
+            self.send_response(status)
+            self.end_headers()
+            self.wfile.write(b'{"errors":[{"detail":"stand-in"}]}')
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}", asked
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
 
 
 def load_script(name):
@@ -290,6 +338,66 @@ class ToolchainTests(unittest.TestCase):
             run = subprocess.run(["make", "msrv"], cwd=root, text=True, capture_output=True,
                                  env={**os.environ, "PATH": directory + os.pathsep + os.environ["PATH"]})
             self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+
+
+class SemverBaselineTests(unittest.TestCase):
+    """release.yml never skips cargo-semver-checks on a crates.io error (#130).
+
+    The step this replaced read every answer but a 200 as "first release" and
+    skipped the check, so a 429 or a 503 switched the gate off before publish.
+    """
+
+    def lookup(self, url, attempts=3):
+        return subprocess.run(
+            ["bash", str(SCRIPTS / "crates-io-baseline.sh"), "oxidelake-core"],
+            env={**os.environ, "CRATES_IO_API": url, "BASELINE_ATTEMPTS": str(attempts),
+                 "BASELINE_PAUSE": "0"},
+            capture_output=True, text=True,
+        )
+
+    def test_a_published_baseline_passes(self):
+        with stand_in([200]) as (url, asked):
+            run = self.lookup(url)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertEqual(asked, ["/crates/oxidelake-core"])
+
+    def test_an_unavailable_registry_fails_after_retrying(self):
+        for status in (503, 429, 500):
+            with self.subTest(status=status), stand_in([status]) as (url, asked):
+                run = self.lookup(url, attempts=3)
+                self.assertNotEqual(run.returncode, 0, run.stdout)
+                self.assertIn("::error::", run.stdout)
+                self.assertIn(f"HTTP {status}", run.stdout)
+                self.assertEqual(len(asked), 3, "a 429 or a 5xx is retried before failing")
+
+    def test_a_blip_is_retried_and_then_passes(self):
+        with stand_in([503, 429, 200]) as (url, asked):
+            run = self.lookup(url, attempts=4)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertEqual(len(asked), 3)
+
+    def test_a_missing_crate_is_an_error_not_a_first_release(self):
+        for status in (404, 301, 403):
+            with self.subTest(status=status), stand_in([status]) as (url, asked):
+                run = self.lookup(url)
+                self.assertNotEqual(run.returncode, 0, run.stdout)
+                self.assertIn("::error::", run.stdout)
+                self.assertEqual(len(asked), 1, "only an overloaded registry is worth asking again")
+
+    def test_no_answer_at_all_fails(self):
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        run = self.lookup(f"http://127.0.0.1:{port}", attempts=2)
+        self.assertNotEqual(run.returncode, 0, run.stdout)
+        self.assertIn("HTTP 000", run.stdout)
+
+    def test_the_release_workflow_runs_the_check_unconditionally(self):
+        job = workflow_job("release.yml", "semver")
+        self.assertIn("        run: .github/scripts/crates-io-baseline.sh oxidelake-core", job)
+        self.assertTrue(any("obi1kenobi/cargo-semver-checks-action@" in line for line in job))
+        conditions = [line.strip() for line in job if line.strip().startswith("if:")]
+        self.assertEqual(conditions, [], "no step of the semver job may be skipped")
 
 
 if __name__ == "__main__":

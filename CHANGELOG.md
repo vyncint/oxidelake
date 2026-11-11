@@ -410,6 +410,16 @@ versions (0.x) may contain breaking changes; they are always listed under a
   `build_description()` are public, and `make test-mixed-build` runs both
   cases with real binaries.
 
+### Fixed
+
+- **A crates.io error can no longer switch the release's semver check off.**
+  `release.yml` read every answer but HTTP 200 — a 429, a 503 — as "first
+  release, no baseline" and skipped `cargo-semver-checks` minutes before
+  `cargo publish`. Every crate has been published since 0.1.0, so the job
+  now fails unless crates.io confirms the baseline, after retrying a 429 or
+  a 5xx; a release that hits an outage is re-run rather than published
+  unchecked (#130).
+
 ### Security
 
 - **thrift is out of the dependency graph** (#4, #54). parquet 59 decodes

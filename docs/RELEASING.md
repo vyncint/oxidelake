@@ -68,8 +68,13 @@ The tag triggers `release.yml`, which:
 2. re-runs the full CI gate without build caches or documentation skips
    (`workflow_call` into `ci.yml`); ordinary main CI cancellation does not
    cancel this release gate;
-3. runs `cargo-semver-checks` against the last published release — skipped on
-   the first release, when there is no baseline;
+3. runs `cargo-semver-checks` against the last published release. It is never
+   skipped: every crate has been on crates.io since 0.1.0, so the job first
+   confirms the baseline is there and fails if crates.io cannot say so — a
+   429 or a 5xx is retried, then fails the job, and a 404 fails at once
+   (`.github/scripts/crates-io-baseline.sh`; it used to read either as "first
+   release" and skip the check, #130). Nothing has been published at that
+   point, so the remedy is a re-run;
 4. publishes the nine crates in dependency order (`core → memory → device →
    compute → storage → planner → tui → runtime → api`), skipping any already
    on the registry so a rate-limited run is resumable via `workflow_dispatch`;
