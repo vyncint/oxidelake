@@ -6,9 +6,10 @@
 //! query could fall back to the CPU.
 //!
 //! No GPU is needed. The test builds a stub `libcuda.so.1` (the driver entry
-//! points detection reaches, each succeeding and reporting one device) and
-//! re-runs this binary with the stub first on `LD_LIBRARY_PATH`, which the
-//! loader reads once at process start — hence the child process.
+//! points detection reaches, each succeeding and reporting one device, of
+//! compute capability 0.0) and re-runs this binary with the stub first on
+//! `LD_LIBRARY_PATH`, which the loader reads once at process start — hence
+//! the child process.
 //!
 //! Linux with a C compiler (`$CC`, default `cc`); run with
 //! `cargo test -p oxidelake-device --features cuda --test stub_driver`.
@@ -73,6 +74,14 @@ fn a_driver_without_nvrtc_selects_the_cpu_and_never_panics() {
     );
     // cudarc tries `libcuda.so` before `libcuda.so.1`.
     std::os::unix::fs::symlink("libcuda.so.1", dir.join("libcuda.so")).unwrap();
+    // Prepended, not replaced: an NVRTC this machine finds through the
+    // variable must stay visible to the child, or a host that has one would
+    // only ever run the missing-NVRTC half of the scenario.
+    let mut path = dir.clone().into_os_string();
+    if let Some(inherited) = std::env::var_os("LD_LIBRARY_PATH") {
+        path.push(":");
+        path.push(inherited);
+    }
 
     let out = Command::new(std::env::current_exe().unwrap())
         .args([
@@ -82,7 +91,7 @@ fn a_driver_without_nvrtc_selects_the_cpu_and_never_panics() {
             "--nocapture",
             "--test-threads=1",
         ])
-        .env("LD_LIBRARY_PATH", &dir)
+        .env("LD_LIBRARY_PATH", path)
         .env(CHILD, "1")
         .env_remove("OXIDE_BACKEND")
         .output()
@@ -112,12 +121,14 @@ fn stub_driver_scenario() {
         CudaBackend::driver_present(),
         "the stub libcuda was not found on LD_LIBRARY_PATH"
     );
-    // A machine that has a real NVRTC cannot reproduce the missing-NVRTC shape.
-    if CudaBackend::nvrtc_present() {
-        println!("stub driver scenario: ok (skipped: this machine has a real libnvrtc)");
-        return;
-    }
-    let expected = "libnvrtc";
+    // A machine that has a real NVRTC cannot reproduce the missing-NVRTC
+    // shape; there the stub's compute capability 0.0 is what disqualifies it
+    // (#107), and the rest of the scenario must hold all the same.
+    let expected = if CudaBackend::nvrtc_present() {
+        "compute capability 0.0"
+    } else {
+        "libnvrtc"
+    };
 
     let why = CudaBackend::probe(0).unwrap_err();
     assert!(why.to_string().contains(expected), "{why}");

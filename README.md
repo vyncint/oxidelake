@@ -162,6 +162,9 @@ Running the CUDA backend needs the NVIDIA driver **and** NVRTC, which ships
 with the CUDA toolkit rather than the driver (the `cuda-nvrtc` package). A
 machine with the driver alone is detected as a CPU machine — `RUST_LOG=warn`
 says why — and `OXIDE_BACKEND=cuda` there fails at startup naming `libnvrtc`.
+The GPU must have compute capability 7.0 (Volta) or newer, and the NVRTC must
+be able to compile for it (CUDA 13 can no longer target Volta); otherwise CUDA
+is passed over, or refused, the same way.
 
 ## Configuration
 

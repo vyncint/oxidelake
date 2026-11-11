@@ -73,7 +73,7 @@ flowchart LR
 
 `Arc<dyn GpuBackend>` is selected at startup by `HardwareDetector` (CUDA → Metal → CPU, overridable with `OXIDE_BACKEND`). The trait is object-safe and synchronous; asynchrony lives on device streams ([ADR-0005](decisions/ADR-0005-object-safe-sync-gpubackend.md)). `CpuBackend` is always present and fully functional — it is the semantic reference the GPU backends must match in the conformance suite.
 
-Kernels ship as source: `.cu` compiled at runtime with NVRTC (PTX cached per device), `.metal` compiled with `newLibraryWithSource`. No `nvcc`, no Xcode step ([ADR-0003](decisions/ADR-0003-cudarc-dynamic-loading-nvrtc.md), [ADR-0004](decisions/ADR-0004-objc2-metal-target-gated.md)).
+Kernels ship as source: `.cu` compiled at runtime with NVRTC for the device's own architecture (PTX cached per device; compute capability 7.0 or newer), `.metal` compiled with `newLibraryWithSource`. No `nvcc`, no Xcode step ([ADR-0003](decisions/ADR-0003-cudarc-dynamic-loading-nvrtc.md), [ADR-0004](decisions/ADR-0004-objc2-metal-target-gated.md)).
 
 ## Storage
 

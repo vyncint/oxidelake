@@ -7,6 +7,14 @@ toolkit is needed to build OxideLake. To *run* them a machine needs the NVIDIA d
 and NVRTC (`libnvrtc`, part of the CUDA toolkit rather than the driver); with the
 driver alone, detection picks the CPU and `OXIDE_BACKEND=cuda` fails naming `libnvrtc`.
 
+Every module is compiled for the GPU's own architecture (`--gpu-architecture=compute_XY`
+from its compute capability, or the newest older target the NVRTC supports), never for
+NVRTC's default: that is `compute_52` under CUDA 12.x, where `aggregation.cu`'s
+`atomicAdd(double*)` does not exist. GPUs below compute capability 7.0 are refused —
+`aggregation.cu`'s slot claim spins on a word another lane of its warp may hold, which
+needs independent thread scheduling (Volta or newer, in code compiled for `compute_70`
+or later).
+
 Conventions (docs/SPEC.md §2.3):
 
 - One `extern "C" __global__` entry point per operator, C ABI, no templates in signatures.
