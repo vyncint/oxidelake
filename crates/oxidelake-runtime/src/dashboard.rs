@@ -11,6 +11,7 @@ use std::sync::Arc;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::util::display::{ArrayFormatter, FormatOptions};
+use datafusion::common::TableReference;
 use datafusion::physical_plan::{ExecutionPlan, collect, displayable};
 use oxidelake_compute::{GpuAggregateExec, GpuFilterExec, GpuHashJoinExec, GpuVectorDistanceExec};
 use oxidelake_core::telemetry::{OperatorSnapshot, PlanNodeSummary};
@@ -161,9 +162,14 @@ pub async fn profile_table(
         }
         layout.push((first, orderable, numeric));
     }
-    // Identifiers come from the CLI (`--table NAME=PATH`); quote them like the
-    // column names above so a name containing `"` cannot escape the query.
-    let quoted_table = format!("\"{}\"", table.replace('"', "\"\""));
+    // The name comes from the CLI (`--table NAME=PATH`), so it is quoted: a
+    // name containing `"` cannot escape the query. But it is quoted as
+    // *registration resolved it*, not as typed. Registering `Trips` parses it
+    // as a SQL identifier and stores `trips`, and quoting the raw string asked
+    // for a case-sensitive `"Trips"` that does not exist (#120). Resolving it
+    // the same way and quoting each part where it needs it (doubling any `"`)
+    // names the table `table_provider` found above.
+    let quoted_table = TableReference::from(table).to_quoted_string();
     let sql = format!("SELECT {} FROM {quoted_table}", selects.join(", "));
     let batches = session.sql(&sql).await?.collect().await?;
     let row = batches
@@ -295,5 +301,58 @@ mod tests {
         assert_eq!(model.profiles[0].max, "2");
         assert_eq!(model.profiles[1].null_count, 1);
         assert!(!model.profiles[1].p50.is_empty());
+    }
+
+    /// A Parquet demo table registered the way `oxide tui --table NAME=PATH`
+    /// registers it.
+    async fn session_with_parquet(name: &str) -> (OxideSession, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        oxidelake_storage::write_demo_table(
+            dir.path(),
+            300,
+            7,
+            &oxidelake_storage::demo_write_options(128, oxidelake_storage::Compression::None),
+        )
+        .unwrap();
+        let session = OxideSession::local_with_target(BackendKind::CpuSimd).unwrap();
+        session
+            .register_parquet(name, dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        (session, dir)
+    }
+
+    /// `--table Trips=PATH` registers `trips`: DataFusion folds an unquoted
+    /// name to lower case. The profile query used to quote the name as typed,
+    /// and `"Trips"` is case-sensitive, so the dashboard failed with `table
+    /// 'datafusion.public.Trips' not found` after the user's own query had
+    /// already run (#120).
+    ///
+    /// The other two names keep the quoting the 2026-09-02 audit (S6) added:
+    /// one that is no SQL identifier at all, and one carrying a `"` that
+    /// would end a naively quoted name and let the rest run as SQL.
+    #[tokio::test]
+    async fn a_table_named_in_upper_case_is_profiled() {
+        for (name, from) in [
+            ("Trips", "Trips"),
+            ("trip data", "\"trip data\""),
+            ("a\"b", "\"a\"\"b\""),
+        ] {
+            let (session, _dir) = session_with_parquet(name).await;
+            let model = query_dashboard(
+                &session,
+                &format!("SELECT k, sum(v) FROM {from} GROUP BY k"),
+                &[name.to_owned()],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("--table {name}=…: {e}"));
+            let columns: Vec<&str> = model.profiles.iter().map(|p| p.name.as_str()).collect();
+            assert_eq!(columns, ["id", "k", "v", "s", "emb"], "{name}");
+            assert_eq!(
+                model.profiles[0].max, "299",
+                "{name}: {:?}",
+                model.profiles[0]
+            );
+        }
     }
 }

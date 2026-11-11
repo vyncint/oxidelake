@@ -426,6 +426,12 @@ versions (0.x) may contain breaking changes; they are always listed under a
   the missing checksum, without printing which. A target now counts as
   attached only when all four of its files are; the missing ones are
   recovered from the attached archive's own bytes, never rebuilt (#131).
+- **`oxide tui --table Trips=…` opens the dashboard.** A table name with an
+  upper-case letter is registered as DataFusion folds it, `trips`, but the
+  column-profile query asked for `"Trips"`, so the dashboard failed with
+  `table 'datafusion.public.Trips' not found` after the query itself had
+  run. The profile query now names the table as registration resolved it
+  (#120).
 
 ### Security
 
