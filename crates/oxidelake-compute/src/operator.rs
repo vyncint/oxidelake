@@ -30,7 +30,7 @@ use oxidelake_core::telemetry::OperatorStats;
 use oxidelake_device::cpu::kernels::{self, JoinTable};
 use oxidelake_device::{
     AggregateArgs, DeviceBatch, DeviceStream, FilterProjectArgs, GpuBackend, HashJoinArgs,
-    VectorDistanceArgs,
+    VectorDistanceArgs, columns,
 };
 
 /// Name of the synthetic row-id column appended to device sub-batches whose
@@ -123,6 +123,22 @@ fn take_rows(column: &ArrayRef, row_ids: &ArrayRef) -> Result<ArrayRef, EngineEr
     Ok(take(column.as_ref(), row_ids.as_ref(), None)?)
 }
 
+/// The bytes a transfer of `batch` moves: each column's values and validity
+/// as [`columns::extract`] cuts them for the device, which is what an upload
+/// copies and a download brings back.
+///
+/// Not `get_array_memory_size`: that is the capacity of the buffers behind
+/// each array, so a ten-row slice of a 200 000-row batch reported the whole
+/// parent's 3.2 MB (#103). A column no device holds (`Utf8`, …) never
+/// travels — the operator gathers those on the host — and counts nothing.
+fn transfer_bytes(batch: &RecordBatch) -> u64 {
+    batch
+        .columns()
+        .iter()
+        .map(|column| columns::extract(column).map_or(0, |bytes| bytes.total_bytes()))
+        .sum()
+}
+
 /// The build side of a hash join, prepared once per join: the collected
 /// batch plus its CPU hash table. Shared by every probe partition.
 #[derive(Debug)]
@@ -130,13 +146,33 @@ pub struct JoinBuild {
     batch: RecordBatch,
     key: usize,
     table: JoinTable,
+    /// Set once the build rows are in some operator's `rows_in` (#103). The
+    /// build side is collected once per join and shared by every probe
+    /// partition, so exactly one recorded batch — the first, whichever
+    /// partition produces it — carries them. A join whose probe side yields
+    /// no batch at all records none, and so reports no build rows either.
+    rows_counted: AtomicBool,
 }
 
 impl JoinBuild {
     /// Hashes `batch` on its `Int64` column `key`.
     pub fn new(batch: RecordBatch, key: usize) -> Result<Self, EngineError> {
         let table = JoinTable::build(&batch, key)?;
-        Ok(Self { batch, key, table })
+        Ok(Self {
+            batch,
+            key,
+            table,
+            rows_counted: AtomicBool::new(false),
+        })
+    }
+
+    /// The build rows for `rows_in` the first time it is asked, then zero.
+    fn uncounted_rows(&self) -> usize {
+        if self.rows_counted.swap(true, Ordering::Relaxed) {
+            0
+        } else {
+            self.batch.num_rows()
+        }
     }
 
     /// The build batch.
@@ -196,7 +232,7 @@ impl std::fmt::Debug for GpuOperator {
 enum DeviceOutcome {
     /// It ran on the device: the downloaded batch and the bytes moved
     /// host→device / device→host.
-    Ran(RecordBatch, (usize, usize)),
+    Ran(RecordBatch, (u64, u64)),
     /// The device path was declined; the CPU reference runs instead.
     Declined(EngineError),
 }
@@ -232,17 +268,11 @@ impl GpuOperator {
         &self.streams[i]
     }
 
-    fn record(
-        &self,
-        rows_in: usize,
-        out: &RecordBatch,
-        start: Instant,
-        moved: Option<(usize, usize)>,
-    ) {
+    fn record(&self, rows_in: usize, out: &RecordBatch, start: Instant, moved: Option<(u64, u64)>) {
         if let Some(stats) = &self.stats {
             stats.record_batch(rows_in as u64, out.num_rows() as u64, start.elapsed());
             if let Some((h2d, d2h)) = moved {
-                stats.record_transfer(h2d as u64, d2h as u64);
+                stats.record_transfer(h2d, d2h);
             }
         }
     }
@@ -252,12 +282,12 @@ impl GpuOperator {
     /// reference path).
     fn try_device<G>(&self, gpu: G) -> Result<DeviceOutcome, EngineError>
     where
-        G: FnOnce(&DeviceStream) -> Result<(RecordBatch, usize), EngineError>,
+        G: FnOnce(&DeviceStream) -> Result<(RecordBatch, u64), EngineError>,
     {
         let stream = self.stream();
         match gpu(stream) {
             Ok((batch, h2d)) => {
-                let d2h = batch.get_array_memory_size();
+                let d2h = transfer_bytes(&batch);
                 Ok(DeviceOutcome::Ran(batch, (h2d, d2h)))
             }
             Err(err) if err.is_unsupported() => Ok(DeviceOutcome::Declined(err)),
@@ -312,12 +342,12 @@ impl GpuOperator {
         stream: &DeviceStream,
         sub: &RecordBatch,
         kernel: impl FnOnce(&DeviceStream, &DeviceBatch) -> Result<DeviceBatch, EngineError>,
-    ) -> Result<(RecordBatch, usize), EngineError> {
+    ) -> Result<(RecordBatch, u64), EngineError> {
         let dev = self.backend.upload(stream, sub)?;
         let out = kernel(stream, &dev)?;
         let host = self.backend.download(stream, &out)?;
         self.backend.synchronize(stream)?;
-        Ok((host, sub.get_array_memory_size()))
+        Ok((host, transfer_bytes(sub)))
     }
 
     /// Fused filter + projection of one batch.
@@ -456,7 +486,7 @@ impl GpuOperator {
                 )
             }
         };
-        self.record(left.num_rows(), &out, start, moved);
+        self.record(left.num_rows() + build.uncounted_rows(), &out, start, moved);
         Ok(out)
     }
 
@@ -499,6 +529,11 @@ impl GpuOperator {
         // Later batches may run on the operator's other stream: make the
         // upload visible to every stream before anyone probes it.
         self.backend.synchronize(stream)?;
+        // Counted where it happens, once per operator: the per-batch
+        // counters only see the probe side (#103).
+        if let Some(stats) = &self.stats {
+            stats.record_transfer(transfer_bytes(&sub), 0);
+        }
         let fresh = Arc::new(DeviceBuild {
             plan: plan.clone(),
             batch,
@@ -1014,6 +1049,90 @@ mod tests {
         assert_eq!(snapshot.batches, 3);
         assert_eq!(snapshot.fallback_batches, 3);
         assert!(snapshot.fell_back_entirely());
+    }
+
+    // --- what the counters say moved (#103) --------------------------------
+
+    /// `{p}k Int64?` cycling through 50 keys with every 7th row (from row 3)
+    /// `NULL`, `{p}x Int64`, `{p}s Utf8`.
+    fn keyed(rows: usize, p: &str) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(format!("{p}k"), DataType::Int64, true),
+            Field::new(format!("{p}x"), DataType::Int64, false),
+            Field::new(format!("{p}s"), DataType::Utf8, false),
+        ]));
+        let rows = i64::try_from(rows).unwrap();
+        let k: Int64Array = (0..rows).map(|r| (r % 7 != 3).then_some(r % 50)).collect();
+        let x: Int64Array = (0..rows).collect();
+        let s: StringArray = (0..rows).map(|r| Some(format!("{p}{}", r % 4))).collect();
+        RecordBatch::try_new(schema, vec![Arc::new(k), Arc::new(x), Arc::new(s)]).unwrap()
+    }
+
+    /// A join placed on a device reports its build side: the upload once per
+    /// operator however many probe batches follow, and the build rows in
+    /// `rows_in` once. A probe batch that is a slice counts the bytes the
+    /// slice moves, not its parent's buffers. Both offsets are probed because
+    /// a validity bitmap that does not start on a byte boundary is re-packed
+    /// on the way to the device.
+    #[test]
+    fn join_counters_include_the_build_side_and_only_the_slices_bytes() {
+        let hub = TelemetryHub::new();
+        let stats = hub.register_operator("GpuHashJoinExec", BackendKind::Cuda);
+        let op = GpuOperator::new(FakeGpu::shared(true), Some(Arc::clone(&stats))).unwrap();
+        let build = JoinBuild::new(keyed(200, "r"), 0).unwrap();
+        let parent = keyed(2_000, "l");
+        // lx, ls, rx, rs: the Utf8 columns stay on the host, so each side
+        // also uploads a row-id column for the host gather.
+        let projection = [1, 2, 4, 5];
+        let mut out_rows = 0;
+        for offset in [1_000, 1_010] {
+            let probe = parent.slice(offset, 10);
+            let out = op.hash_join(&probe, &build, 0, Some(&projection)).unwrap();
+            assert!(out.num_rows() > 0);
+            out_rows += out.num_rows() as u64;
+        }
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.fallback_batches, 0, "{snapshot:?}");
+        assert_eq!(
+            snapshot.rows_in,
+            2 * 10 + 200,
+            "both probe slices, and the build rows once: {snapshot:?}"
+        );
+        // Build sub-batch: rk (values, 25 validity bytes), rx, row ids.
+        let build_bytes = 200 * 8 + 25 + 200 * 8 + 200 * 8;
+        // Each probe slice: lk (values, 2 validity bytes), lx, row ids.
+        let probe_bytes = 10 * 8 + 2 + 10 * 8 + 10 * 8;
+        assert_eq!(
+            snapshot.bytes_h2d,
+            build_bytes + 2 * probe_bytes,
+            "{snapshot:?}"
+        );
+        // Back: lk, lx, left row id, rk, rx, right row id per output row. A
+        // matched key is never NULL, so no validity bitmap comes back.
+        assert_eq!(snapshot.bytes_d2h, 6 * 8 * out_rows, "{snapshot:?}");
+    }
+
+    /// The reviewer's case for every operator: a filter over ten rows of a
+    /// 200 000-row batch moves ten rows, and used to report the parent's
+    /// 3.2 MB.
+    #[test]
+    fn a_sliced_batch_counts_only_the_bytes_it_moves() {
+        let hub = TelemetryHub::new();
+        let stats = hub.register_operator("GpuFilterExec", BackendKind::Cuda);
+        let op = GpuOperator::new(FakeGpu::shared(true), Some(Arc::clone(&stats))).unwrap();
+        let slice = keyed(200_000, "t").slice(1_000, 10);
+        let all = Predicate::compare(
+            1,
+            oxidelake_core::params::Comparison::Gt,
+            oxidelake_core::params::Literal::Int64(0),
+        );
+        let out = op.filter_project(&slice, &all, &[0, 1]).unwrap();
+        assert_eq!(out.num_rows(), 10);
+        let snapshot = stats.snapshot();
+        // tk (values, 2 validity bytes) and tx, each way: row 1004 is NULL in
+        // tk and survives the filter, so its bitmap comes back too.
+        assert_eq!(snapshot.bytes_h2d, 10 * 8 + 2 + 10 * 8, "{snapshot:?}");
+        assert_eq!(snapshot.bytes_d2h, 10 * 8 + 2 + 10 * 8, "{snapshot:?}");
     }
 
     /// Aggregation and vector distance count too, not just the filter.

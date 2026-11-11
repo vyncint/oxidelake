@@ -96,6 +96,19 @@ versions (0.x) may contain breaking changes; they are always listed under a
   which DataFusion plans on: a window partitioned by one key over a lowered
   hash join, DataFusion's default join, failed with the same error.
 
+- **A GPU join's counters include its build side, and a sliced batch counts
+  what it moves** (#103). `GpuHashJoinExec` on a device now adds its
+  build-side upload to `bytes_h2d` (once per operator, where the upload
+  happens) and its build rows to `rows_in` (once per join). Both were
+  missing, so a join against 200 000 build rows reported a few hundred
+  bytes moved. Every operator's `bytes_h2d` and `bytes_d2h` now count the
+  bytes a transfer copies instead of the capacity of the buffers behind each
+  array: a filter over ten rows of a 200 000-row batch reported 3.2 MB and
+  now reports 162 bytes. The Inspector, `/metrics`
+  (`oxide_operator_bytes_h2d_total`, `oxide_operator_bytes_d2h_total`,
+  `oxide_operator_rows_in_total`) and `OperatorSnapshot` change with them;
+  a dashboard that charts those series will show a step at the upgrade.
+
 ### Security
 
 - **thrift is out of the dependency graph** (#4, #54). parquet 59 decodes
