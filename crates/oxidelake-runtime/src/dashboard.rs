@@ -8,10 +8,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::array::{RecordBatch, new_empty_array};
 use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::util::display::{ArrayFormatter, FormatOptions};
 use datafusion::common::TableReference;
+use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
+use datafusion::logical_expr::Accumulator;
 use datafusion::physical_plan::{ExecutionPlan, collect, displayable};
 use oxidelake_compute::{GpuAggregateExec, GpuFilterExec, GpuHashJoinExec, GpuVectorDistanceExec};
 use oxidelake_core::telemetry::{OperatorSnapshot, PlanNodeSummary};
@@ -128,8 +130,33 @@ fn render_cell(batch: &RecordBatch, column: usize) -> String {
         .map_or(String::new(), |f| f.value(0).to_string())
 }
 
-/// Profiles every column of `table`: min, max, null count, and P25/P50/P99
-/// (numeric columns only) — one aggregation query per table.
+/// Whether DataFusion's `min` and `max` can order `data_type` (#121).
+///
+/// Asked of the accumulators `min(col)` and `max(col)` run, over an empty
+/// column of the type, rather than decided from a list kept here. The list
+/// this replaced named `Int64`, `Float64` and `Utf8`, and DataFusion reads
+/// every Parquet string as `Utf8View`, so the demo table's own `s` never had a
+/// min or a max. The functions' signatures cannot answer it either: their
+/// `coerce_types` accept every type, and one they cannot order (a `Map`)
+/// fails only at execution, which would take the whole profile query down.
+fn min_max_applies(data_type: &DataType) -> bool {
+    let empty = new_empty_array(data_type);
+    let min = MinAccumulator::try_new(data_type)
+        .and_then(|mut acc| acc.update_batch(std::slice::from_ref(&empty)));
+    let max = MaxAccumulator::try_new(data_type).and_then(|mut acc| acc.update_batch(&[empty]));
+    min.is_ok() && max.is_ok()
+}
+
+/// Where one column's aggregates sit in the profile query's single row.
+struct Slots {
+    non_null: usize,
+    min_max: Option<usize>,
+    quantiles: Option<usize>,
+}
+
+/// Profiles every column of `table`: null count for all of them, min and max
+/// wherever DataFusion can order the type, and P25/P50/P99 for numeric
+/// columns — one aggregation query per table.
 pub async fn profile_table(
     session: &OxideSession,
     table: &str,
@@ -141,26 +168,33 @@ pub async fn profile_table(
         .map_err(EngineError::from)?
         .schema();
     let mut selects = vec!["count(*)".to_owned()];
-    // Per column: [count, min?, max?, p25?, p50?, p99?] — track each column's
-    // slot layout so the result row can be unpacked positionally.
+    // Per column: count, then min and max, then three quantiles, each only
+    // where it applies; the slots say where to read them back.
     let mut layout = Vec::new();
     for field in schema.fields() {
         let name = field.name();
         let quoted = format!("\"{}\"", name.replace('"', "\"\""));
-        let numeric = matches!(field.data_type(), DataType::Int64 | DataType::Float64);
-        let orderable = numeric || matches!(field.data_type(), DataType::Utf8);
-        let first = selects.len();
+        let non_null = selects.len();
         selects.push(format!("count({quoted})"));
-        if orderable {
+        let min_max = min_max_applies(field.data_type()).then(|| {
             selects.push(format!("min({quoted})"));
             selects.push(format!("max({quoted})"));
-        }
-        if numeric {
+            non_null + 1
+        });
+        // `approx_percentile_cont` coerces any numeric type to Float64:
+        // integers of every width, floats and decimals.
+        let quantiles = field.data_type().is_numeric().then(|| {
+            let at = selects.len();
             for q in ["0.25", "0.5", "0.99"] {
                 selects.push(format!("approx_percentile_cont({quoted}, {q})"));
             }
-        }
-        layout.push((first, orderable, numeric));
+            at
+        });
+        layout.push(Slots {
+            non_null,
+            min_max,
+            quantiles,
+        });
     }
     // The name comes from the CLI (`--table NAME=PATH`), so it is quoted: a
     // name containing `"` cannot escape the query. But it is quoted as
@@ -178,19 +212,16 @@ pub async fn profile_table(
         .ok_or_else(|| EngineError::execution("profile query returned no rows"))?;
     let total = render_cell(row, 0).parse::<u64>().unwrap_or(0);
     let mut profiles = Vec::with_capacity(schema.fields().len());
-    for (field, (first, orderable, numeric)) in schema.fields().iter().zip(layout) {
-        let non_null = render_cell(row, first).parse::<u64>().unwrap_or(0);
-        let (min, max) = if orderable {
-            (render_cell(row, first + 1), render_cell(row, first + 2))
-        } else {
-            (String::new(), String::new())
-        };
+    for (field, slots) in schema.fields().iter().zip(layout) {
+        let non_null = render_cell(row, slots.non_null).parse::<u64>().unwrap_or(0);
+        let (min, max) = slots.min_max.map_or_else(
+            || (String::new(), String::new()),
+            |at| (render_cell(row, at), render_cell(row, at + 1)),
+        );
         let quantile = |i: usize| {
-            if numeric {
-                render_cell(row, first + 3 + i)
-            } else {
-                String::new()
-            }
+            slots
+                .quantiles
+                .map_or_else(String::new, |at| render_cell(row, at + i))
         };
         profiles.push(ColumnProfile {
             name: field.name().clone(),
@@ -353,6 +384,120 @@ mod tests {
                 "{name}: {:?}",
                 model.profiles[0]
             );
+        }
+    }
+
+    /// Describe used to profile min and max for `Int64`, `Float64` and `Utf8`
+    /// only, and DataFusion reads every Parquet string as `Utf8View` — so the
+    /// demo table's own `s`, read the way `oxide tui --table` reads it, showed
+    /// none, nor did any other integer width, date or list (#121).
+    #[tokio::test]
+    async fn every_column_min_and_max_can_order_gets_them() {
+        let (session, _dir) = session_with_parquet("t").await;
+        let profiles = profile_table(&session, "t").await.unwrap();
+        let profile = |name: &str| profiles.iter().find(|p| p.name == name).unwrap();
+        let s = profile("s");
+        assert_eq!(
+            s.data_type, "Utf8View",
+            "the type Parquet strings arrive as"
+        );
+        assert!(s.min.starts_with('s') && s.max.starts_with('s'), "{s:?}");
+        assert!(s.min < s.max, "{s:?}");
+        assert!(s.p50.is_empty(), "a string has no quantiles: {s:?}");
+        let emb = profile("emb");
+        assert!(emb.data_type.starts_with("FixedSizeList"), "{emb:?}");
+        assert!(
+            emb.min.starts_with('[') && emb.max.starts_with('['),
+            "{emb:?}"
+        );
+    }
+
+    /// The other type families, and one that `min` and `max` cannot order: a
+    /// `Map` column. Their `coerce_types` accept it and the accumulator
+    /// refuses it at execution, which would fail the whole profile query —
+    /// so it has to be left out, not tried.
+    #[tokio::test]
+    async fn the_other_type_families_are_profiled_and_a_map_is_left_out() {
+        use arrow::array::{
+            ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float32Array, Int32Array,
+            LargeStringArray, MapBuilder, StringBuilder, TimestampMillisecondArray, UInt32Array,
+        };
+        let mut map = MapBuilder::new(None, StringBuilder::new(), Int32Array::builder(4));
+        for (key, value) in [("a", 1), ("b", 2), ("c", 3)] {
+            map.keys().append_value(key);
+            map.values().append_value(value);
+            map.append(true).unwrap();
+        }
+        map.append(false).unwrap();
+        let columns: Vec<(&str, ArrayRef)> = vec![
+            (
+                "i32",
+                Arc::new(Int32Array::from(vec![Some(-3), Some(7), None, Some(1)])),
+            ),
+            ("u32", Arc::new(UInt32Array::from(vec![4, 9, 2, 6]))),
+            (
+                "f32",
+                Arc::new(Float32Array::from(vec![0.5, -1.5, 2.0, 1.0])),
+            ),
+            (
+                "dec",
+                Arc::new(
+                    Decimal128Array::from(vec![1250, -300, 999, 1])
+                        .with_precision_and_scale(10, 2)
+                        .unwrap(),
+                ),
+            ),
+            (
+                "day",
+                Arc::new(Date32Array::from(vec![19_000, 19_500, 18_000, 19_001])),
+            ),
+            (
+                "ts",
+                Arc::new(TimestampMillisecondArray::from(vec![0, 86_400_000, 1, 2])),
+            ),
+            (
+                "flag",
+                Arc::new(BooleanArray::from(vec![true, false, true, true])),
+            ),
+            (
+                "big",
+                Arc::new(LargeStringArray::from(vec!["m", "z", "a", "q"])),
+            ),
+            ("map", Arc::new(map.finish())),
+        ];
+        let batch = RecordBatch::try_from_iter(columns).unwrap();
+        let session = OxideSession::local_with_target(BackendKind::CpuSimd).unwrap();
+        session.ctx().register_batch("u", batch).unwrap();
+
+        let profiles = profile_table(&session, "u").await.unwrap();
+        let found: Vec<(&str, &str, &str, u64)> = profiles
+            .iter()
+            .map(|p| {
+                (
+                    p.name.as_str(),
+                    p.min.as_str(),
+                    p.max.as_str(),
+                    p.null_count,
+                )
+            })
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("i32", "-3", "7", 1),
+                ("u32", "2", "9", 0),
+                ("f32", "-1.5", "2.0", 0),
+                ("dec", "-3.00", "12.50", 0),
+                ("day", "2019-04-14", "2023-05-23", 0),
+                ("ts", "1970-01-01T00:00:00", "1970-01-02T00:00:00", 0),
+                ("flag", "false", "true", 0),
+                ("big", "a", "z", 0),
+                ("map", "", "", 1),
+            ]
+        );
+        for p in &profiles {
+            let numeric = ["i32", "u32", "f32", "dec"].contains(&p.name.as_str());
+            assert_eq!(!p.p50.is_empty(), numeric, "quantiles iff numeric: {p:?}");
         }
     }
 }

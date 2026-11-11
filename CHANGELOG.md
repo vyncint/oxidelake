@@ -432,6 +432,15 @@ versions (0.x) may contain breaking changes; they are always listed under a
   `table 'datafusion.public.Trips' not found` after the query itself had
   run. The profile query now names the table as registration resolved it
   (#120).
+- **The Describe panel shows min and max for every column DataFusion can
+  order.** It profiled `Int64`, `Float64` and `Utf8` only, and DataFusion
+  reads Parquet strings as `Utf8View`, so string columns read from Parquet
+  (the demo table's `s` among them), other integer widths, decimals, dates,
+  timestamps, booleans and lists showed blank min and max. Whether a type
+  applies is now asked of DataFusion's own `min`/`max` accumulators, so a
+  type they cannot order (a `Map`) is left out instead of failing the
+  profile; every numeric type now gets P25/P50/P99 too, not only `Int64`
+  and `Float64` (#121).
 
 ### Security
 
