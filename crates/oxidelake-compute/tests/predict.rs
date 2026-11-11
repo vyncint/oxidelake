@@ -809,3 +809,50 @@ async fn a_null_element_gives_a_null_output() {
         }
     }
 }
+
+// --- message text (#98) -----------------------------------------------------
+
+/// The error `sql` fails with, whether planning or execution refuses it.
+async fn error_of(sql: &str) -> String {
+    let ctx = SessionContext::new();
+    ctx.register_udf(predict_udf());
+    ctx.register_batch("t", batch()).expect("register");
+    match ctx.sql(sql).await {
+        Err(e) => e.to_string(),
+        Ok(df) => df.collect().await.expect_err(sql).to_string(),
+    }
+}
+
+/// Each of these four messages used to carry the source's indentation, runs
+/// of 14 to 22 spaces, where a string literal had lost its `\` line
+/// continuations (#98). Every test above matches a substring, and passed.
+#[tokio::test]
+async fn messages_read_as_written_with_no_runs_of_spaces() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (_, declared) = model_on_disk_with(dir.path(), "declared.safetensors", Some("relu"));
+    let (_, bare) = model_on_disk_with(dir.path(), "bare.safetensors", None);
+    let messages = [
+        error_of(&format!(
+            "SELECT predict('{declared}', features, 'gelu') FROM t"
+        ))
+        .await,
+        error_of(&format!("SELECT predict('{bare}', features) FROM t")).await,
+        error_of("SELECT predict('m', features, 'relu', 'extra') FROM t").await,
+        error_of("SELECT predict('m', features, 1) FROM t").await,
+    ];
+    for message in &messages {
+        assert!(!message.contains("  "), "a run of spaces in: {message}");
+    }
+    // One pinned whole, so the sentence itself is under test and not only
+    // its whitespace.
+    let contradiction = format!(
+        "predict: {declared} declares `{ACTIVATION_KEY}: relu` but the query asks for \
+         'gelu'; the model was trained with one of them, so change the query or the \
+         file rather than running the other"
+    );
+    assert!(
+        messages[0].contains(&contradiction),
+        "expected\n  {contradiction}\nin\n  {}",
+        messages[0]
+    );
+}

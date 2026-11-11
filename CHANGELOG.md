@@ -282,6 +282,13 @@ versions (0.x) may contain breaking changes; they are always listed under a
   returns NULL, as a NULL vector always did. A query that relied on the old
   number fills the element in before calling `predict`.
 
+- **Four `predict` error messages read as one sentence again** (#98): the
+  activation mismatch, the missing-activation refusal, the argument count
+  and the third argument's type. Their string literals had lost their `\`
+  line continuations, so runs of 14 to 22 spaces from the source's
+  indentation sat in the middle of each message. A script that matched one
+  of them with the runs in it matches single spaces now.
+
 ### Security
 
 - **thrift is out of the dependency graph** (#4, #54). parquet 59 decodes

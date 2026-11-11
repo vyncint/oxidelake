@@ -341,12 +341,20 @@ fn resolve_activation(
     let declared = declared_activation(path, bytes)?;
     match (declared, asserted) {
         (Some(declared), Some(asserted)) if declared != asserted => Err(exec(format!(
-            "{PREDICT}: {path} declares `{ACTIVATION_KEY}: {declared}` but the query              asks for '{asserted}'; the model was trained with one of them, so              change the query or the file rather than running the other"
+            "{PREDICT}: {path} declares `{ACTIVATION_KEY}: {declared}` but the query \
+             asks for '{asserted}'; the model was trained with one of them, so \
+             change the query or the file rather than running the other"
         ))),
         (Some(declared), _) => Ok(declared),
         (None, Some(asserted)) => Ok(asserted),
         (None, None) => Err(exec(format!(
-            "{PREDICT}: {path} does not declare `{ACTIVATION_KEY}` in its              safetensors `__metadata__`, so the activation between its Linear              layers is unknown and assuming one would return confident wrong              numbers. Either save the file with that key (`safetensors::serialize`              takes a metadata map; `oxmera::nn::serialize::save` does not write              one as of oxmera 0.5), or state it in the query:              predict('{path}', features, 'relu'). Accepted values: {}",
+            "{PREDICT}: {path} does not declare `{ACTIVATION_KEY}` in its \
+             safetensors `__metadata__`, so the activation between its Linear \
+             layers is unknown and assuming one would return confident wrong \
+             numbers. Either save the file with that key (`safetensors::serialize` \
+             takes a metadata map; `oxmera::nn::serialize::save` does not write \
+             one as of oxmera 0.5), or state it in the query: \
+             predict('{path}', features, 'relu'). Accepted values: {}",
             Activation::names()
         ))),
     }
@@ -497,7 +505,8 @@ impl ScalarUDFImpl for PredictUdf {
             [path, features, activation] => (path, features, Some(activation)),
             other => {
                 return Err(DataFusionError::Plan(format!(
-                    "{PREDICT} takes 2 or 3 arguments (model path, features                      [, activation]), got {}",
+                    "{PREDICT} takes 2 or 3 arguments (model path, features \
+                     [, activation]), got {}",
                     other.len()
                 )));
             }
@@ -506,7 +515,8 @@ impl ScalarUDFImpl for PredictUdf {
             && !is_string(activation)
         {
             return Err(DataFusionError::Plan(format!(
-                "{PREDICT}: the third argument is the activation as a string                  ({}), got {activation:?}",
+                "{PREDICT}: the third argument is the activation as a string \
+                 ({}), got {activation:?}",
                 Activation::names()
             )));
         }
