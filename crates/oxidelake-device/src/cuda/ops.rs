@@ -7,8 +7,10 @@
 //! Small prefix scans (block counts, per-row match counts) round-trip through
 //! the host; everything else stays on the device.
 //!
-//! Divergence from the CPU reference, by design: device `SUM` over `Int64`
-//! wraps on overflow where the CPU path reports an error.
+//! Device `SUM` over `Int64` wraps on overflow (an unsigned `atomicAdd`), which
+//! is what stock DataFusion and the CPU reference do. Until 0.3.0 this comment
+//! called the wrap a divergence by design: the CPU reference raised an error,
+//! and DataFusion — the reference both are held to — never did (#46, #100).
 
 use std::fmt;
 use std::sync::Arc;

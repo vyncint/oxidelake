@@ -8,7 +8,9 @@
 // the output matches the CPU reference exactly.
 //
 // Semantics: SUM/MIN/MAX skip NULL values and are NULL when a group has none
-// (count == 0); COUNT counts non-NULL values.
+// (count == 0); COUNT counts non-NULL values. SUM over Int64 wraps on
+// overflow (the unsigned atomicAdd), as stock DataFusion's SUM and the CPU
+// reference do.
 //
 // Compiled at runtime with NVRTC; there is no nvcc build step.
 

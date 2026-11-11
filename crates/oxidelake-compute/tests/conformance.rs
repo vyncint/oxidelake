@@ -331,6 +331,44 @@ async fn cpu_sum_overflow_wraps_like_datafusion() {
     check_sum_overflow(cpu()).await;
 }
 
+/// The aggregate edge cases on the detected GPU backend. Ignored by default
+/// because the development machine has no device; on a CUDA machine run
+/// `OXIDE_BACKEND=cuda cargo test -p oxidelake-compute --features cuda --test conformance -- --ignored`.
+/// Equal answers would also come from the CPU fallback, so a backend that
+/// aggregates on its device must also show that it did: bytes uploaded and
+/// no batch fallen back. Metal declares aggregates unsupported; there the
+/// checks pin the fallback's answers.
+#[tokio::test]
+#[ignore = "requires a GPU backend (CUDA or Metal) on this machine"]
+async fn gpu_aggregate_edges_match_the_reference_when_available() {
+    let backend = HardwareDetector::select().unwrap();
+    assert!(
+        backend.kind().is_gpu(),
+        "no GPU backend detected: {:?}",
+        backend.kind()
+    );
+    check_sum_overflow(Arc::clone(&backend)).await;
+    if backend.supports_aggregate() {
+        let hub = TelemetryHub::new();
+        let stats = hub.register_operator("GpuAggregateExec", backend.kind());
+        let operator = GpuOperator::new(Arc::clone(&backend), Some(Arc::clone(&stats))).unwrap();
+        let batch = gen_sum_overflow();
+        let spec = AggregateSpec {
+            group_by: 0,
+            aggregates: vec![(AggregateFunction::Sum, 1)],
+        };
+        let device = operator.aggregate(&batch, &spec).unwrap();
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.fallback_batches, 0, "{snapshot:?}");
+        assert!(snapshot.bytes_h2d > 0, "{snapshot:?}");
+        let reference = GpuOperator::new(cpu(), None)
+            .unwrap()
+            .aggregate(&batch, &spec)
+            .unwrap();
+        assert_eq!(sorted_rows(&[device]), sorted_rows(&[reference]));
+    }
+}
+
 fn reference_distances(
     batch: &RecordBatch,
     query: &[f32],

@@ -195,6 +195,16 @@ versions (0.x) may contain breaking changes; they are always listed under a
   selects the CPU and logs why, and `OXIDE_BACKEND=cuda` fails at startup
   saying which. New: `CudaBackend::nvrtc_arch`.
 
+- **CUDA's `SUM(Int64)` wrap is no longer called a divergence** (#46). It is
+  what stock DataFusion does, so `cuda/ops.rs` no longer documents it as a
+  divergence by design and the roadmap line no longer asks for an overflow
+  error: #46 was filed on the premise that DataFusion raises one, and it
+  wraps. The CPU reference was the outlier and now wraps too (#100, under
+  Fixed). The `#[ignore]`d device test
+  `aggregate_wraps_int64_sums_like_the_reference` and the conformance
+  suite's GPU pass pin the kernel to the reference's wrapped answer when
+  they next run on a CUDA machine.
+
 ### Fixed
 
 - **`SUM(Int64)` wraps on overflow under a GPU target, as it does in stock
