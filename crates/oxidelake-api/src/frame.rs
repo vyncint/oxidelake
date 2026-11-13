@@ -111,7 +111,7 @@ impl OxideFrame {
         };
         let call = udf.call(vec![
             datafusion::prelude::col(column),
-            lit(query_literal(query)),
+            lit(query_literal(query)?),
         ]);
         Ok(Self::new(self.inner.with_column(output, call)?))
     }
