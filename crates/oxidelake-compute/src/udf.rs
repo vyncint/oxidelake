@@ -17,7 +17,7 @@ use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
 };
-use oxidelake_core::params::DistanceMetric;
+use oxidelake_core::{EngineError, params::DistanceMetric};
 use oxidelake_device::cpu::kernels;
 
 /// Name of the L2 (Euclidean) distance UDF.
@@ -249,13 +249,21 @@ pub fn oxide_udfs() -> Vec<Arc<ScalarUDF>> {
 
 /// The query vector as the `FixedSizeList<Float32>` literal our planner rule
 /// recognizes ([`ScalarValue::FixedSizeList`], no nulls).
-pub fn query_literal(query: &[f32]) -> ScalarValue {
+///
+/// Returns a planning error when `query` is empty because a zero-dimension
+/// fixed-size list cannot represent a DataFusion scalar.
+pub fn query_literal(query: &[f32]) -> core::result::Result<ScalarValue, EngineError> {
+    if query.is_empty() {
+        return Err(EngineError::plan("query vector must not be empty"));
+    }
     let values = Float32Array::from(query.to_vec());
-    ScalarValue::FixedSizeList(Arc::new(FixedSizeListArray::new(
-        Arc::new(Field::new("item", DataType::Float32, true)),
-        i32::try_from(query.len()).unwrap_or(i32::MAX),
-        Arc::new(values),
-        None,
+    Ok(ScalarValue::FixedSizeList(Arc::new(
+        FixedSizeListArray::new(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            i32::try_from(query.len()).unwrap_or(i32::MAX),
+            Arc::new(values),
+            None,
+        ),
     )))
 }
 
@@ -398,7 +406,16 @@ mod tests {
     #[test]
     fn query_literal_round_trips() {
         let q = [1.5f32, -2.0, 0.25];
-        assert_eq!(literal_query(&query_literal(&q)).unwrap(), q);
+        assert_eq!(literal_query(&query_literal(&q).unwrap()).unwrap(), q);
         assert_eq!(literal_query(&ScalarValue::Float32(Some(1.0))), None);
+    }
+
+    #[test]
+    fn query_literal_rejects_empty_vector() {
+        let error = query_literal(&[]).expect_err("an empty query vector is invalid");
+        assert!(matches!(
+            error,
+            EngineError::Plan(message) if message == "query vector must not be empty"
+        ));
     }
 }
