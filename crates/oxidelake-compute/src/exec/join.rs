@@ -3,6 +3,7 @@
 use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError};
 
+use arrow::array::RecordBatch;
 use arrow::compute::concat_batches;
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use datafusion::common::JoinType;
@@ -27,7 +28,7 @@ use oxidelake_core::telemetry::TelemetryHub;
 use oxidelake_device::GpuBackend;
 
 use super::{ExecConfig, field_type, plan_err};
-use crate::operator::JoinBuild;
+use crate::operator::{GpuOperator, JoinBuild, JoinProbe};
 
 /// The collected and hashed build side, shared by every probe partition.
 /// Collecting once matters for correctness, not just cost: a shared-state
@@ -62,10 +63,62 @@ impl fmt::Debug for BuildOnce {
     }
 }
 
+/// One partition's probe side on its way through the join: the probe batch
+/// being emitted, piece by piece, and what the next one needs.
+struct ProbeStream {
+    left: SendableRecordBatchStream,
+    operator: GpuOperator,
+    build: Arc<JoinBuild>,
+    left_key: usize,
+    projection: Option<Vec<usize>>,
+    batch_size: usize,
+    span: tracing::Span,
+    baseline: BaselineMetrics,
+    probe: Option<JoinProbe>,
+}
+
+impl ProbeStream {
+    /// Starts joining `batch`; its output comes from [`Self::next_piece`].
+    fn start(&mut self, batch: &RecordBatch) -> Result<()> {
+        let _entered = self.span.enter();
+        let _timer = self.baseline.elapsed_compute().timer();
+        self.probe = Some(self.operator.hash_join(
+            batch,
+            &self.build,
+            self.left_key,
+            self.projection.as_deref(),
+            self.batch_size,
+        )?);
+        Ok(())
+    }
+
+    /// The current probe batch's next piece, or `None` when it has none left
+    /// (or there is no probe batch yet).
+    fn next_piece(&mut self) -> Result<Option<RecordBatch>> {
+        let Some(probe) = self.probe.as_mut() else {
+            return Ok(None);
+        };
+        let _entered = self.span.enter();
+        let _timer = self.baseline.elapsed_compute().timer();
+        match self.operator.next_join_chunk(probe, &self.build)? {
+            Some(out) => {
+                self.baseline.record_output(out.num_rows());
+                Ok(Some(out))
+            }
+            None => {
+                self.probe = None;
+                Ok(None)
+            }
+        }
+    }
+}
+
 /// Inner hash join. The right child is the build side and is collected in
 /// full once, when the first partition starts; each left (probe) batch
-/// streams through. Output columns are the left columns followed by the right
-/// columns, or the [`Self::with_projection`] subset of them.
+/// streams through, its output in batches of at most the session's batch
+/// size however often its keys repeat. Output columns are the left columns
+/// followed by the right columns, or the [`Self::with_projection`] subset of
+/// them.
 #[derive(Debug)]
 pub struct GpuHashJoinExec {
     left: Arc<dyn ExecutionPlan>,
@@ -339,6 +392,7 @@ impl ExecutionPlan for GpuHashJoinExec {
         let baseline = BaselineMetrics::new(&self.metrics, partition);
         let (left_key, right_key) = (self.left_key, self.right_key);
         let projection = self.projection.clone();
+        let batch_size = context.session_config().batch_size();
         let build_fut = self.build.get_or_init(|| {
             let right = Arc::clone(&self.right);
             let right_schema = right.schema();
@@ -355,13 +409,29 @@ impl ExecutionPlan for GpuHashJoinExec {
         });
         let stream = futures::stream::once(async move {
             let build = build_fut.await.map_err(DataFusionError::Shared)?;
-            Ok::<_, DataFusionError>(left.map(move |batch| {
-                let _entered = span.enter();
-                let batch = batch?;
-                let _timer = baseline.elapsed_compute().timer();
-                let out = operator.hash_join(&batch, &build, left_key, projection.as_deref())?;
-                baseline.record_output(out.num_rows());
-                Ok(out)
+            let state = ProbeStream {
+                left,
+                operator,
+                build,
+                left_key,
+                projection,
+                batch_size,
+                span,
+                baseline,
+                probe: None,
+            };
+            // One piece per poll, so a probe batch whose matches outnumber
+            // the batch size is never held whole (#95).
+            Ok::<_, DataFusionError>(futures::stream::try_unfold(state, |mut state| async move {
+                loop {
+                    if let Some(out) = state.next_piece()? {
+                        return Ok(Some((out, state)));
+                    }
+                    match state.left.next().await {
+                        Some(batch) => state.start(&batch?)?,
+                        None => return Ok(None),
+                    }
+                }
             }))
         })
         .try_flatten();

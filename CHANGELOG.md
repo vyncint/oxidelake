@@ -34,6 +34,12 @@ versions (0.x) may contain breaking changes; they are always listed under a
   DataFusion's pool unbounded: a DataFusion operator on a worker that used to
   grow without limit now spills, or fails with a resources-exhausted error.
   The `Gpu*Exec` operators do not reserve from it.
+- `GpuOperator::hash_join` takes the batch size and returns a `JoinProbe`,
+  whose output `GpuOperator::next_join_chunk` hands out one batch of at
+  most that size at a time, in place of one `RecordBatch` holding every
+  match (#95). *Migration:* `let mut probe = op.hash_join(&left, &build,
+  key, projection, batch_size)?;` then `while let Some(batch) =
+  op.next_join_chunk(&mut probe, &build)? { … }`.
 
 ### Fixed
 
@@ -108,6 +114,22 @@ versions (0.x) may contain breaking changes; they are always listed under a
   (`oxide_operator_bytes_h2d_total`, `oxide_operator_bytes_d2h_total`,
   `oxide_operator_rows_in_total`) and `OperatorSnapshot` change with them;
   a dashboard that charts those series will show a step at the upgrade.
+- **A join whose key repeats on both sides no longer aborts the process**
+  (#95). `GpuHashJoinExec` gathered every match of a probe batch into one
+  output batch, so a key repeated on both sides arrived as the product of
+  its two counts at once: 65 536 probe rows against 4 000 build rows of one
+  key are 262 million rows, and `oxide sql --target cuda` died with
+  `memory allocation of 2097152000 bytes failed` (SIGABRT, no error, no
+  fallback) where stock DataFusion streams the same join in 74 MB. A probe
+  batch's output now leaves in batches of at most the session's batch size,
+  and that query completes in 83 MB under a 4 GB cap. A GPU still
+  returns a probe batch's output in one piece, so a probe batch that joins
+  to more than one batch runs on the CPU reference, counted in
+  `fallback_batches`. A join's `batches` counter now counts the batches it
+  emits, which is its probe batches unless one of them joined to more than
+  a batch. `oxidelake_device::cpu::kernels` gains `JoinMatches` and
+  `hash_join_gather`, the reference for gathering a range of a probe's
+  matches.
 
 ### Security
 

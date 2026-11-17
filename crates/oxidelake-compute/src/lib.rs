@@ -42,7 +42,7 @@ pub use exec::{
     GpuAggregateExec, GpuFilterExec, GpuHashJoinExec, GpuVectorDistanceExec,
     aggregate_output_schema,
 };
-pub use operator::{GpuOperator, JoinBuild};
+pub use operator::{GpuOperator, JoinBuild, JoinProbe};
 pub use oxidelake_core::params;
 pub use oxidelake_core::params::{
     AggregateFunction, AggregateSpec, Comparison, DistanceMetric, Literal, Predicate,
