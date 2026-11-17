@@ -40,7 +40,7 @@ flowchart TB
   e2 --> result
 ```
 
-Placement is a **physical optimizer rule**, not an AST pass: eligibility depends on physical operator shape and resolved types ([ADR-0010](decisions/ADR-0010-placement-as-physical-optimizer-rule.md)). Anything outside the bounded v1 GPU coverage stays on CPU. In cluster mode the rule runs on the scheduler against the declared cluster capability (`OXIDE_CLUSTER_BACKEND`); each `Gpu*Exec` then selects the *real* local backend at execute time, so a heterogeneous cluster stays correct ([ADR-0013](decisions/ADR-0013-cluster-mode-on-ballista.md)).
+Placement is a **physical optimizer rule**, not an AST pass: eligibility depends on physical operator shape and resolved types ([ADR-0010](decisions/ADR-0010-placement-as-physical-optimizer-rule.md)). Anything outside the bounded v1 GPU coverage stays on CPU. In cluster mode the rule runs on the scheduler against the declared cluster capability (`OXIDE_CLUSTER_BACKEND`); each `Gpu*Exec` then selects the *real* local backend at execute time, so a heterogeneous cluster stays correct ([ADR-0013](decisions/ADR-0013-cluster-mode-on-ballista.md)). The scheduler plans with Ballista's static planner: Ballista 55's adaptive planner builds its own physical optimizer pipeline, which leaves the rule out, so it is turned off in every cluster session and the scheduler's session builder overrides a client that turns it back on (#134).
 
 ## Bounded v1 GPU coverage
 

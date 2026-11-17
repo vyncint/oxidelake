@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use ballista::prelude::SessionContextExt;
-use ballista_core::extension::SessionConfigExt;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::dataframe::DataFrame;
@@ -214,11 +213,12 @@ impl OxideSession {
     ) -> Result<Self, EngineError> {
         // The scheduler picks the batch size a GPU cluster runs with, so it
         // has to be told when this one is a choice rather than a default (#93).
-        let config = with_pruning(SessionConfig::new_with_ballista())
-            .with_ballista_physical_extension_codec(cluster::oxide_codec())
-            .with_option_extension(cluster::ClientOptions {
-                explicit_batch_size: options.batch_size.is_some(),
-            });
+        // The rest is what every cluster process runs with, adaptive planning
+        // off included, so this client's own settings say what the scheduler
+        // will do with its query (#134).
+        let config = cluster::session_config().with_option_extension(cluster::ClientOptions {
+            explicit_batch_size: options.batch_size.is_some(),
+        });
         let config = options.apply(config, None)?;
         let state = SessionStateBuilder::new()
             .with_default_features()

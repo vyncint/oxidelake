@@ -64,10 +64,19 @@ pub fn ballista_codec() -> BallistaCodec {
 }
 
 /// Session configuration for every process: Ballista defaults, Parquet pruning
-/// on, and the OxideLake codec.
+/// on, the OxideLake codec, and Ballista's static planner.
+///
+/// Ballista 55 plans adaptively by default, and its adaptive planner builds
+/// its own session with Ballista's physical optimizer rules in place of the
+/// session's, so the placement rules never run: a GPU-targeted cluster
+/// executed no `Gpu*Exec` at all while `EXPLAIN`, which plans statically,
+/// still showed them (#134). The adaptive planner has no hook to add a rule
+/// to, so it stays off until it does, and [`build_session_state`] holds the
+/// scheduler to that whatever a client sends.
 pub fn session_config() -> SessionConfig {
     with_pruning(SessionConfig::new_with_ballista())
         .with_ballista_physical_extension_codec(oxide_codec())
+        .with_ballista_adaptive_query_planner(false)
         .with_option_extension(ClientOptions::default())
 }
 
@@ -170,13 +179,28 @@ pub fn config_producer() -> ConfigProducer {
 /// range a corrupt footer declares past the end of the file.
 /// `config` is the client's (Ballista sends it with every query). A GPU
 /// target raises its batch size to the GPU default unless the client chose
-/// one, which it keeps (#93).
+/// one, which it keeps (#93). Adaptive planning is turned off whatever the
+/// client asked for, because it would drop the placement rule (#134; see
+/// [`session_config`]).
 pub fn build_session_state(
     config: SessionConfig,
     target: BackendKind,
 ) -> datafusion::error::Result<SessionState> {
     let mut scalar_functions = ballista_scalar_functions();
     scalar_functions.extend(oxide_udfs());
+    // The scheduler picks its planner from the state built here, after the
+    // client's settings were applied, so this is the one place a client's
+    // `SET ballista.planner.adaptive.enabled = true` (or a stock Ballista
+    // client, whose default it is) cannot win.
+    let config = if config.ballista_adaptive_query_planner_enabled() {
+        tracing::warn!(
+            "adaptive query planning is not available on an OxideLake cluster: \
+             it would drop the placement rules, so this query is planned statically (#134)"
+        );
+        config.with_ballista_adaptive_query_planner(false)
+    } else {
+        config
+    };
     let config = if target.is_gpu() && !client_chose_batch_size(&config) {
         with_gpu_batch_size(config)
     } else {
@@ -417,5 +441,24 @@ mod tests {
         );
         let err = options.set("batch", "true").unwrap_err();
         assert!(err.to_string().contains("oxidelake.batch"), "{err}");
+    }
+
+    /// The scheduler plans statically whatever a client sends (#134):
+    /// Ballista's adaptive planner would replace the placement rules.
+    #[test]
+    fn a_client_cannot_turn_adaptive_planning_back_on() {
+        assert!(!session_config().ballista_adaptive_query_planner_enabled());
+        // `SET ballista.planner.adaptive.enabled = true`, and a stock Ballista
+        // client, whose default it is: both arrive at the session builder.
+        let asked = session_config().with_ballista_adaptive_query_planner(true);
+        let stock = SessionConfig::new_with_ballista();
+        for client in [asked, stock] {
+            let seen = as_the_scheduler_sees(&client);
+            assert!(seen.ballista_adaptive_query_planner_enabled());
+            for target in [BackendKind::CpuSimd, BackendKind::Cuda] {
+                let state = build_session_state(seen.clone(), target).unwrap();
+                assert!(!state.config().ballista_adaptive_query_planner_enabled());
+            }
+        }
     }
 }

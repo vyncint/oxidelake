@@ -356,6 +356,16 @@ versions (0.x) may contain breaking changes; they are always listed under a
   the deletes run on a thread and runtime of their own and the drop waits
   for them; after 30 seconds it stops waiting and lets them finish in the
   background. A file that cannot be deleted is logged at `warn`.
+- **Cluster queries keep Ballista's static planner** (#134). Ballista 55
+  plans adaptively by default, and its adaptive planner swaps the session's
+  physical optimizer rules for Ballista's own, so on the 55 chain a
+  GPU-targeted cluster ran no `Gpu*Exec` operator at all while `EXPLAIN`
+  still showed them (never released: 0.2.0 is on Ballista 54, which plans
+  statically). `ballista.planner.adaptive.enabled` is now `false` in every
+  OxideLake cluster session, and the scheduler overrides a client that sets
+  it to `true`, with a warning in its log. Adaptive join selection and
+  partition coalescing are therefore not available on an OxideLake cluster
+  until the placement rule can run inside the adaptive planner.
 
 ### Fixed
 

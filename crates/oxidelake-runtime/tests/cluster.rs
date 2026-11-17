@@ -1,10 +1,12 @@
 //! Cluster equivalence (docs/SPEC.md §2.6): an in-process Ballista scheduler plus
 //! two executors, planned with `OXIDE_CLUSTER_BACKEND`-style target `cuda` so
 //! `Gpu*Exec` nodes travel through the codec (the executors have no GPU and take
-//! the CPU path), must return exactly what embedded mode returns.
+//! the CPU path), must return exactly what embedded mode returns, and must run
+//! the `Gpu*Exec` nodes the cluster's `EXPLAIN` shows (#134).
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -13,6 +15,9 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 use datafusion::physical_expr::Partitioning;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, displayable};
+
+use ballista_core::extension::SessionConfigExt;
+use datafusion::physical_plan::displayable;
 use datafusion::prelude::SessionContext;
 use oxidelake_core::BackendKind;
 use oxidelake_core::telemetry::TelemetryHub;
@@ -117,6 +122,69 @@ const NOT_IN_NULL_PROBE: &str =
 /// `NOT IN` over a subquery that contains a NULL: no row can qualify.
 const NOT_IN_NULL_BUILD: &str = "SELECT k, s FROM t WHERE k NOT IN (SELECT rk FROM r)";
 
+/// The `Gpu*Exec` operators the cluster's `EXPLAIN` names for `sql`.
+async fn explained_gpu_operators(session: &OxideSession, sql: &str) -> BTreeSet<String> {
+    let text = rows_of(session, &format!("EXPLAIN {sql}")).await.join("\n");
+    let mut names = BTreeSet::new();
+    for (at, _) in text.match_indices("Gpu") {
+        let name: String = text[at..]
+            .chars()
+            .take_while(char::is_ascii_alphanumeric)
+            .collect();
+        if name.ends_with("Exec") && text[at + name.len()..].starts_with('[') {
+            names.insert(name);
+        }
+    }
+    names
+}
+
+/// The next registration id of the process-wide hub: operators registered
+/// from here on have an id at least this large.
+fn next_operator_id() -> usize {
+    TelemetryHub::global()
+        .snapshot()
+        .operators
+        .iter()
+        .map(|op| op.id + 1)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Asserts that every operator in `names` processed rows after `since`.
+///
+/// The process-wide hub is the witness because nothing but execution writes
+/// to it here: the plan codec attaches it to each `Gpu*Exec` an executor
+/// decodes, an operator registers on its first `execute()`, the scheduler's
+/// plans carry no hub, and embedded sessions own their own (#134).
+fn assert_executed_on_an_executor(since: usize, names: &BTreeSet<String>, sql: &str) {
+    let operators = TelemetryHub::global().snapshot().operators;
+    for name in names {
+        let rows_in: u64 = operators
+            .iter()
+            .filter(|op| op.id >= since && &op.name == name)
+            .map(|op| op.rows_in)
+            .sum();
+        assert!(
+            rows_in > 0,
+            "EXPLAIN shows {name} for `{sql}`, but no executor ran one; \
+             operators since #{since}: {:?}",
+            operators
+                .iter()
+                .filter(|op| op.id >= since)
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+/// The cluster returns embedded mode's rows, and runs the `Gpu*Exec`
+/// operators its `EXPLAIN` shows while doing so (#134).
+///
+/// Rows alone cannot tell a GPU-placed plan from one with no GPU operator in
+/// it, because every `Gpu*Exec` equals the CPU path by construction. Ballista
+/// 55's adaptive planner replaced the placement rules with its own and this
+/// test stayed green, while `EXPLAIN`, planned statically, still showed the
+/// `Gpu*Exec` nodes no executor ran. So each query is also explained on the
+/// cluster, and every operator that names must then have run.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn distributed_results_equal_embedded_results() {
     let dir = tempfile::tempdir().unwrap();
@@ -127,6 +195,13 @@ async fn distributed_results_equal_embedded_results() {
         .await
         .unwrap();
     assert!(matches!(cluster.mode(), SessionMode::Cluster { .. }));
+    // What the client sends agrees with what the scheduler will do.
+    assert!(
+        !cluster
+            .ctx()
+            .copied_config()
+            .ballista_adaptive_query_planner_enabled()
+    );
     cluster.register_parquet("t", &t_path).await.unwrap();
     cluster.register_parquet("r", &r_path).await.unwrap();
 
@@ -134,11 +209,21 @@ async fn distributed_results_equal_embedded_results() {
     embedded.register_parquet("t", &t_path).await.unwrap();
     embedded.register_parquet("r", &r_path).await.unwrap();
 
+    let mut placed = BTreeSet::new();
     for sql in QUERIES {
-        let distributed = sorted_rows(&cluster.sql(sql).await.unwrap().collect().await.unwrap());
-        let local = sorted_rows(&embedded.sql(sql).await.unwrap().collect().await.unwrap());
+        let explained = explained_gpu_operators(&cluster, sql).await;
+        let since = next_operator_id();
+        let distributed = rows_of(&cluster, sql).await;
+        let local = rows_of(&embedded, sql).await;
         assert!(!local.is_empty(), "{sql}");
         assert_eq!(distributed, local, "{sql}");
+        assert_executed_on_an_executor(since, &explained, sql);
+        placed.extend(explained);
+    }
+    // The witness is only as good as what `EXPLAIN` claims: a plan that
+    // placed nothing would pass it vacuously too.
+    for name in ["GpuFilterExec", "GpuHashJoinExec", "GpuAggregateExec"] {
+        assert!(placed.contains(name), "no query placed {name}: {placed:?}");
     }
 }
 

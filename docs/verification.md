@@ -119,7 +119,7 @@ and the Metal backend executes for real.
 | CUDA code compiles and lints | yes | `check` / `clippy -p oxidelake-runtime --features cuda` (no CUDA installed anywhere) |
 | `metal` feature is a no-op on Linux | yes | `cargo check -p oxidelake-runtime --features metal` on Linux |
 | Metal compile, lint, **execution** | yes (macOS) | the Metal lane above; the conformance suite runs on the actual device |
-| Cluster mode (Ballista scheduler + executors, codec, placement) | yes | in-process scheduler + 2 executors; spawned binaries in the Phase 7 E2E — executors take the CPU path |
+| Cluster mode (Ballista scheduler + executors, codec, placement) | yes | in-process scheduler + 2 executors, where every `Gpu*Exec` the cluster's `EXPLAIN` shows must also have run on an executor (the process-wide telemetry hub, #134); spawned binaries in the Phase 7 E2E — executors take the CPU path |
 | Embedded GPU-target ≡ CPU results | yes | `oxidelake-runtime/tests/embedded.rs` over cpu/cuda/metal targets |
 | Parquet pruning | yes | scan metrics + result equality against a pruning-disabled run |
 | CPU ↔ CUDA operator equivalence | **no** | conformance suite is `#[ignore]` for CUDA; run on a CUDA box |
