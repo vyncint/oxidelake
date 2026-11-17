@@ -83,6 +83,10 @@ pub trait GpuBackend: Send + Sync + std::fmt::Debug {
     // listed in §2.3; anything else returns EngineError::Unsupported and the
     // planner must never route it here.
     fn filter_project(&self, s: &DeviceStream, a: FilterProjectArgs<'_>) -> Result<DeviceBatch, EngineError>;
+    // A join: the build side prepared once per operator, each probe batch
+    // probed once, its output gathered in ranges.
+    fn prepare_join_build(&self, s: &DeviceStream, a: JoinBuildArgs<'_>) -> Result<DeviceJoinTable, EngineError>;
+    fn probe_join(&self, s: &DeviceStream, a: JoinProbeArgs<'_>) -> Result<DeviceJoinMatches, EngineError>;
     fn hash_join(&self, s: &DeviceStream, a: HashJoinArgs<'_>) -> Result<DeviceBatch, EngineError>;
     fn aggregate(&self, s: &DeviceStream, a: AggregateArgs<'_>) -> Result<DeviceBatch, EngineError>;
     fn vector_distance(&self, s: &DeviceStream, a: VectorDistanceArgs<'_>) -> Result<DeviceBatch, EngineError>;
@@ -106,7 +110,7 @@ DataFusion `ExecutionPlan` implementations: `GpuFilterExec` (fused filter + proj
 **Deliberately bounded GPU type coverage for v1** (everything outside it stays on CPU by planner rule):
 
 - filter + project: predicates `=, <, <=, >, >=` combined with `AND` over `Int64`/`Float64` columns against literals; projection = column selection; output is stream-compacted (block-scan prefix sums).
-- hash join: inner join on a single `Int64` key; open-addressing linear-probing table in device memory built with atomic CAS, probed in parallel.
+- hash join: inner join on a single `Int64` key; an open-addressing linear-probing table in device memory with one slot per distinct key, holding that key's run in a row-index array — built once per operator on the host from the CPU reference's index and uploaded, then probed in parallel; a probe batch's matches stay on the device and its output is gathered in pieces of at most the session's batch size.
 - aggregate: `SUM/COUNT/MIN/MAX` over `Int64`/`Float64` grouped by one `Int64` key of low cardinality (atomic/radix reduction).
 - vector distance: L2 and cosine between a query vector and a `FixedSizeList<Float32>` column (shared memory + warp shuffles on CUDA; threadgroup memory + simdgroup reductions on Metal).
 

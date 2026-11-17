@@ -14,6 +14,7 @@ pub mod columns;
 pub mod cpu;
 pub mod detector;
 pub mod handles;
+mod join_slots;
 
 #[cfg(feature = "cuda")]
 pub mod cuda;
@@ -21,9 +22,14 @@ pub mod cuda;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub mod metal;
 
-pub use args::{AggregateArgs, FilterProjectArgs, HashJoinArgs, VectorDistanceArgs};
+pub use args::{
+    AggregateArgs, FilterProjectArgs, HashJoinArgs, JoinBuildArgs, JoinProbeArgs,
+    VectorDistanceArgs,
+};
 pub use backend::{GpuBackend, MemoryInfo};
 pub use cpu::CpuBackend;
 pub use detector::{Availability, BACKEND_ENV, HardwareDetector};
-pub use handles::{DeviceBatch, DeviceBuffer, DeviceStream, HostBuffer};
+pub use handles::{
+    DeviceBatch, DeviceBuffer, DeviceJoinMatches, DeviceJoinTable, DeviceStream, HostBuffer,
+};
 pub use oxidelake_core::{BackendKind, DeviceId};

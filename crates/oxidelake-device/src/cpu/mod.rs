@@ -10,10 +10,14 @@ use arrow::array::RecordBatch;
 use oxidelake_core::{BackendKind, DeviceId, EngineError};
 use oxidelake_memory::AlignedBuf;
 
-use crate::args::{AggregateArgs, FilterProjectArgs, HashJoinArgs, VectorDistanceArgs};
+use crate::args::{
+    AggregateArgs, FilterProjectArgs, HashJoinArgs, JoinBuildArgs, JoinProbeArgs,
+    VectorDistanceArgs,
+};
 use crate::backend::{GpuBackend, MemoryInfo};
 use crate::handles::{
-    DeviceBatch, DeviceBuffer, DeviceBufferInner, DeviceStream, HostBuffer, StreamInner,
+    DeviceBatch, DeviceBuffer, DeviceBufferInner, DeviceJoinMatches, DeviceJoinTable, DeviceStream,
+    HostBuffer, StreamInner,
 };
 
 /// The CPU backend.
@@ -49,6 +53,18 @@ pub(crate) fn host_batch(batch: &DeviceBatch) -> Result<&RecordBatch, EngineErro
     batch
         .as_host()
         .ok_or_else(|| foreign("batch", batch.backend()))
+}
+
+fn host_table(table: &DeviceJoinTable) -> Result<&kernels::JoinTable, EngineError> {
+    table
+        .as_host()
+        .ok_or_else(|| foreign("join table", table.backend()))
+}
+
+fn host_matches(matches: &DeviceJoinMatches) -> Result<&kernels::JoinMatches, EngineError> {
+    matches
+        .as_host()
+        .ok_or_else(|| foreign("join matches", matches.backend()))
 }
 
 /// Total and available host memory from `/proc/meminfo` (zeros elsewhere).
@@ -191,13 +207,45 @@ impl GpuBackend for CpuBackend {
         args: HashJoinArgs<'_>,
     ) -> Result<DeviceBatch, EngineError> {
         Self::check_stream(stream)?;
-        let out = kernels::hash_join(
+        let out = kernels::hash_join_gather(
             host_batch(args.left)?,
             host_batch(args.right)?,
-            args.left_key,
-            args.right_key,
+            host_table(args.table)?,
+            host_matches(args.matches)?,
+            args.first,
+            args.rows,
+            None,
         )?;
         Ok(DeviceBatch::from_host(out))
+    }
+
+    fn prepare_join_build(
+        &self,
+        stream: &DeviceStream,
+        args: JoinBuildArgs<'_>,
+    ) -> Result<DeviceJoinTable, EngineError> {
+        Self::check_stream(stream)?;
+        let build = host_batch(args.build)?;
+        // Host memory is the device here, so preparing is a copy of the
+        // index the operator already built.
+        Ok(DeviceJoinTable::from_host(
+            args.index.clone(),
+            build.num_rows(),
+        ))
+    }
+
+    fn probe_join(
+        &self,
+        stream: &DeviceStream,
+        args: JoinProbeArgs<'_>,
+    ) -> Result<DeviceJoinMatches, EngineError> {
+        Self::check_stream(stream)?;
+        let matches = kernels::JoinMatches::probe(
+            host_batch(args.probe)?,
+            args.key,
+            host_table(args.table)?,
+        )?;
+        Ok(DeviceJoinMatches::from_host(matches))
     }
 
     fn aggregate(

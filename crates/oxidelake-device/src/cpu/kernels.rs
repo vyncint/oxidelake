@@ -189,9 +189,25 @@ impl JoinTable {
         }
     }
 
-    /// `(start, count)` of `key`'s run in the row array.
+    /// `(start, count)` of `key`'s run in [`Self::row_indices`].
     fn run(&self, key: i64) -> Option<(u32, u32)> {
         self.ranges.get(&key).copied()
+    }
+
+    /// Every distinct key with its run in [`Self::row_indices`], as
+    /// `(key, start, count)`, in no particular order. A backend builds its
+    /// device index from these rather than hashing the build side again
+    /// (see `GpuBackend::prepare_join_build`).
+    pub fn runs(&self) -> impl Iterator<Item = (i64, u32, u32)> + '_ {
+        self.ranges
+            .iter()
+            .map(|(&key, &(start, count))| (key, start, count))
+    }
+
+    /// The build rows with a non-`NULL` key, grouped by key and in build
+    /// order within a key: the array every run indexes.
+    pub fn row_indices(&self) -> &[u32] {
+        &self.rows
     }
 
     /// Number of distinct non-`NULL` keys.

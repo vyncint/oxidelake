@@ -14,8 +14,9 @@
 //!   CPU path;
 //! * a backend is asked whether it supports an operation *before* anything is
 //!   uploaded ([`GpuBackend::supports_predicate`] and friends);
-//! * a hash join's build side is hashed once ([`JoinBuild`]) and uploaded once
-//!   per operator, then probed by every batch;
+//! * a hash join's build side is hashed once ([`JoinBuild`]), then uploaded
+//!   and indexed on the device once per operator
+//!   ([`GpuBackend::prepare_join_build`]) and probed by every batch;
 //! * a hash join's output leaves in batches of a bounded size
 //!   ([`JoinProbe`]), however often its keys repeat.
 
@@ -31,8 +32,9 @@ use oxidelake_core::params::{AggregateSpec, DistanceMetric, Predicate, vector_di
 use oxidelake_core::telemetry::OperatorStats;
 use oxidelake_device::cpu::kernels::{self, JoinTable};
 use oxidelake_device::{
-    AggregateArgs, DeviceBatch, DeviceStream, FilterProjectArgs, GpuBackend, HashJoinArgs,
-    VectorDistanceArgs, columns,
+    AggregateArgs, DeviceBatch, DeviceJoinMatches, DeviceJoinTable, DeviceStream,
+    FilterProjectArgs, GpuBackend, HashJoinArgs, JoinBuildArgs, JoinProbeArgs, VectorDistanceArgs,
+    columns,
 };
 
 /// Name of the synthetic row-id column appended to device sub-batches whose
@@ -193,10 +195,130 @@ impl JoinBuild {
     }
 }
 
-/// The build side as uploaded for one operator, with the plan it was cut by.
+/// The build side as uploaded and indexed for one operator, with the plan it
+/// was cut by.
 struct DeviceBuild {
     plan: SidePlan,
     batch: DeviceBatch,
+    table: DeviceJoinTable,
+}
+
+/// What became of this operator's attempt to put the build side on the
+/// device.
+enum BuildState {
+    Ready(Arc<DeviceBuild>),
+    /// The backend declined. Kept so that a backend which cannot prepare a
+    /// join — one that leaves `prepare_join_build` at its default, say — is
+    /// handed the build side once rather than once per probe batch.
+    Declined {
+        feature: &'static str,
+        detail: String,
+    },
+}
+
+/// The columns a join's device path moves from each side, and where each
+/// output column comes from.
+struct JoinPlan {
+    /// Output columns, as indices into `left ++ build`.
+    selected: Vec<usize>,
+    /// Columns of the probe side.
+    width: usize,
+    left: SidePlan,
+    right: SidePlan,
+}
+
+impl JoinPlan {
+    fn new(
+        left: &Schema,
+        right: &Schema,
+        left_key: usize,
+        right_key: usize,
+        projection: Option<&[usize]>,
+    ) -> Result<Self, EngineError> {
+        let width = left.fields().len();
+        let all = width + right.fields().len();
+        let selected: Vec<usize> = match projection {
+            Some(p) => p.to_vec(),
+            None => (0..all).collect(),
+        };
+        if let Some(&index) = selected.iter().find(|&&index| index >= all) {
+            return Err(EngineError::plan(format!(
+                "join projection index {index} out of range"
+            )));
+        }
+        let left_plan = GpuOperator::side_plan(
+            left,
+            left_key,
+            selected.iter().copied().filter(|&i| i < width),
+        )?;
+        let right_plan = GpuOperator::side_plan(
+            right,
+            right_key,
+            selected
+                .iter()
+                .copied()
+                .filter(|&i| i >= width)
+                .map(|i| i - width),
+        )?;
+        Ok(Self {
+            selected,
+            width,
+            left: left_plan,
+            right: right_plan,
+        })
+    }
+
+    /// The output rows of one downloaded device piece, whose columns are the
+    /// left sub-batch's then the right's (each with its row-id column last
+    /// when present). A column the device does not hold is gathered on the
+    /// host at the row ids.
+    fn assemble(
+        &self,
+        dev_out: &RecordBatch,
+        left: &RecordBatch,
+        build: &RecordBatch,
+    ) -> Result<RecordBatch, EngineError> {
+        let (ls, rs) = (left.schema(), build.schema());
+        let left_width = self.left.device_cols.len() + usize::from(self.left.row_ids);
+        let left_ids = self
+            .left
+            .row_id_position()
+            .map(|pos| Arc::clone(dev_out.column(pos)));
+        let right_ids = self
+            .right
+            .row_id_position()
+            .map(|pos| Arc::clone(dev_out.column(left_width + pos)));
+        let mut fields = Vec::with_capacity(self.selected.len());
+        let mut columns = Vec::with_capacity(self.selected.len());
+        for &index in &self.selected {
+            let (schema, batch, plan, ids, offset, local) = if index < self.width {
+                (&ls, left, &self.left, &left_ids, 0, index)
+            } else {
+                (
+                    &rs,
+                    build,
+                    &self.right,
+                    &right_ids,
+                    left_width,
+                    index - self.width,
+                )
+            };
+            fields.push(Arc::clone(field(schema, local)?));
+            match plan.position(local) {
+                Some(pos) => columns.push(Arc::clone(dev_out.column(offset + pos))),
+                None => {
+                    let ids = ids
+                        .as_ref()
+                        .ok_or_else(|| EngineError::execution("row ids missing for host gather"))?;
+                    columns.push(take_rows(batch.column(local), ids)?);
+                }
+            }
+        }
+        Ok(RecordBatch::try_new(
+            Arc::new(Schema::new(fields)),
+            columns,
+        )?)
+    }
 }
 
 /// One probe batch of a hash join, on its way out in pieces of a bounded
@@ -205,6 +327,7 @@ struct DeviceBuild {
 /// [`GpuOperator::next_join_chunk`].
 pub struct JoinProbe {
     left: RecordBatch,
+    left_key: usize,
     projection: Option<Vec<usize>>,
     batch_size: usize,
     /// Until the first piece is out: when the probe started, and the rows it
@@ -214,9 +337,9 @@ pub struct JoinProbe {
 }
 
 enum ProbePath {
-    /// The device joined the whole batch in one piece, which the first call
-    /// takes.
-    Device(Option<(RecordBatch, (u64, u64))>),
+    /// Probed on the device, where its matches stay; each piece is gathered
+    /// there and downloaded.
+    Device(Box<DeviceProbe>),
     /// The CPU reference, gathering from match `next` on; `why` is the reason
     /// each piece is counted as a fallback.
     Host {
@@ -226,13 +349,34 @@ enum ProbePath {
     },
 }
 
+/// A probe batch on the device: its sub-batch and its matches, resident on
+/// the stream that probed them, and the next match to gather.
+struct DeviceProbe {
+    stream: usize,
+    build: Arc<DeviceBuild>,
+    left: DeviceBatch,
+    matches: DeviceJoinMatches,
+    plan: JoinPlan,
+    next: u64,
+}
+
+/// What probing one batch on the device produced.
+enum Probed {
+    Device(Box<DeviceProbe>),
+    /// The backend answered `Unsupported` on the way; the batch takes the
+    /// CPU reference path.
+    Declined(EngineError),
+}
+
 impl std::fmt::Debug for JoinProbe {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut s = f.debug_struct("JoinProbe");
         s.field("probe_rows", &self.left.num_rows())
             .field("batch_size", &self.batch_size);
         match &self.path {
-            ProbePath::Device(pending) => s.field("device_output_pending", &pending.is_some()),
+            ProbePath::Device(device) => s
+                .field("device_matches", &device.matches.len())
+                .field("device_emitted", &device.next),
             ProbePath::Host { matches, next, .. } => s
                 .field("cpu_matches", &matches.len())
                 .field("cpu_emitted", next),
@@ -251,7 +395,7 @@ pub struct GpuOperator {
     streams: Vec<DeviceStream>,
     next_stream: AtomicUsize,
     stats: Option<Arc<OperatorStats>>,
-    device_build: OnceLock<Arc<DeviceBuild>>,
+    device_build: OnceLock<BuildState>,
     /// One `warn!` per operator instance, not one per batch: a fallback that
     /// happens at all usually happens for every batch, and a log line per
     /// batch would bury the fact it is reporting.
@@ -518,34 +662,23 @@ impl GpuOperator {
         batch_size: usize,
     ) -> Result<JoinProbe, EngineError> {
         let start = Instant::now();
-        let batch_size = batch_size.max(1);
-        let matches = kernels::JoinMatches::probe(left, left_key, build.table())?;
-        let outcome = match self.no_device_path(self.backend.supports_hash_join(), "hash joins") {
-            Some(why) => DeviceOutcome::Declined(why),
-            None if matches.len() > batch_size as u64 => {
-                DeviceOutcome::Declined(EngineError::unsupported(
-                    "operator.join_output",
-                    format!(
-                        "a probe batch joins to {} rows, more than one {batch_size}-row \
-                         batch, and the device returns a probe batch's output in one piece",
-                        matches.len()
-                    ),
-                ))
-            }
-            None => self.hash_join_on_device(left, build, left_key, projection)?,
+        let probed = match self.no_device_path(self.backend.supports_hash_join(), "hash joins") {
+            Some(why) => Probed::Declined(why),
+            None => self.probe_on_device(left, build, left_key, projection)?,
         };
-        let path = match outcome {
-            DeviceOutcome::Ran(out, moved) => ProbePath::Device(Some((out, moved))),
-            DeviceOutcome::Declined(why) => ProbePath::Host {
-                matches,
+        let path = match probed {
+            Probed::Device(device) => ProbePath::Device(device),
+            Probed::Declined(why) => ProbePath::Host {
+                matches: kernels::JoinMatches::probe(left, left_key, build.table())?,
                 next: 0,
                 why,
             },
         };
         Ok(JoinProbe {
             left: left.clone(),
+            left_key,
             projection: projection.map(<[usize]>::to_vec),
-            batch_size,
+            batch_size: batch_size.max(1),
             first: Some((start, left.num_rows() + build.uncounted_rows())),
             path,
         })
@@ -561,30 +694,56 @@ impl GpuOperator {
         build: &JoinBuild,
     ) -> Result<Option<RecordBatch>, EngineError> {
         let started = Instant::now();
-        let (out, moved) = match &mut probe.path {
-            ProbePath::Device(done) => match done.take() {
-                Some((out, moved)) => (out, Some(moved)),
-                None => return Ok(None),
-            },
-            ProbePath::Host { matches, next, why } => {
-                let remaining = matches.len() - *next;
-                if remaining == 0 && probe.first.is_none() {
-                    return Ok(None);
+        let (out, moved) = loop {
+            let (total, next) = match &probe.path {
+                ProbePath::Device(device) => (device.matches.len(), device.next),
+                ProbePath::Host { matches, next, .. } => (matches.len(), *next),
+            };
+            let remaining = total - next;
+            if remaining == 0 && probe.first.is_none() {
+                return Ok(None);
+            }
+            // At most the batch size, so it fits a `usize`.
+            let rows = remaining.min(probe.batch_size as u64) as usize;
+            match &mut probe.path {
+                ProbePath::Device(device) => {
+                    match self.gather_on_device(device, &probe.left, build, rows) {
+                        Ok((out, d2h)) => {
+                            device.next += rows as u64;
+                            break (out, Some((0, d2h)));
+                        }
+                        // A backend numbers a probe's matches as the CPU
+                        // reference does (`GpuBackend::probe_join`), so the
+                        // rest of the batch continues there from the same
+                        // match, neither repeating nor losing a row.
+                        Err(why) if why.is_unsupported() => {
+                            probe.path = ProbePath::Host {
+                                matches: kernels::JoinMatches::probe(
+                                    &probe.left,
+                                    probe.left_key,
+                                    build.table(),
+                                )?,
+                                next,
+                                why,
+                            };
+                        }
+                        Err(err) => return Err(err),
+                    }
                 }
-                // At most the batch size, so it fits a `usize`.
-                let rows = remaining.min(probe.batch_size as u64) as usize;
-                self.fell_back(why);
-                let out = kernels::hash_join_gather(
-                    &probe.left,
-                    build.batch(),
-                    build.table(),
-                    matches,
-                    *next,
-                    rows,
-                    probe.projection.as_deref(),
-                )?;
-                *next += rows as u64;
-                (out, None)
+                ProbePath::Host { matches, next, why } => {
+                    self.fell_back(why);
+                    let out = kernels::hash_join_gather(
+                        &probe.left,
+                        build.batch(),
+                        build.table(),
+                        matches,
+                        *next,
+                        rows,
+                        probe.projection.as_deref(),
+                    )?;
+                    *next += rows as u64;
+                    break (out, None);
+                }
             }
         };
         // The first piece carries the probe itself in its time, and the rows.
@@ -613,128 +772,165 @@ impl GpuOperator {
         })
     }
 
-    /// The build side on the device, uploaded on first use and reused by every
-    /// probe batch of this operator (a fresh operator per partition, so at most
-    /// one upload per partition instead of one per batch).
+    fn record_transfer(&self, h2d: u64, d2h: u64) {
+        if let Some(stats) = &self.stats {
+            stats.record_transfer(h2d, d2h);
+        }
+    }
+
+    /// The build side on the device: uploaded and indexed on first use and
+    /// reused by every probe batch of this operator (a fresh operator per
+    /// partition, so one upload per partition instead of one per batch). A
+    /// backend that declines is not asked again.
     fn device_build(
         &self,
         stream: &DeviceStream,
         build: &JoinBuild,
         plan: &SidePlan,
     ) -> Result<Arc<DeviceBuild>, EngineError> {
-        if let Some(cached) = self.device_build.get()
-            && cached.plan == *plan
-        {
-            return Ok(Arc::clone(cached));
+        match self.device_build.get() {
+            Some(BuildState::Ready(cached)) if cached.plan == *plan => {
+                return Ok(Arc::clone(cached));
+            }
+            Some(BuildState::Declined { feature, detail }) => {
+                return Err(EngineError::unsupported(feature, detail.clone()));
+            }
+            _ => {}
         }
-        let sub = plan.sub_batch(build.batch())?;
-        let batch = self.backend.upload(stream, &sub)?;
-        // Later batches may run on the operator's other stream: make the
-        // upload visible to every stream before anyone probes it.
-        self.backend.synchronize(stream)?;
-        // Counted where it happens, once per operator: the per-batch
-        // counters only see the probe side (#103).
-        if let Some(stats) = &self.stats {
-            stats.record_transfer(transfer_bytes(&sub), 0);
+        match self.prepare_device_build(stream, build, plan) {
+            Ok(fresh) => {
+                // `set` fails only if a build with another plan is cached,
+                // which one exec's fixed projection never produces; that
+                // batch then uses its own upload without caching it.
+                let _ = self.device_build.set(BuildState::Ready(Arc::clone(&fresh)));
+                Ok(fresh)
+            }
+            Err(EngineError::Unsupported { feature, detail }) => {
+                let _ = self.device_build.set(BuildState::Declined {
+                    feature,
+                    detail: detail.clone(),
+                });
+                Err(EngineError::unsupported(feature, detail))
+            }
+            Err(other) => Err(other),
         }
-        let fresh = Arc::new(DeviceBuild {
-            plan: plan.clone(),
-            batch,
-        });
-        Ok(Arc::clone(self.device_build.get_or_init(|| fresh)))
     }
 
-    fn hash_join_on_device(
+    fn prepare_device_build(
+        &self,
+        stream: &DeviceStream,
+        build: &JoinBuild,
+        plan: &SidePlan,
+    ) -> Result<Arc<DeviceBuild>, EngineError> {
+        let sub = plan.sub_batch(build.batch())?;
+        let batch = self.backend.upload(stream, &sub)?;
+        // Counted where it happens, once per operator: the per-batch
+        // counters only see the probe side (#103).
+        self.record_transfer(transfer_bytes(&sub), 0);
+        let key = plan
+            .position(build.key())
+            .ok_or_else(|| EngineError::plan("build key missing from the device plan"))?;
+        let table = self.backend.prepare_join_build(
+            stream,
+            JoinBuildArgs {
+                build: &batch,
+                key,
+                index: build.table(),
+            },
+        )?;
+        self.record_transfer(table.uploaded_bytes(), 0);
+        // Later batches may run on the operator's other stream: make the
+        // upload and the index visible to every stream before anyone probes
+        // them.
+        self.backend.synchronize(stream)?;
+        Ok(Arc::new(DeviceBuild {
+            plan: plan.clone(),
+            batch,
+            table,
+        }))
+    }
+
+    /// Uploads one probe batch's columns and probes them against the build
+    /// side on the device. [`Probed::Declined`] when the backend answered
+    /// `Unsupported` on the way: the batch then takes the CPU reference path.
+    fn probe_on_device(
         &self,
         left: &RecordBatch,
         build: &JoinBuild,
         left_key: usize,
         projection: Option<&[usize]>,
-    ) -> Result<DeviceOutcome, EngineError> {
-        let (ls, rs) = (left.schema(), build.batch().schema());
-        let width = ls.fields().len();
-        let selected: Vec<usize> = match projection {
-            Some(p) => p.to_vec(),
-            None => (0..width + rs.fields().len()).collect(),
-        };
-        for &index in &selected {
-            if index >= width + rs.fields().len() {
-                return Err(EngineError::plan(format!(
-                    "join projection index {index} out of range"
-                )));
-            }
-        }
-        let left_plan = Self::side_plan(
-            &ls,
+    ) -> Result<Probed, EngineError> {
+        let plan = JoinPlan::new(
+            &left.schema(),
+            &build.batch().schema(),
             left_key,
-            selected.iter().copied().filter(|&i| i < width),
-        )?;
-        let right_plan = Self::side_plan(
-            &rs,
             build.key(),
-            selected
-                .iter()
-                .copied()
-                .filter(|&i| i >= width)
-                .map(|i| i - width),
+            projection,
         )?;
-        let left_sub = left_plan.sub_batch(left)?;
-        let left_key_pos = left_plan.position(left_key).unwrap_or(0);
-        let right_key_pos = right_plan.position(build.key()).unwrap_or(0);
-        let (dev_out, moved) = match self.try_device(|stream| {
-            let dev_build = self.device_build(stream, build, &right_plan)?;
-            self.round_trip(stream, &left_sub, |stream, dev_left| {
-                self.backend.hash_join(
-                    stream,
-                    HashJoinArgs {
-                        left: dev_left,
-                        right: &dev_build.batch,
-                        left_key: left_key_pos,
-                        right_key: right_key_pos,
+        let left_sub = plan.left.sub_batch(left)?;
+        let key = plan
+            .left
+            .position(left_key)
+            .ok_or_else(|| EngineError::plan("probe key missing from the device plan"))?;
+        // Every piece of this batch is gathered on the stream that holds its
+        // matches.
+        let stream = self.next_stream.fetch_add(1, Ordering::Relaxed) % self.streams.len();
+        let on = &self.streams[stream];
+        let probed = self
+            .device_build(on, build, &plan.right)
+            .and_then(|dev_build| {
+                let dev_left = self.backend.upload(on, &left_sub)?;
+                // Counted where it happens, like the build side's.
+                self.record_transfer(transfer_bytes(&left_sub), 0);
+                let matches = self.backend.probe_join(
+                    on,
+                    JoinProbeArgs {
+                        probe: &dev_left,
+                        key,
+                        table: &dev_build.table,
                     },
-                )
-            })
-        })? {
-            DeviceOutcome::Ran(batch, moved) => (batch, moved),
-            declined => return Ok(declined),
-        };
-        // Device output = left sub-batch columns ++ right sub-batch columns
-        // (each with its row-id column last when present).
-        let left_width = left_plan.device_cols.len() + usize::from(left_plan.row_ids);
-        let left_ids = left_plan
-            .row_id_position()
-            .map(|pos| Arc::clone(dev_out.column(pos)));
-        let right_ids = right_plan
-            .row_id_position()
-            .map(|pos| Arc::clone(dev_out.column(left_width + pos)));
-        let mut fields = Vec::with_capacity(selected.len());
-        let mut columns = Vec::with_capacity(selected.len());
-        for &index in &selected {
-            let (schema, batch, plan, ids, offset, local) = if index < width {
-                (&ls, left, &left_plan, &left_ids, 0, index)
-            } else {
-                (
-                    &rs,
-                    build.batch(),
-                    &right_plan,
-                    &right_ids,
-                    left_width,
-                    index - width,
-                )
-            };
-            fields.push(Arc::clone(field(schema, local)?));
-            match plan.position(local) {
-                Some(pos) => columns.push(Arc::clone(dev_out.column(offset + pos))),
-                None => {
-                    let ids = ids
-                        .as_ref()
-                        .ok_or_else(|| EngineError::execution("row ids missing for host gather"))?;
-                    columns.push(take_rows(batch.column(local), ids)?);
-                }
-            }
+                )?;
+                Ok((dev_build, dev_left, matches))
+            });
+        match probed {
+            Ok((build, left, matches)) => Ok(Probed::Device(Box::new(DeviceProbe {
+                stream,
+                build,
+                left,
+                matches,
+                plan,
+                next: 0,
+            }))),
+            Err(why) if why.is_unsupported() => Ok(Probed::Declined(why)),
+            Err(err) => Err(err),
         }
-        let out = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
-        Ok(DeviceOutcome::Ran(out, moved))
+    }
+
+    /// Matches `device.next..+rows` of a probe batch gathered on the device,
+    /// downloaded and assembled, with the bytes the download moved.
+    fn gather_on_device(
+        &self,
+        device: &DeviceProbe,
+        left: &RecordBatch,
+        build: &JoinBuild,
+        rows: usize,
+    ) -> Result<(RecordBatch, u64), EngineError> {
+        let stream = &self.streams[device.stream];
+        let out = self.backend.hash_join(
+            stream,
+            HashJoinArgs {
+                left: &device.left,
+                right: &device.build.batch,
+                table: &device.build.table,
+                matches: &device.matches,
+                first: device.next,
+                rows,
+            },
+        )?;
+        let host = self.backend.download(stream, &out)?;
+        self.backend.synchronize(stream)?;
+        let d2h = transfer_bytes(&host);
+        Ok((device.plan.assemble(&host, left, build.batch())?, d2h))
     }
 
     /// Grouped aggregation of one (complete) input batch.
@@ -884,12 +1080,19 @@ mod tests {
     /// halves of that need a backend that reports `cuda` while declining some
     /// shapes. `float_predicates` is the knob the Metal backend really has —
     /// it has no f64, so a `Float64` comparison is declined before anything
-    /// is uploaded. The counters say what the operator asked of the device.
+    /// is uploaded. `declines_prepare` declines `prepare_join_build` the way
+    /// the trait's default does, as a backend written before it existed
+    /// would; `gathers_before_declining` declines every join piece after
+    /// that many. The counters say what the operator asked of the device.
     #[derive(Debug, Default)]
     struct FakeGpu {
         inner: CpuBackend,
         float_predicates: bool,
+        declines_prepare: bool,
+        gathers_before_declining: Option<usize>,
         uploads: AtomicUsize,
+        prepared: AtomicUsize,
+        probes: AtomicUsize,
         joins: AtomicUsize,
     }
 
@@ -982,8 +1185,39 @@ mod tests {
             stream: &DeviceStream,
             args: HashJoinArgs<'_>,
         ) -> Result<DeviceBatch, EngineError> {
-            self.joins.fetch_add(1, Ordering::Relaxed);
+            let done = self.joins.fetch_add(1, Ordering::Relaxed);
+            if self
+                .gathers_before_declining
+                .is_some_and(|limit| done >= limit)
+            {
+                return Err(EngineError::unsupported(
+                    "fake.hash_join",
+                    "this fake declines join pieces after a few",
+                ));
+            }
             self.inner.hash_join(stream, args)
+        }
+        fn prepare_join_build(
+            &self,
+            stream: &DeviceStream,
+            args: JoinBuildArgs<'_>,
+        ) -> Result<DeviceJoinTable, EngineError> {
+            if self.declines_prepare {
+                return Err(EngineError::unsupported(
+                    "backend.prepare_join_build",
+                    "this fake leaves it at the trait's default",
+                ));
+            }
+            self.prepared.fetch_add(1, Ordering::Relaxed);
+            self.inner.prepare_join_build(stream, args)
+        }
+        fn probe_join(
+            &self,
+            stream: &DeviceStream,
+            args: JoinProbeArgs<'_>,
+        ) -> Result<DeviceJoinMatches, EngineError> {
+            self.probes.fetch_add(1, Ordering::Relaxed);
+            self.inner.probe_join(stream, args)
         }
         fn aggregate(
             &self,
@@ -1283,47 +1517,120 @@ mod tests {
         assert_eq!(snapshot.rows_out, total as u64, "{snapshot:?}");
     }
 
-    /// A device that returns a probe batch's output in one piece is not
-    /// handed a batch whose output would not fit one: that batch takes the
-    /// CPU path, piece by piece and counted, before anything is uploaded. A
-    /// batch that fits still runs on the device, in one piece.
+    fn fake(configure: impl FnOnce(&mut FakeGpu)) -> Arc<FakeGpu> {
+        let mut fake = FakeGpu {
+            float_predicates: true,
+            ..FakeGpu::default()
+        };
+        configure(&mut fake);
+        Arc::new(fake)
+    }
+
+    fn joined(pieces: &[RecordBatch]) -> RecordBatch {
+        arrow::compute::concat_batches(&pieces[0].schema(), pieces).unwrap()
+    }
+
+    /// The device path gathers a skewed probe batch in pieces too (#95): one
+    /// probe on the device, then one gather per piece of at most the batch
+    /// size, together exactly the CPU reference in its order (#45).
     #[test]
-    fn a_device_is_not_handed_a_probe_batch_too_big_for_one_piece() {
-        let fake = FakeGpu::new(true);
+    fn a_device_gathers_a_skewed_probe_batch_in_pieces() {
+        let fake = fake(|_| {});
         let hub = TelemetryHub::new();
         let stats = hub.register_operator("GpuHashJoinExec", BackendKind::Cuda);
         let backend = Arc::clone(&fake) as Arc<dyn GpuBackend>;
         let op = GpuOperator::new(backend, Some(Arc::clone(&stats))).unwrap();
         let build = JoinBuild::new(keyed(200, "r"), 0).unwrap();
-        let reference = |probe: &RecordBatch| {
-            kernels::hash_join_probe(probe, 0, build.batch(), build.table(), None).unwrap()
-        };
+        let probe = keyed(2_000, "l");
+        let reference =
+            kernels::hash_join_probe(&probe, 0, build.batch(), build.table(), None).unwrap();
 
-        let big = keyed(2_000, "l");
-        let pieces = join_all(&op, &big, &build, None, 61);
-        assert!(pieces.len() > 1);
+        let pieces = join_all(&op, &probe, &build, None, 61);
+        assert_eq!(pieces.len(), reference.num_rows().div_ceil(61));
         assert!(pieces.iter().all(|piece| piece.num_rows() <= 61));
-        let joined = arrow::compute::concat_batches(&pieces[0].schema(), &pieces).unwrap();
-        assert_eq!(joined, reference(&big));
-        assert_eq!(fake.joins.load(Ordering::Relaxed), 0);
-        assert_eq!(fake.uploads.load(Ordering::Relaxed), 0);
-        assert_eq!(stats.snapshot().fallback_batches, pieces.len() as u64);
+        assert_eq!(joined(&pieces), reference);
+        assert_eq!(fake.prepared.load(Ordering::Relaxed), 1);
+        assert_eq!(fake.probes.load(Ordering::Relaxed), 1);
+        assert_eq!(fake.joins.load(Ordering::Relaxed), pieces.len());
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.fallback_batches, 0, "{snapshot:?}");
+        assert_eq!(snapshot.batches, pieces.len() as u64, "{snapshot:?}");
+    }
 
-        let small = keyed(10, "l");
-        assert!(reference(&small).num_rows() <= 61);
-        let pieces = join_all(&op, &small, &build, None, 61);
-        assert_eq!(pieces, vec![reference(&small)]);
-        assert_eq!(fake.joins.load(Ordering::Relaxed), 1);
+    /// The build side is uploaded and indexed once per operator, however
+    /// many probe batches follow (#45), and the device path returns the CPU
+    /// reference's rows in the CPU reference's order.
+    #[test]
+    fn a_join_prepares_its_build_side_once_per_operator() {
+        let fake = fake(|_| {});
+        let op = GpuOperator::new(Arc::clone(&fake) as Arc<dyn GpuBackend>, None).unwrap();
+        let build = JoinBuild::new(keyed(200, "r"), 0).unwrap();
+        let parent = keyed(2_000, "l");
+        for offset in [0, 500, 1_000] {
+            let probe = parent.slice(offset, 100);
+            let device = join_all(&op, &probe, &build, None, 65_536);
+            let reference =
+                kernels::hash_join_probe(&probe, 0, build.batch(), build.table(), None).unwrap();
+            assert!(reference.num_rows() > 0);
+            assert_eq!(device, vec![reference], "probe rows {offset}..+100");
+        }
+        assert_eq!(fake.prepared.load(Ordering::Relaxed), 1);
+        assert_eq!(fake.probes.load(Ordering::Relaxed), 3);
         assert_eq!(
             fake.uploads.load(Ordering::Relaxed),
-            2,
-            "the build side, then the probe batch"
+            1 + 3,
+            "the build side once, then each probe batch"
         );
+    }
+
+    /// A backend that cannot prepare a join runs every probe batch on the
+    /// CPU reference, counted, and is handed the build side once rather than
+    /// once per batch.
+    #[test]
+    fn a_backend_that_cannot_prepare_a_join_is_asked_once() {
+        let fake = fake(|fake| fake.declines_prepare = true);
+        let hub = TelemetryHub::new();
+        let stats = hub.register_operator("GpuHashJoinExec", BackendKind::Cuda);
+        let backend = Arc::clone(&fake) as Arc<dyn GpuBackend>;
+        let op = GpuOperator::new(backend, Some(Arc::clone(&stats))).unwrap();
+        let build = JoinBuild::new(keyed(200, "r"), 0).unwrap();
+        let probe = keyed(100, "l");
+        let reference =
+            kernels::hash_join_probe(&probe, 0, build.batch(), build.table(), None).unwrap();
+        for _ in 0..3 {
+            assert_eq!(
+                join_all(&op, &probe, &build, None, 65_536),
+                vec![reference.clone()]
+            );
+        }
+        assert_eq!(stats.snapshot().fallback_batches, 3);
+        assert_eq!(fake.uploads.load(Ordering::Relaxed), 1);
+        assert_eq!(fake.probes.load(Ordering::Relaxed), 0);
+    }
+
+    /// A probe batch whose device piece is declined finishes on the CPU
+    /// reference from the same match: both paths number a probe's matches
+    /// the same way, so no row is repeated or lost at the switch.
+    #[test]
+    fn a_probe_batch_finishes_on_the_cpu_when_the_device_declines_a_piece() {
+        let fake = fake(|fake| fake.gathers_before_declining = Some(2));
+        let hub = TelemetryHub::new();
+        let stats = hub.register_operator("GpuHashJoinExec", BackendKind::Cuda);
+        let backend = Arc::clone(&fake) as Arc<dyn GpuBackend>;
+        let op = GpuOperator::new(backend, Some(Arc::clone(&stats))).unwrap();
+        let build = JoinBuild::new(keyed(200, "r"), 0).unwrap();
+        let probe = keyed(2_000, "l");
+        let reference =
+            kernels::hash_join_probe(&probe, 0, build.batch(), build.table(), None).unwrap();
+
+        let pieces = join_all(&op, &probe, &build, Some(&[1, 2, 4, 5]), 61);
+        assert!(pieces.iter().all(|piece| piece.num_rows() <= 61));
+        assert_eq!(joined(&pieces), reference.project(&[1, 2, 4, 5]).unwrap());
         let snapshot = stats.snapshot();
         assert_eq!(
-            snapshot.batches - snapshot.fallback_batches,
-            1,
-            "{snapshot:?}"
+            snapshot.fallback_batches,
+            pieces.len() as u64 - 2,
+            "two pieces on the device, the rest on the CPU: {snapshot:?}"
         );
     }
 

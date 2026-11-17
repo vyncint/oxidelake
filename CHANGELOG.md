@@ -40,6 +40,35 @@ versions (0.x) may contain breaking changes; they are always listed under a
   match (#95). *Migration:* `let mut probe = op.hash_join(&left, &build,
   key, projection, batch_size)?;` then `while let Some(batch) =
   op.next_join_chunk(&mut probe, &build)? { … }`.
+- **`GpuBackend` prepares a hash join's build side once and probes it in
+  two steps** (the join half of #45). The CUDA backend used to rebuild its
+  join table for every probe batch; `prepare_join_build` now indexes the
+  build side once per operator and returns a `DeviceJoinTable`,
+  `probe_join` returns a probe batch's `DeviceJoinMatches`, numbered in
+  probe-row order and then build order as the CPU reference numbers them,
+  and `hash_join` gathers a range of those matches, so a skewed probe batch
+  leaves the device in pieces of at most a batch (#95). Breaking for code
+  that implements the trait or builds `HashJoinArgs`, which now carries
+  `table`, `matches`, `first` and `rows` in place of `left_key` and
+  `right_key`. *Migration:* an external backend that runs joins implements
+  the two new methods and gathers the range `HashJoinArgs` names. Until it
+  does, both default to `Unsupported`, so its joins take the CPU reference
+  path, counted in `fallback_batches`, and it is handed the build side once
+  rather than once per probe batch. Compiled, not yet run on a GPU:
+  STATUS.md has the T4 commands. The aggregate half of #45 is still open.
+- **The CUDA hash join keeps one slot per distinct build key** (#108). A
+  key repeated D times on the build side took D slots, so building the
+  table cost O(D²) `atomicCAS` attempts per probe batch and a probe row
+  landing in the run walked O(D) slots: for a 100 000-row single-key build
+  side, 5.0e9 attempts and 19 050 slot reads per absent probe key (the
+  0.2.0 kernel itself, compiled on the CPU under a shim that counts its
+  `atomicCAS` calls). The index now holds each key once with its run of
+  build rows. It is built on the host from the table the CPU path already
+  holds and only read on the device, so the device makes no `atomicCAS`
+  at all and a probe reads a bounded number of slots however often a key
+  repeats (1.1 to 1.8 on average for the same shapes), and a key's matches
+  come back in build order, as the CPU reference returns them. Not yet run
+  on a GPU (STATUS.md).
 
 ### Fixed
 
@@ -122,12 +151,11 @@ versions (0.x) may contain breaking changes; they are always listed under a
   `memory allocation of 2097152000 bytes failed` (SIGABRT, no error, no
   fallback) where stock DataFusion streams the same join in 74 MB. A probe
   batch's output now leaves in batches of at most the session's batch size,
-  and that query completes in 83 MB under a 4 GB cap. A GPU still
-  returns a probe batch's output in one piece, so a probe batch that joins
-  to more than one batch runs on the CPU reference, counted in
-  `fallback_batches`. A join's `batches` counter now counts the batches it
-  emits, which is its probe batches unless one of them joined to more than
-  a batch. `oxidelake_device::cpu::kernels` gains `JoinMatches` and
+  and that query completes in 83 MB under a 4 GB cap. On a GPU the pieces
+  are gathered on the device from matches that stay there (#45). A join's
+  `batches` counter now counts the batches it emits, which is its probe
+  batches unless one of them joined to more than a batch.
+  `oxidelake_device::cpu::kernels` gains `JoinMatches` and
   `hash_join_gather`, the reference for gathering a range of a probe's
   matches.
 

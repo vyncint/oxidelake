@@ -10,6 +10,7 @@
 //! Divergence from the CPU reference, by design: device `SUM` over `Int64`
 //! wraps on overflow where the CPU path reports an error.
 
+use std::fmt;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Float64Array, Int64Array, RecordBatch};
@@ -23,9 +24,15 @@ use oxidelake_core::params::{
 use oxidelake_core::{BackendKind, EngineError};
 
 use super::{CudaBackend, CudaBatch, CudaColumn, driver_error, foreign};
-use crate::args::{AggregateArgs, FilterProjectArgs, HashJoinArgs, VectorDistanceArgs};
+use crate::args::{
+    AggregateArgs, FilterProjectArgs, HashJoinArgs, JoinBuildArgs, JoinProbeArgs,
+    VectorDistanceArgs,
+};
 use crate::columns;
-use crate::handles::{BatchInner, DeviceBatch};
+use crate::handles::{
+    BatchInner, DeviceBatch, DeviceJoinMatches, DeviceJoinTable, JoinMatchesInner, JoinTableInner,
+};
+use crate::join_slots::JoinSlots;
 
 /// Threads per block for the one-thread-per-row kernels.
 const BLOCK: u32 = 256;
@@ -365,7 +372,173 @@ pub(super) fn filter_project(
 // hash join
 // ---------------------------------------------------------------------------
 
-/// Inner hash join on one `Int64` key per side; output = left columns then right columns.
+/// A hash join's build side on the device (#45, #108): the distinct-key slot
+/// index the host built from the CPU reference's table (`join_slots.rs`) and
+/// that table's row array, uploaded once per operator and only ever read by
+/// the kernels.
+pub struct CudaJoinTable {
+    capacity: u32,
+    keys: CudaSlice<i64>,
+    starts: CudaSlice<u32>,
+    counts: CudaSlice<u32>,
+    rows: CudaSlice<u32>,
+    row_count: u32,
+    distinct: usize,
+}
+
+impl fmt::Debug for CudaJoinTable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CudaJoinTable")
+            .field("capacity", &self.capacity)
+            .field("distinct", &self.distinct)
+            .field("rows", &self.row_count)
+            .finish()
+    }
+}
+
+/// One probe batch's matches on the device: per probe row, the exclusive
+/// scan of the match counts and the start of its key's run.
+pub struct CudaJoinMatches {
+    probe_rows: u32,
+    offsets: CudaSlice<u64>,
+    starts: CudaSlice<u32>,
+}
+
+impl fmt::Debug for CudaJoinMatches {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CudaJoinMatches")
+            .field("probe_rows", &self.probe_rows)
+            .finish()
+    }
+}
+
+fn cuda_table(table: &DeviceJoinTable) -> Result<&CudaJoinTable, EngineError> {
+    match &table.inner {
+        JoinTableInner::Cuda(t) => Ok(t),
+        JoinTableInner::Host(_) => Err(foreign("join table", table.backend())),
+    }
+}
+
+fn cuda_matches(matches: &DeviceJoinMatches) -> Result<&CudaJoinMatches, EngineError> {
+    match &matches.inner {
+        JoinMatchesInner::Cuda(m) => Ok(m),
+        JoinMatchesInner::Host(_) => Err(foreign("join matches", matches.backend())),
+    }
+}
+
+/// Copies `values` to the device; an empty slice still gets a one-element
+/// buffer, so a kernel argument always points at an allocation.
+fn upload_slice<T: DeviceRepr + ValidAsZeroBits>(
+    stream: &Arc<CudaStream>,
+    values: &[T],
+) -> Result<CudaSlice<T>, EngineError> {
+    if values.is_empty() {
+        alloc::<T>(stream, 1)
+    } else {
+        stream.clone_htod(values).map_err(driver_error)
+    }
+}
+
+/// Exclusive scan of per-row match counts. In `u64`: one probe batch's
+/// matches can pass `u32::MAX` however its output is chunked.
+fn match_offsets(counts: &[u32]) -> (Vec<u64>, u64) {
+    let mut offsets = Vec::with_capacity(counts.len());
+    let mut total = 0u64;
+    for &count in counts {
+        offsets.push(total);
+        total += u64::from(count);
+    }
+    (offsets, total)
+}
+
+/// Uploads the build side's index (#45): built on the host from the table
+/// the operator holds for the CPU path, with one slot per distinct key
+/// (#108). The previous table gave every build *row* a slot claimed with
+/// `atomicCAS`, again for every probe batch.
+pub(super) fn prepare_join_build(
+    stream: &Arc<CudaStream>,
+    args: JoinBuildArgs<'_>,
+) -> Result<DeviceJoinTable, EngineError> {
+    let build = cuda_batch(args.build)?;
+    require_int64(column(build, args.key)?, "build join key")?;
+    // Checks every row index and run against the build side, so the kernels
+    // can gather at what they read.
+    let slots = JoinSlots::build(args.index, build.num_rows)?;
+    let rows = args.index.row_indices();
+    let row_count = u32_len(rows.len(), "join build side")?;
+    let keys = upload_slice(stream, &slots.keys)?;
+    let starts = upload_slice(stream, &slots.starts)?;
+    let counts = upload_slice(stream, &slots.counts)?;
+    let device_rows = upload_slice(stream, rows)?;
+    let bytes =
+        (slots.keys.len() * 8 + (slots.starts.len() + slots.counts.len() + rows.len()) * 4) as u64;
+    Ok(DeviceJoinTable::new(
+        BackendKind::Cuda,
+        build.num_rows,
+        bytes,
+        JoinTableInner::Cuda(CudaJoinTable {
+            capacity: slots.capacity,
+            keys,
+            starts,
+            counts,
+            rows: device_rows,
+            row_count,
+            distinct: slots.distinct(),
+        }),
+    ))
+}
+
+/// Per probe row, its key's run in the prepared table (`oxide_hj_count`),
+/// then the scan of the counts on the host, kept on the device for
+/// [`hash_join`] to expand range by range.
+pub(super) fn probe_join(
+    backend: &CudaBackend,
+    stream: &Arc<CudaStream>,
+    args: JoinProbeArgs<'_>,
+) -> Result<DeviceJoinMatches, EngineError> {
+    let probe = cuda_batch(args.probe)?;
+    let table = cuda_table(args.table)?;
+    let key = column(probe, args.key)?;
+    require_int64(key, "probe join key")?;
+    let n = u32_len(probe.num_rows, "join probe side")?;
+    let mut counts = alloc::<u32>(stream, probe.num_rows)?;
+    let mut starts = alloc::<u32>(stream, probe.num_rows)?;
+    if n > 0 && table.distinct > 0 {
+        let func = backend.function("hash_join", HASH_JOIN_SRC, "oxide_hj_count")?;
+        let mut launch = stream.launch_builder(&func);
+        launch.arg(&*key.values);
+        push_validity(&mut launch, &key.validity);
+        launch.arg(&n);
+        launch.arg(&table.keys);
+        launch.arg(&table.starts);
+        launch.arg(&table.counts);
+        launch.arg(&table.capacity);
+        launch.arg(&mut counts);
+        launch.arg(&mut starts);
+        // SAFETY: arguments match `oxide_hj_count`; `counts` and `starts` hold n
+        // slots, and every slot it reads is masked below `capacity`, the length
+        // of the three table arrays.
+        unsafe { launch.launch(grid_for(n)) }.map_err(driver_error)?;
+    }
+    let mut host_counts = stream.clone_dtoh(&counts).map_err(driver_error)?;
+    host_counts.truncate(probe.num_rows);
+    let (offsets, total) = match_offsets(&host_counts);
+    let offsets = upload_slice(stream, &offsets)?;
+    Ok(DeviceJoinMatches::new(
+        BackendKind::Cuda,
+        probe.num_rows,
+        total,
+        JoinMatchesInner::Cuda(CudaJoinMatches {
+            probe_rows: n,
+            offsets,
+            starts,
+        }),
+    ))
+}
+
+/// Matches `args.first..args.first + args.rows` of a probe as output rows:
+/// left columns, then right columns. `oxide_hj_expand` turns the range into
+/// (probe row, build row) pairs; every column is then gathered at them.
 pub(super) fn hash_join(
     backend: &CudaBackend,
     stream: &Arc<CudaStream>,
@@ -373,12 +546,25 @@ pub(super) fn hash_join(
 ) -> Result<DeviceBatch, EngineError> {
     let left = cuda_batch(args.left)?;
     let right = cuda_batch(args.right)?;
-    let lk = column(left, args.left_key)?;
-    let rk = column(right, args.right_key)?;
-    require_int64(lk, "left join key")?;
-    require_int64(rk, "right join key")?;
-    let n_left = u32_len(left.num_rows, "join probe side")?;
-    let n_right = u32_len(right.num_rows, "join build side")?;
+    let table = cuda_table(args.table)?;
+    let matches = cuda_matches(args.matches)?;
+    if matches.probe_rows as usize != left.num_rows || args.table.build_rows() != right.num_rows {
+        return Err(EngineError::execution(
+            "hash join chunk: the probe, build, table and matches do not belong together",
+        ));
+    }
+    let end = u64::try_from(args.rows)
+        .ok()
+        .and_then(|rows| args.first.checked_add(rows));
+    if end.is_none_or(|end| end > args.matches.len()) {
+        return Err(EngineError::execution(format!(
+            "matches {}..+{} are outside a probe with {} matches",
+            args.first,
+            args.rows,
+            args.matches.len()
+        )));
+    }
+    let rows = u32_len(args.rows, "join output chunk")?;
     let fields: Vec<FieldRef> = args
         .left
         .schema()
@@ -389,76 +575,42 @@ pub(super) fn hash_join(
         .collect();
     let out_schema = Arc::new(Schema::new(fields));
 
-    let capacity = (2 * right.num_rows).max(16).next_power_of_two();
-    let cap_u32 = u32_len(capacity, "hash table capacity")?;
-    let mut t_keys = alloc::<i64>(stream, capacity)?;
-    let mut t_rows = alloc::<u32>(stream, capacity)?;
-    let mut t_state = alloc::<u32>(stream, capacity)?;
-    if n_right > 0 {
-        let func = backend.function("hash_join", HASH_JOIN_SRC, "oxide_hj_build")?;
+    let mut left_idx = alloc::<u32>(stream, args.rows)?;
+    let mut right_idx = alloc::<u32>(stream, args.rows)?;
+    if rows > 0 {
+        let func = backend.function("hash_join", HASH_JOIN_SRC, "oxide_hj_expand")?;
         let mut launch = stream.launch_builder(&func);
-        launch.arg(&*rk.values);
-        push_validity(&mut launch, &rk.validity);
-        launch.arg(&n_right);
-        launch.arg(&mut t_keys);
-        launch.arg(&mut t_rows);
-        launch.arg(&mut t_state);
-        launch.arg(&cap_u32);
-        // SAFETY: arguments match `oxide_hj_build`; capacity >= 2 * n_right so every insert finds a slot.
-        unsafe { launch.launch(grid_for(n_right)) }.map_err(driver_error)?;
-    }
-
-    let mut counts = alloc::<u32>(stream, left.num_rows)?;
-    if n_left > 0 && n_right > 0 {
-        let func = backend.function("hash_join", HASH_JOIN_SRC, "oxide_hj_count")?;
-        let mut launch = stream.launch_builder(&func);
-        launch.arg(&*lk.values);
-        push_validity(&mut launch, &lk.validity);
-        launch.arg(&n_left);
-        launch.arg(&t_keys);
-        launch.arg(&t_state);
-        launch.arg(&cap_u32);
-        launch.arg(&mut counts);
-        // SAFETY: arguments match `oxide_hj_count`; `counts` holds n_left slots.
-        unsafe { launch.launch(grid_for(n_left)) }.map_err(driver_error)?;
-    }
-    let mut host_counts = stream.clone_dtoh(&counts).map_err(driver_error)?;
-    host_counts.truncate(left.num_rows);
-    let (offsets, total) = exclusive_scan(&host_counts)?;
-    let offsets_dev = stream.clone_htod(&offsets).map_err(driver_error)?;
-    let mut left_idx = alloc::<u32>(stream, total)?;
-    let mut right_idx = alloc::<u32>(stream, total)?;
-    if total > 0 {
-        let func = backend.function("hash_join", HASH_JOIN_SRC, "oxide_hj_write")?;
-        let mut launch = stream.launch_builder(&func);
-        launch.arg(&*lk.values);
-        push_validity(&mut launch, &lk.validity);
-        launch.arg(&n_left);
-        launch.arg(&t_keys);
-        launch.arg(&t_rows);
-        launch.arg(&t_state);
-        launch.arg(&cap_u32);
-        launch.arg(&offsets_dev);
+        launch.arg(&matches.offsets);
+        launch.arg(&matches.starts);
+        launch.arg(&matches.probe_rows);
+        launch.arg(&table.rows);
+        launch.arg(&table.row_count);
+        launch.arg(&args.first);
+        launch.arg(&rows);
         launch.arg(&mut left_idx);
         launch.arg(&mut right_idx);
-        // SAFETY: arguments match `oxide_hj_write`; the index buffers hold exactly `total`
-        // pairs, the sum of the per-row counts computed by `oxide_hj_count`.
-        unsafe { launch.launch(grid_for(n_left)) }.map_err(driver_error)?;
+        // SAFETY: arguments match `oxide_hj_expand`; the index buffers hold
+        // `rows` slots, every probe row it can name is below `probe_rows` (the
+        // length of `offsets` and `starts`, at least one since the range is not
+        // empty), and every row index it reads is below `row_count`, the length
+        // of `table.rows`, whose entries `JoinSlots::build` checked against the
+        // build side.
+        unsafe { launch.launch(grid_for(rows)) }.map_err(driver_error)?;
     }
 
     let mut columns = Vec::with_capacity(left.columns.len() + right.columns.len());
     for col in &left.columns {
-        columns.push(gather_column(backend, stream, col, &left_idx, total)?);
+        columns.push(gather_column(backend, stream, col, &left_idx, args.rows)?);
     }
     for col in &right.columns {
-        columns.push(gather_column(backend, stream, col, &right_idx, total)?);
+        columns.push(gather_column(backend, stream, col, &right_idx, args.rows)?);
     }
     Ok(DeviceBatch::new(
         BackendKind::Cuda,
         out_schema,
-        total,
+        args.rows,
         BatchInner::Cuda(CudaBatch {
-            num_rows: total,
+            num_rows: args.rows,
             columns,
         }),
     ))
@@ -1034,6 +1186,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn match_offsets_are_wide() {
+        let (offsets, total) = match_offsets(&[u32::MAX, 0, u32::MAX, 3]);
+        assert_eq!(
+            offsets,
+            vec![
+                0,
+                u64::from(u32::MAX),
+                u64::from(u32::MAX),
+                2 * u64::from(u32::MAX)
+            ]
+        );
+        assert_eq!(total, 2 * u64::from(u32::MAX) + 3);
+    }
+
+    #[test]
     fn exclusive_scan_totals() {
         let (offsets, total) = exclusive_scan(&[3, 0, 2, 5]).unwrap_or_default();
         assert_eq!(offsets, vec![0, 3, 3, 5]);
@@ -1044,7 +1211,7 @@ mod tests {
     #[test]
     fn kernel_sources_are_embedded() {
         assert!(FILTER_PROJECT_SRC.contains("oxide_scatter_indices"));
-        assert!(HASH_JOIN_SRC.contains("oxide_hj_write"));
+        assert!(HASH_JOIN_SRC.contains("oxide_hj_expand"));
         assert!(AGGREGATION_SRC.contains("oxide_agg_minmax_f64"));
         assert!(VECTOR_DISTANCE_SRC.contains("oxide_vec_distance"));
     }

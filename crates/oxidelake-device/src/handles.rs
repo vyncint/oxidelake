@@ -9,6 +9,8 @@ use arrow::datatypes::SchemaRef;
 use oxidelake_core::BackendKind;
 use oxidelake_memory::AlignedBuf;
 
+use crate::cpu::kernels::{JoinMatches, JoinTable};
+
 /// A host buffer whose memory class (pinned/pageable) is observable.
 pub use oxidelake_memory::HostAlloc as HostBuffer;
 
@@ -205,6 +207,168 @@ impl fmt::Debug for DeviceBatch {
             .field("backend", &self.backend)
             .field("num_rows", &self.num_rows)
             .field("columns", &self.schema.fields().len())
+            .finish()
+    }
+}
+
+pub(crate) enum JoinTableInner {
+    Host(JoinTable),
+    #[cfg(feature = "cuda")]
+    Cuda(crate::cuda::ops::CudaJoinTable),
+}
+
+/// A hash join's build side prepared on a backend
+/// ([`crate::GpuBackend::prepare_join_build`]): the backend's index of the
+/// build rows, made once and probed by every batch of one operator, and
+/// freed when the operator drops it (#45).
+pub struct DeviceJoinTable {
+    backend: BackendKind,
+    build_rows: usize,
+    uploaded_bytes: u64,
+    pub(crate) inner: JoinTableInner,
+}
+
+impl DeviceJoinTable {
+    /// Wraps a host index over a build side of `build_rows` rows (the CPU
+    /// backend's representation).
+    pub fn from_host(table: JoinTable, build_rows: usize) -> Self {
+        Self {
+            backend: BackendKind::CpuSimd,
+            build_rows,
+            uploaded_bytes: 0,
+            inner: JoinTableInner::Host(table),
+        }
+    }
+
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(crate) const fn new(
+        backend: BackendKind,
+        build_rows: usize,
+        uploaded_bytes: u64,
+        inner: JoinTableInner,
+    ) -> Self {
+        Self {
+            backend,
+            build_rows,
+            uploaded_bytes,
+            inner,
+        }
+    }
+
+    /// The backend the index is resident on.
+    pub const fn backend(&self) -> BackendKind {
+        self.backend
+    }
+
+    /// Rows of the build side it indexes.
+    pub const fn build_rows(&self) -> usize {
+        self.build_rows
+    }
+
+    /// Bytes copied host → device to prepare it; zero for a host index.
+    pub const fn uploaded_bytes(&self) -> u64 {
+        self.uploaded_bytes
+    }
+
+    /// The host index, when host-resident.
+    pub fn as_host(&self) -> Option<&JoinTable> {
+        match &self.inner {
+            JoinTableInner::Host(table) => Some(table),
+            #[cfg(feature = "cuda")]
+            JoinTableInner::Cuda(_) => None,
+        }
+    }
+}
+
+impl fmt::Debug for DeviceJoinTable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeviceJoinTable")
+            .field("backend", &self.backend)
+            .field("build_rows", &self.build_rows)
+            .field("uploaded_bytes", &self.uploaded_bytes)
+            .finish()
+    }
+}
+
+pub(crate) enum JoinMatchesInner {
+    Host(JoinMatches),
+    #[cfg(feature = "cuda")]
+    Cuda(crate::cuda::ops::CudaJoinMatches),
+}
+
+/// The matches of one probe batch against a [`DeviceJoinTable`]
+/// ([`crate::GpuBackend::probe_join`]): a sequence in probe-row order, and in
+/// build order within a probe row, that [`crate::GpuBackend::hash_join`]
+/// gathers in ranges (#95).
+pub struct DeviceJoinMatches {
+    backend: BackendKind,
+    probe_rows: usize,
+    len: u64,
+    pub(crate) inner: JoinMatchesInner,
+}
+
+impl DeviceJoinMatches {
+    /// Wraps host matches (the CPU backend's representation).
+    pub fn from_host(matches: JoinMatches) -> Self {
+        Self {
+            backend: BackendKind::CpuSimd,
+            probe_rows: matches.probe_rows(),
+            len: matches.len(),
+            inner: JoinMatchesInner::Host(matches),
+        }
+    }
+
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(crate) const fn new(
+        backend: BackendKind,
+        probe_rows: usize,
+        len: u64,
+        inner: JoinMatchesInner,
+    ) -> Self {
+        Self {
+            backend,
+            probe_rows,
+            len,
+            inner,
+        }
+    }
+
+    /// The backend the matches are resident on.
+    pub const fn backend(&self) -> BackendKind {
+        self.backend
+    }
+
+    /// Probe rows looked up.
+    pub const fn probe_rows(&self) -> usize {
+        self.probe_rows
+    }
+
+    /// Total matches: the rows the probe batch joins to.
+    pub const fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// `true` when no probe row matched.
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The host matches, when host-resident.
+    pub fn as_host(&self) -> Option<&JoinMatches> {
+        match &self.inner {
+            JoinMatchesInner::Host(matches) => Some(matches),
+            #[cfg(feature = "cuda")]
+            JoinMatchesInner::Cuda(_) => None,
+        }
+    }
+}
+
+impl fmt::Debug for DeviceJoinMatches {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeviceJoinMatches")
+            .field("backend", &self.backend)
+            .field("probe_rows", &self.probe_rows)
+            .field("len", &self.len)
             .finish()
     }
 }
