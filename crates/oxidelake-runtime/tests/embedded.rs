@@ -8,7 +8,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use arrow::array::RecordBatch;
+use arrow::array::{Array, Int64Array, RecordBatch};
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 use oxidelake_core::BackendKind;
 use oxidelake_runtime::OxideSession;
@@ -165,6 +165,98 @@ async fn gpu_targets_return_cpu_results() {
             match target {
                 BackendKind::CpuSimd => reference.push(rows),
                 _ => assert_eq!(rows, reference[i], "{target}: {sql}"),
+            }
+        }
+    }
+}
+
+/// The `Int64` values of the first column, in output order.
+fn first_column(batches: &[RecordBatch]) -> Vec<i64> {
+    batches
+        .iter()
+        .flat_map(|b| {
+            let column = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            assert_eq!(column.null_count(), 0);
+            column.values().to_vec()
+        })
+        .collect()
+}
+
+/// Under `prefer_hash_join = false`, Ballista's session default, DataFusion
+/// plans a sort-merge join and leaves out the sort an ORDER BY on its key
+/// needs, because the merge join's output already has that order; a merge
+/// join or a window above reads the order the same way. The lowered join
+/// returned the ORDER BY unsorted on a GPU target, lost rows in the LEFT
+/// join above it and failed the window (#88). Every target returns the CPU
+/// target's rows now, in its key order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_merge_join_keeps_its_order_on_every_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = demo_write_options(512, Compression::None);
+    write_demo_table(dir.path(), 4000, 11, &options).unwrap();
+    let path = dir.path().to_str().unwrap();
+    let a = "(SELECT id, k FROM t WHERE id < 200)";
+    let b = "(SELECT id, k FROM t WHERE id >= 3800)";
+    // `k` is nullable, so only NULLS FIRST is the merge join's own order
+    // and lets DataFusion drop the sort.
+    let queries = [
+        format!(
+            "SELECT a.k, a.id, b.id FROM {a} a JOIN {b} b ON a.k = b.k ORDER BY a.k NULLS FIRST"
+        ),
+        format!(
+            "SELECT a.k, b.id, c.id FROM {a} a JOIN {b} b ON a.k = b.k \
+             LEFT JOIN {b} c ON a.k = c.k"
+        ),
+        format!(
+            "SELECT a.k, b.id, count(*) OVER (PARTITION BY b.k) \
+             FROM {a} a JOIN {b} b ON a.k = b.k"
+        ),
+    ];
+
+    let mut reference: Vec<(Vec<i64>, Vec<String>)> = Vec::new();
+    for target in [BackendKind::CpuSimd, BackendKind::Cuda, BackendKind::Metal] {
+        let session = OxideSession::local_with_target(target).unwrap();
+        session
+            .sql("SET datafusion.optimizer.prefer_hash_join = false")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        session.register_parquet("t", path).await.unwrap();
+        for (i, sql) in queries.iter().enumerate() {
+            let plan = session.explain(sql).await.unwrap();
+            let lowered = plan.contains("GpuHashJoinExec");
+            assert!(
+                plan.contains("SortMergeJoinExec") || lowered,
+                "{target}: no merge join to cover:\n{plan}"
+            );
+            assert_eq!(lowered, target.is_gpu(), "{target}: {sql}\n{plan}");
+            let batches = session
+                .sql(sql)
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap_or_else(|e| panic!("{target}: {sql}: {e}\n{plan}"));
+            let keys = first_column(&batches);
+            let rows = sorted_rows(&batches);
+            assert!(rows.len() > 100, "{target}: {sql}: {} rows", rows.len());
+            if i == 0 {
+                assert!(
+                    keys.is_sorted(),
+                    "{target}: not in key order: {keys:?}\n{plan}"
+                );
+            }
+            match target {
+                BackendKind::CpuSimd => reference.push((keys, rows)),
+                _ => {
+                    let (want_keys, want_rows) = &reference[i];
+                    if i == 0 {
+                        assert_eq!(&keys, want_keys, "{target}: {sql}");
+                    }
+                    assert_eq!(&rows, want_rows, "{target}: {sql}");
+                }
             }
         }
     }

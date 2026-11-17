@@ -121,9 +121,9 @@ impl HardwarePlacementRule {
             return Ok(Some(lowered));
         }
         if let Some(join) = node.downcast_ref::<SortMergeJoinExec>()
-            && let Some(gpu) = self.lower_sort_merge_join(join)?
+            && let Some(lowered) = self.lower_sort_merge_join(join)?
         {
-            return Ok(Some(Arc::new(gpu)));
+            return Ok(Some(lowered));
         }
         if let Some(agg) = node.downcast_ref::<AggregateExec>()
             && let Some(gpu) = self.lower_aggregate(agg)?
@@ -389,10 +389,26 @@ impl HardwarePlacementRule {
     }
 
     /// `SortMergeJoinExec` (what DataFusion plans when hash joins are not
-    /// preferred) has the same inner-join semantics; its output order is
-    /// `left ++ right`, so no side swap is needed. The `SortExec`s DataFusion
-    /// inserted for the merge are dropped when they carry no `LIMIT`.
-    fn lower_sort_merge_join(&self, join: &SortMergeJoinExec) -> Result<Option<GpuHashJoinExec>> {
+    /// preferred, as in every Ballista session) has the same inner-join
+    /// semantics; its output order is `left ++ right`, so no side swap is
+    /// needed. The `SortExec`s DataFusion inserted for the merge are dropped
+    /// when they carry no `LIMIT`.
+    ///
+    /// The merge join's output is sorted on its keys, and by the time this
+    /// rule runs DataFusion has planned what is above it on that: an ORDER BY
+    /// on a key lost its sort, a merge join above reads it as sorted, a
+    /// window partitioned by a key finds its partitions in it. The device
+    /// join promises no order, so lowering it alone returned unsorted rows,
+    /// lost rows in the merge join above, and failed the window (#88). A
+    /// `SortExec` over the device join, partition by partition, restores the
+    /// order: the sort the merge join paid on its inputs, paid once on its
+    /// output. The lowering is kept only if the sorted join promises every
+    /// ordering the merge join did, since the operators above rebuild their
+    /// own properties from it when the rule swaps it in.
+    fn lower_sort_merge_join(
+        &self,
+        join: &SortMergeJoinExec,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         if let Some(why) = join_shape_refusal(
             join.join_type(),
             join.filter().is_some(),
@@ -432,7 +448,32 @@ impl HardwarePlacementRule {
             );
             return Ok(None);
         }
-        Ok(Some(self.instrument(exec, GpuHashJoinExec::with_telemetry)))
+        let exec: Arc<dyn ExecutionPlan> =
+            Arc::new(self.instrument(exec, GpuHashJoinExec::with_telemetry));
+        let merge = join.properties();
+        let lowered: Arc<dyn ExecutionPlan> = match merge.output_ordering() {
+            Some(ordering) => {
+                Arc::new(SortExec::new(ordering.clone(), exec).with_preserve_partitioning(true))
+            }
+            None => exec,
+        };
+        // The sort promises its own ordering and nothing else, so a merge
+        // join with a second, independent order (a `row_number()` below it,
+        // say) would lose it, and an operator above that reads it fails.
+        let promised = lowered.equivalence_properties();
+        for ordering in merge.equivalence_properties().oeq_class().iter() {
+            if !promised.ordering_satisfy(ordering.clone())? {
+                self.skip(
+                    "SortMergeJoinExec",
+                    format_args!(
+                        "the merge join's output is also ordered by `{ordering}`, an order \
+                         a sort over the device join would not promise"
+                    ),
+                );
+                return Ok(None);
+            }
+        }
+        Ok(Some(lowered))
     }
 
     fn lower_aggregate(&self, agg: &AggregateExec) -> Result<Option<GpuAggregateExec>> {

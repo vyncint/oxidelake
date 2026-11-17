@@ -96,6 +96,12 @@ fn batches_e() -> Vec<Vec<RecordBatch>> {
     ]]
 }
 
+/// `0..100` in an order that is neither sorted nor reversed, so an operator
+/// that only happens to preserve its input's order cannot pass for sorted.
+fn scrambled(i: i64) -> i64 {
+    (i * 37) % 100
+}
+
 /// `k Int64`, `v Float64`: 100 rows in one partition and one batch, which
 /// DataFusion never splits, however many partitions the session targets.
 fn batches_n() -> Vec<Vec<RecordBatch>> {
@@ -103,7 +109,7 @@ fn batches_n() -> Vec<Vec<RecordBatch>> {
         Field::new("k", DataType::Int64, false),
         Field::new("v", DataType::Float64, false),
     ]));
-    let k: Vec<i64> = (0..100).collect();
+    let k: Vec<i64> = (0..100).map(scrambled).collect();
     let v: Vec<f64> = k.iter().map(|&k| k as f64 / 2.0).collect();
     vec![vec![
         RecordBatch::try_new(
@@ -127,7 +133,9 @@ fn batches_d() -> Vec<Vec<RecordBatch>> {
         RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(Int64Array::from_iter_values((0..400).map(|i| i % 100))),
+                Arc::new(Int64Array::from_iter_values(
+                    (0..400).map(|i| scrambled(i % 100)),
+                )),
                 Arc::new(Int64Array::from_iter_values(0..400)),
             ],
         )
@@ -150,11 +158,32 @@ fn batches_w() -> Vec<Vec<RecordBatch>> {
     vec![vec![RecordBatch::try_new(schema, columns).unwrap()]]
 }
 
+/// The rows of `batches` cut into `parts` partitions, in order.
+fn partitioned(batches: Vec<Vec<RecordBatch>>, parts: usize) -> Vec<Vec<RecordBatch>> {
+    let all =
+        arrow::compute::concat_batches(&batches[0][0].schema(), batches.iter().flatten()).unwrap();
+    let step = all.num_rows().div_ceil(parts);
+    (0..parts)
+        .map(|p| {
+            let start = p * step;
+            vec![all.slice(start, step.min(all.num_rows() - start))]
+        })
+        .collect()
+}
+
 fn register(ctx: &SessionContext) {
     for udf in oxidelake_compute::oxide_udfs() {
         ctx.register_udf(udf.as_ref().clone());
     }
-    for (name, batches) in [("n", batches_n()), ("d", batches_d()), ("w", batches_w())] {
+    for (name, batches) in [
+        ("n", batches_n()),
+        ("d", batches_d()),
+        ("w", batches_w()),
+        // `n` and `d` split across partitions, so a join over them is
+        // hash-repartitioned the way a cluster's is.
+        ("np", partitioned(batches_n(), 3)),
+        ("dp", partitioned(batches_d(), 2)),
+    ] {
         ctx.register_table(
             name,
             Arc::new(MemTable::try_new(batches[0][0].schema(), batches).unwrap()),
@@ -788,6 +817,8 @@ async fn a_join_left_on_the_cpu_records_why() {
     }
 }
 
+// --- merge joins (#88) -------------------------------------------------------
+
 /// Ballista's session default, `prefer_hash_join = false`, under which
 /// DataFusion plans `SortMergeJoinExec`; four partitions so the merge join
 /// runs partitioned the way it does on a cluster.
@@ -795,4 +826,210 @@ fn merge_join_config() -> SessionConfig {
     SessionConfig::new()
         .with_target_partitions(4)
         .set_bool("datafusion.optimizer.prefer_hash_join", false)
+}
+
+/// The `Int64` values of `column`, in output order.
+fn column_values(batches: &[RecordBatch], column: usize) -> Vec<i64> {
+    batches
+        .iter()
+        .flat_map(|b| {
+            b.column(column)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect()
+}
+
+/// Whether `plan` (indented text) has an inner merge join with no sort
+/// anywhere above it: what is above reads the merge join's order as it is.
+fn merge_join_order_is_relied_on(plan: &str) -> bool {
+    let join = plan.lines().position(|l| {
+        l.trim_start()
+            .starts_with("SortMergeJoinExec: join_type=Inner")
+    });
+    join.is_some_and(|at| {
+        !plan
+            .lines()
+            .take(at)
+            .any(|l| l.trim_start().starts_with("SortExec"))
+    })
+}
+
+/// A merge join's output is sorted on its keys, and DataFusion plans what is
+/// above it on that: it drops the sort an ORDER BY on either key needs, a
+/// merge join above merges it as it arrives, and a window partitioned by
+/// either key reads its partitions off it. Lowering the merge join into an
+/// unordered hash join broke all three (#88): unsorted ORDER BY output, rows
+/// lost from a LEFT join, and an internal assertion from the window. The
+/// lowered join is re-sorted now, and its rows and order equal stock
+/// DataFusion's.
+#[tokio::test]
+async fn a_lowered_merge_join_keeps_the_order_above_it_relies_on() {
+    let shapes = [
+        (
+            "SELECT n.k, d.y FROM {n} n JOIN {d} d ON n.k = d.bk ORDER BY n.k",
+            Some(0),
+        ),
+        (
+            "SELECT d.bk, d.y FROM {n} n JOIN {d} d ON n.k = d.bk ORDER BY d.bk",
+            Some(0),
+        ),
+        // Every key has four rows, so the first 20 are a whole set of keys
+        // and which rows a LIMIT keeps is not up to the plan.
+        (
+            "SELECT n.k, d.y FROM {n} n JOIN {d} d ON n.k = d.bk ORDER BY n.k LIMIT 20",
+            Some(0),
+        ),
+        (
+            "SELECT n.k, d.y, x.y AS y2 FROM {n} n JOIN {d} d ON n.k = d.bk \
+             LEFT JOIN {d} x ON n.k = x.bk",
+            None,
+        ),
+        (
+            "SELECT n.k, d.y, count(*) OVER (PARTITION BY n.k) AS c \
+             FROM {n} n JOIN {d} d ON n.k = d.bk",
+            None,
+        ),
+        (
+            "SELECT n.k, d.y, count(*) OVER (PARTITION BY d.bk) AS c \
+             FROM {n} n JOIN {d} d ON n.k = d.bk",
+            None,
+        ),
+    ];
+    // One partition each, and several, which DataFusion hash-repartitions
+    // under the merge join the way a cluster does.
+    let queries = [("n", "d"), ("np", "dp")].into_iter().flat_map(|(n, d)| {
+        shapes.iter().map(move |(shape, ordered_by)| {
+            (shape.replace("{n}", n).replace("{d}", d), *ordered_by)
+        })
+    });
+    for (sql, ordered_by) in queries {
+        let sql = sql.as_str();
+        let (_, stock) = plan_and_text(&plain_ctx_with(merge_join_config()), sql).await;
+        assert!(
+            merge_join_order_is_relied_on(&stock),
+            "{sql}: no inner merge join whose order is relied on above, so this \
+             no longer covers #88:\n{stock}"
+        );
+        let expected = plain_ctx_with(merge_join_config())
+            .sql(sql)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let ctx = ctx_with_rule_and(BackendKind::Cuda, merge_join_config());
+        let (plan, text) = plan_and_text(&ctx, sql).await;
+        assert!(
+            text.contains("GpuHashJoinExec[cuda]"),
+            "{sql}: the merge join is still lowered:\n{text}"
+        );
+        let actual = collect(Arc::clone(&plan), ctx.task_ctx())
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}\n{text}"));
+        if let Some(column) = ordered_by {
+            let keys = column_values(&actual, column);
+            assert!(
+                keys.is_sorted(),
+                "{sql}: not in key order: {keys:?}\n{text}"
+            );
+            assert_eq!(keys, column_values(&expected, column), "{sql}");
+        }
+        assert_eq!(
+            sorted_rows(&actual),
+            sorted_rows(&expected),
+            "{sql}\n{text}"
+        );
+        assert_eq!(
+            parent_of(&plan, "GpuHashJoinExec").map(|p| p.name().to_owned()),
+            Some("SortExec".to_owned()),
+            "{sql}: the merge join's order is restored by one sort over the device join:\n{text}"
+        );
+    }
+}
+
+/// A merge join can promise more than one order. Over a `row_number()`
+/// window its output is ordered by the key and by the row number, and a
+/// window partitioned by the row number reads its partitions off it. A sort
+/// over the device join promises only what it sorts on, so lowering that
+/// join failed the window with DataFusion's internal "All partition by
+/// columns should have an ordering" assertion. Such a merge join stays on
+/// the CPU, and the note names the order it would lose (#88).
+#[tokio::test]
+async fn a_merge_join_whose_order_a_sort_cannot_restore_stays_on_the_cpu() {
+    let sql = "SELECT l.k, l.rn, d.y, count(*) OVER (PARTITION BY l.rn) AS c \
+               FROM (SELECT k, row_number() OVER (ORDER BY k) AS rn FROM n) l \
+               JOIN d ON l.k = d.bk";
+    let (_, stock) = plan_and_text(&plain_ctx_with(merge_join_config()), sql).await;
+    assert!(
+        merge_join_order_is_relied_on(&stock) && stock.contains("PARTITION BY [l.rn]"),
+        "the window no longer reads the row-number order off the merge join, so \
+         this no longer covers the case:\n{stock}"
+    );
+    let ctx = ctx_with_rule_and(BackendKind::Cuda, merge_join_config());
+    let (plan, text) = plan_and_text(&ctx, sql).await;
+    let actual = collect(plan, ctx.task_ctx())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{text}"));
+    let expected = plain_ctx_with(merge_join_config())
+        .sql(sql)
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(sorted_rows(&actual), sorted_rows(&expected), "{text}");
+    assert!(
+        text.contains("SortMergeJoinExec: join_type=Inner") && !text.contains("GpuHashJoinExec"),
+        "the merge join stays:\n{text}"
+    );
+    let notes = placement_notes_with(merge_join_config(), sql).await;
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.starts_with(
+                "SortMergeJoinExec: the merge join's output is also ordered by `rn@1 ASC"
+            ) && n.ends_with("an order a sort over the device join would not promise")),
+        "{notes:?}"
+    );
+}
+
+/// A lowered join promises what any inner equi-join does: its two keys hold
+/// the same value on every row. DataFusion sorts a hash join's output on one
+/// key for a window partitioned by the other; the device join promised no
+/// such equality, so that window failed over it with the same internal
+/// assertion. This is DataFusion's default join, so it failed embedded on
+/// any GPU target, not only under Ballista's merge joins (found with #88).
+#[tokio::test]
+async fn a_window_by_the_other_key_runs_over_a_lowered_hash_join() {
+    let sql = "SELECT n.k, d.y, count(*) OVER (PARTITION BY d.bk) AS c \
+               FROM n JOIN d ON n.k = d.bk";
+    for target_partitions in [1, 4] {
+        let config = || SessionConfig::new().with_target_partitions(target_partitions);
+        let context = format!("target_partitions={target_partitions}");
+        let (_, stock) = plan_and_text(&plain_ctx_with(config()), sql).await;
+        assert!(
+            stock.contains("HashJoinExec: mode=") && stock.contains("SortExec: expr=[k@0"),
+            "{context}: the window over d.bk no longer sorts on n.k, so this no \
+             longer covers the case:\n{stock}"
+        );
+        let ctx = ctx_with_rule_and(BackendKind::Cuda, config());
+        let (plan, text) = plan_and_text(&ctx, sql).await;
+        assert!(text.contains("GpuHashJoinExec[cuda]"), "{context}:\n{text}");
+        let actual = collect(plan, ctx.task_ctx())
+            .await
+            .unwrap_or_else(|e| panic!("{context}: {e}\n{text}"));
+        let expected = plain_ctx_with(config())
+            .sql(sql)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(sorted_rows(&actual), sorted_rows(&expected), "{context}");
+    }
 }

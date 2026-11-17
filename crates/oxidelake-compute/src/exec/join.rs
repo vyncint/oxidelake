@@ -5,11 +5,15 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use arrow::compute::concat_batches;
 use arrow::datatypes::{DataType, Schema, SchemaRef};
+use datafusion::common::JoinType;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::PhysicalExpr;
-use datafusion::physical_plan::execution_plan::EmissionType;
+use datafusion::physical_expr::equivalence::join_equivalence_properties;
+use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_expr::projection::ProjectionMapping;
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
@@ -22,7 +26,7 @@ use oxidelake_core::BackendKind;
 use oxidelake_core::telemetry::TelemetryHub;
 use oxidelake_device::GpuBackend;
 
-use super::{ExecConfig, field_type, plan_err, plan_properties};
+use super::{ExecConfig, field_type, plan_err};
 use crate::operator::JoinBuild;
 
 /// The collected and hashed build side, shared by every probe partition.
@@ -87,6 +91,65 @@ fn joined_schema(left: &dyn ExecutionPlan, right: &dyn ExecutionPlan) -> SchemaR
     Arc::new(Schema::new(fields))
 }
 
+/// The output schema and what the join promises the operators above it:
+/// both inputs' equalities and constants and its two keys equal to each
+/// other (an inner equi-join in which NULL matches nothing, so on every
+/// output row they hold the same value), derived by DataFusion's own
+/// `join_equivalence_properties` and carried through `projection`; no
+/// ordering, since the probe order is not promised; and the probe side's
+/// partitioning.
+///
+/// A parent rebuilds its own properties from these when the placement rule
+/// swaps this node in for a stock join, so an equality left out here is one
+/// no operator above can plan on any more. Without the key equality, a
+/// window partitioned by one key over a sort on the other, which DataFusion
+/// plans over a hash join and over a re-sorted merge join alike, failed with
+/// an internal "All partition by columns should have an ordering" assertion
+/// (#88).
+fn join_properties(
+    left: &Arc<dyn ExecutionPlan>,
+    right: &Arc<dyn ExecutionPlan>,
+    (left_key, right_key): (usize, usize),
+    projection: Option<&[usize]>,
+) -> Result<(SchemaRef, Arc<PlanProperties>)> {
+    let full = joined_schema(left.as_ref(), right.as_ref());
+    let key = |plan: &Arc<dyn ExecutionPlan>, index: usize| -> Result<Arc<dyn PhysicalExpr>> {
+        let schema = plan.schema();
+        let field = schema.fields().get(index).ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "GpuHashJoinExec: key column {index} out of range for {schema}"
+            ))
+        })?;
+        Ok(Arc::new(Column::new(field.name(), index)))
+    };
+    let on = [(key(left, left_key)?, key(right, right_key)?)];
+    let mut equivalences = join_equivalence_properties(
+        left.equivalence_properties().clone(),
+        right.equivalence_properties().clone(),
+        &JoinType::Inner,
+        Arc::clone(&full),
+        &[false, false],
+        None,
+        &on,
+    )?;
+    let schema = match projection {
+        Some(indices) => {
+            let projected = Arc::new(full.project(indices)?);
+            let mapping = ProjectionMapping::from_indices(indices, &full)?;
+            equivalences = equivalences.project(&mapping, Arc::clone(&projected));
+            projected
+        }
+        None => full,
+    };
+    let properties = PlanProperties::new(
+        equivalences,
+        left.output_partitioning().clone(),
+        EmissionType::Incremental,
+        Boundedness::Bounded,
+    );
+    Ok((schema, Arc::new(properties)))
+}
+
 impl GpuHashJoinExec {
     /// Builds the exec, validating that both keys are `Int64` columns.
     pub fn try_new(
@@ -105,12 +168,7 @@ impl GpuHashJoinExec {
                 ));
             }
         }
-        let schema = joined_schema(left.as_ref(), right.as_ref());
-        let properties = plan_properties(
-            Arc::clone(&schema),
-            left.output_partitioning().clone(),
-            EmissionType::Incremental,
-        );
+        let (schema, properties) = join_properties(&left, &right, (left_key, right_key), None)?;
         Ok(Self {
             left,
             right,
@@ -128,19 +186,16 @@ impl GpuHashJoinExec {
     /// Selects and orders output columns by index into the joined
     /// `left ++ right` row; `None` keeps every column.
     pub fn with_projection(mut self, projection: Option<Vec<usize>>) -> Result<Self> {
-        let full = joined_schema(self.left.as_ref(), self.right.as_ref());
-        let schema = match &projection {
-            Some(indices) if indices.is_empty() => {
-                return plan_err("GpuHashJoinExec: projection must select at least one column");
-            }
-            Some(indices) => Arc::new(full.project(indices)?),
-            None => full,
-        };
-        self.properties = plan_properties(
-            Arc::clone(&schema),
-            self.left.output_partitioning().clone(),
-            EmissionType::Incremental,
-        );
+        if projection.as_ref().is_some_and(Vec::is_empty) {
+            return plan_err("GpuHashJoinExec: projection must select at least one column");
+        }
+        let (schema, properties) = join_properties(
+            &self.left,
+            &self.right,
+            (self.left_key, self.right_key),
+            projection.as_deref(),
+        )?;
+        self.properties = properties;
         self.schema = schema;
         self.projection = projection;
         Ok(self)

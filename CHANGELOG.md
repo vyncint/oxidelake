@@ -76,6 +76,26 @@ versions (0.x) may contain breaking changes; they are always listed under a
   printed no note at all; each now says which, e.g. ``HashJoinExec: a
   `Left` join has no device kernel; the device join is inner only``.
 
+- **ORDER BY, merge joins and windows over a GPU-placed sort-merge join are
+  right again** (#88). Under `prefer_hash_join = false`, Ballista's session
+  default and so the usual join plan on a GPU cluster, DataFusion plans a
+  `SortMergeJoinExec` and leaves out the sorts that the operators above it
+  would otherwise need, because its output is already in key order. The
+  placement rule swapped in the device join, which has no order, so an
+  `ORDER BY` on a join key came back unsorted, a LEFT merge join above it
+  lost rows, and a window partitioned by a join key failed with an internal
+  "All partition by columns should have an ordering" error, on a GPU
+  cluster and on `--target cuda|metal` with the setting. The device join now
+  has a `SortExec` on the merge join's order directly above it, in place of
+  the sorts DataFusion put under the merge join, and `oxide explain` shows
+  it. A merge join with a second order a sort cannot restore (one over a
+  `row_number()`, for example) stays on the CPU, and `oxide explain` says
+  so: ``SortMergeJoinExec: the merge join's output is also ordered by
+  `rn@1 ASC NULLS LAST, bk@2 ASC`, an order a sort over the device join
+  would not promise``. The device join also declares its two keys equal,
+  which DataFusion plans on: a window partitioned by one key over a lowered
+  hash join, DataFusion's default join, failed with the same error.
+
 ### Security
 
 - **thrift is out of the dependency graph** (#4, #54). parquet 59 decodes

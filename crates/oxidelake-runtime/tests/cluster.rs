@@ -291,4 +291,36 @@ async fn the_static_planner_runs_lowered_nodes_correctly() {
             "{sql}: {ran} {lowered} produced {rows} rows, {counted} counted"
         );
     }
+
+    // The scheduler plans these joins as sort-merge joins (Ballista's
+    // sessions do not prefer hash joins), and an ORDER BY that matches the
+    // merge join's own key order (ascending, NULLs first) loses its sort.
+    // Lowering the merge join must keep that order (#88): it came back
+    // unsorted.
+    for sql in [
+        "SELECT t.k, r.name FROM t JOIN r ON t.k = r.rk ORDER BY t.k NULLS FIRST",
+        "SELECT r.rk, t.s FROM t JOIN r ON t.k = r.rk ORDER BY r.rk NULLS FIRST",
+    ] {
+        let since = next_operator_id();
+        let batches = cluster.sql(sql).await.unwrap().collect().await.unwrap();
+        let keys: Vec<i64> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert!(keys.len() > 1000, "{sql}: {} rows", keys.len());
+        assert!(keys.is_sorted(), "{sql}: not in key order: {keys:?}");
+        let local = sorted_rows(&embedded.sql(sql).await.unwrap().collect().await.unwrap());
+        assert_eq!(sorted_rows(&batches), local, "{sql}");
+        assert!(
+            ran_since(since, "GpuHashJoinExec").0 > 0,
+            "{sql}: no GpuHashJoinExec ran"
+        );
+    }
 }
