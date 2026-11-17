@@ -330,6 +330,18 @@ versions (0.x) may contain breaking changes; they are always listed under a
   bytes and republishes the tier gauges; a batch the eviction had already
   moved before it failed stays where it was moved.
 
+- **A slice is charged for its own rows, not its parent's buffers**
+  (#116). The spill manager sized a batch with `get_array_memory_size`,
+  which counts every buffer a slice shares with its parent in full: four
+  quarter slices of an 800 KB batch were charged 800 KB each, so under a
+  1.2 MB budget three of them spilled and nothing was freed.
+  `SpillManager::batch_bytes`, what the budgets count, is now each
+  column's own slice of its buffers (values, offsets, validity, and the
+  out-of-line strings of a `Utf8View` or `BinaryView` column), so the
+  slices of one batch together are charged what the batch is, and a sliced
+  batch reports less than it did. The buffers the slices share stay
+  allocated while any of them lives, which no per-batch measure can see.
+
 ### Security
 
 - **thrift is out of the dependency graph** (#4, #54). parquet 59 decodes

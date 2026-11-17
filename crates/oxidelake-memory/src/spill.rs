@@ -15,8 +15,8 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use arrow::array::RecordBatch;
-use arrow::datatypes::SchemaRef;
+use arrow::array::{Array, ArrayData, ArrayRef, MAX_INLINE_VIEW_LEN, RecordBatch};
+use arrow::datatypes::{DataType, SchemaRef};
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use oxidelake_core::EngineError;
@@ -85,9 +85,10 @@ struct Entry {
     tier: Tier,
     /// Bytes in the current tier (disk size while spilled).
     bytes: u64,
-    /// Logical host size, fixed at first host residency. Reused on promotion
-    /// because IPC-decoded batches over-report `get_array_memory_size`
-    /// (every column counts the shared message buffer).
+    /// Host size ([`SpillManager::batch_bytes`]), fixed at first host
+    /// residency and reused on promotion, so a batch back from disk is
+    /// charged what it was charged before: the batch decoded from its spill
+    /// file need not measure the same as the one that was written.
     host_bytes: u64,
     last_touch: u64,
     schema: SchemaRef,
@@ -160,9 +161,22 @@ impl SpillManager {
         &self.telemetry
     }
 
-    /// Host bytes a batch occupies.
+    /// Host bytes a batch is charged against the budgets (#116).
+    ///
+    /// For each column, the bytes of its own slice of the buffers it
+    /// references: its rows' values, offsets and validity, and for a
+    /// `Utf8View` or `BinaryView` column the out-of-line strings its views
+    /// point to. A slice of a larger batch is charged for its own rows, so
+    /// the slices of one batch together are charged what the batch is. The
+    /// parent's buffers stay allocated while any slice of them lives, which
+    /// no per-batch measure can see: the budgets bound what the registered
+    /// batches are charged, not the allocator's resident set. A column arrow
+    /// cannot size by its slice is charged its buffers whole.
     pub fn batch_bytes(batch: &RecordBatch) -> u64 {
-        u64::try_from(batch.get_array_memory_size()).unwrap_or(u64::MAX)
+        let bytes = batch.columns().iter().fold(0_usize, |sum, column| {
+            sum.saturating_add(column_bytes(column))
+        });
+        u64::try_from(bytes).unwrap_or(u64::MAX)
     }
 
     fn tick(&self) -> u64 {
@@ -421,6 +435,46 @@ impl SpillManager {
     }
 }
 
+/// Bytes in one Arrow view: a string's length, then its first bytes, or the
+/// buffer and offset where it lives when it is too long to be inlined.
+const VIEW_LEN: usize = 16;
+
+/// One column's share of [`SpillManager::batch_bytes`].
+fn column_bytes(column: &ArrayRef) -> usize {
+    let data = column.to_data();
+    data.get_slice_memory_size()
+        .map(|bytes| bytes.saturating_add(view_bytes(&data)))
+        .unwrap_or_else(|_| column.get_array_memory_size())
+}
+
+/// The strings `data`'s view arrays point to, which `get_slice_memory_size`
+/// leaves out: it counts each view's 16 bytes, not a string too long to be
+/// inlined in one.
+fn view_bytes(data: &ArrayData) -> usize {
+    let own = match data.data_type() {
+        DataType::Utf8View | DataType::BinaryView => data.buffers().first().map_or(0, |views| {
+            let start = data.offset().saturating_mul(VIEW_LEN);
+            let end = start.saturating_add(data.len().saturating_mul(VIEW_LEN));
+            views.as_slice().get(start..end).map_or(0, |views| {
+                views
+                    .as_chunks::<VIEW_LEN>()
+                    .0
+                    .iter()
+                    // A view starts with its string's length, little-endian.
+                    .map(|&[a, b, c, d, ..]| u32::from_le_bytes([a, b, c, d]))
+                    .filter(|&len| len > MAX_INLINE_VIEW_LEN)
+                    .fold(0_usize, |sum, len| {
+                        sum.saturating_add(usize::try_from(len).unwrap_or(usize::MAX))
+                    })
+            })
+        }),
+        _ => 0,
+    };
+    data.child_data()
+        .iter()
+        .fold(own, |sum, child| sum.saturating_add(view_bytes(child)))
+}
+
 impl fmt::Debug for SpillManager {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SpillManager")
@@ -674,5 +728,53 @@ mod tests {
             [0, 2 * per_batch, 0],
             "the gauges follow usage"
         );
+    }
+
+    // #116
+    #[tokio::test]
+    async fn slices_of_one_batch_are_charged_their_own_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let whole = batch(0, 100_000);
+        let whole_bytes = SpillManager::batch_bytes(&whole);
+        // Room for the batch once and a half: its four quarters fit.
+        let mgr = manager(dir.path(), 0, whole_bytes + whole_bytes / 2);
+        let quarter = 25_000;
+        let mut ids = Vec::new();
+        for i in 0..4 {
+            let slice = whole.slice(i * quarter, quarter);
+            ids.push(mgr.insert_host(slice).await.unwrap());
+        }
+        for id in ids {
+            assert_eq!(mgr.tier_of(id).await, Some(Tier::Host), "batch {id}");
+        }
+        assert_eq!(mgr.usage().await, [0, whole_bytes, 0]);
+        assert!(!dir.path().join("spill").exists(), "nothing spilled");
+    }
+
+    #[test]
+    fn a_view_column_is_charged_the_strings_it_points_to() {
+        use arrow::array::StringViewArray;
+
+        // 100-byte strings are too long to inline in a 16-byte view.
+        let strings: Vec<String> = (0..1000).map(|i| format!("{i:0>100}")).collect();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            DataType::Utf8View,
+            false,
+        )]));
+        let whole = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringViewArray::from_iter_values(&strings))],
+        )
+        .unwrap();
+        let whole_bytes = SpillManager::batch_bytes(&whole);
+        assert!(
+            whole_bytes >= 100 * 1000,
+            "{whole_bytes}: the strings count"
+        );
+        let quarters: u64 = (0..4)
+            .map(|i| SpillManager::batch_bytes(&whole.slice(i * 250, 250)))
+            .sum();
+        assert_eq!(quarters, whole_bytes);
     }
 }
