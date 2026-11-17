@@ -236,6 +236,13 @@ fn plain_ctx_with(config: SessionConfig) -> SessionContext {
 }
 
 fn sorted_rows(batches: &[RecordBatch]) -> Vec<String> {
+    let mut rows = ordered_rows(batches);
+    rows.sort();
+    rows
+}
+
+/// Rows in the order they come back, for queries whose order is the point.
+fn ordered_rows(batches: &[RecordBatch]) -> Vec<String> {
     let opts = FormatOptions::default().with_null("NULL");
     let mut rows = Vec::new();
     for b in batches {
@@ -253,7 +260,6 @@ fn sorted_rows(batches: &[RecordBatch]) -> Vec<String> {
             );
         }
     }
-    rows.sort();
     rows
 }
 
@@ -1059,4 +1065,45 @@ async fn an_overflowing_sum_wraps_on_a_gpu_target() {
     let (text, gpu) = run(&ctx_with_rule(BackendKind::Cuda), sql).await;
     assert!(text.contains("GpuAggregateExec[cuda]"), "{text}");
     assert_eq!(sorted_rows(&gpu), ["1|-4", "2|5"], "{text}");
+}
+
+/// DataFusion aggregates input sorted on its key in an ordered mode that
+/// emits the groups in the input's order, and plans the operators above on
+/// that order: an `ORDER BY` on the key over it needs no sort. The lowered
+/// aggregate emitted groups by ascending key with `NULL` last whatever the
+/// input order, so these came back ascending and with `NULL` last (#89).
+/// Such an aggregate now stays on the CPU, and the placement note says why.
+#[tokio::test]
+async fn an_aggregate_over_sorted_input_keeps_its_order() {
+    for sql in [
+        "SELECT k, sum(v) AS s FROM (SELECT k, v FROM t ORDER BY k DESC LIMIT 1000) \
+         GROUP BY k ORDER BY k DESC",
+        "SELECT k, count(v) AS c FROM (SELECT k, v FROM t ORDER BY k NULLS FIRST LIMIT 900) \
+         GROUP BY k ORDER BY k NULLS FIRST",
+    ] {
+        let (text, gpu) = run(&ctx_with_rule(BackendKind::Cuda), sql).await;
+        let (_, cpu) = run(&plain_ctx(), sql).await;
+        assert_eq!(ordered_rows(&gpu), ordered_rows(&cpu), "{sql}\n{text}");
+        assert!(!text.contains("GpuAggregateExec"), "{sql}\n{text}");
+        let notes = placement_notes(sql).await;
+        assert!(
+            notes.iter().any(
+                |n| n.starts_with("AggregateExec:") && n.contains("sorted on the grouping key")
+            ),
+            "{sql}: {notes:?}"
+        );
+    }
+    // What the operators above were planned on is the output ordering, not
+    // the input order mode: DataFusion runs a constant key in the ordered
+    // mode too (a constant is trivially sorted), but it promises no order
+    // there — there is one group — and that aggregate is still lowered. The
+    // string comparison keeps the filter on the CPU: a `GpuFilterExec`
+    // declares no constants, and the aggregate rebuilt over one is planned
+    // in the unordered mode, which would make this case prove nothing.
+    assert_same_results(
+        "SELECT k, sum(v) FROM t WHERE k = 2 AND s <> 'x' GROUP BY k ORDER BY k DESC",
+        BackendKind::Cuda,
+        Some("GpuAggregateExec[cuda]"),
+    )
+    .await;
 }

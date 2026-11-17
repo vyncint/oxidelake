@@ -521,6 +521,27 @@ impl HardwarePlacementRule {
             }
             _ => return Ok(None),
         };
+        // `GpuAggregateExec` emits each partition's groups by ascending key,
+        // `NULL` last. An aggregate whose input is sorted on its key runs in an
+        // ordered mode instead: it emits groups in the input's order as each
+        // one ends, and DataFusion plans the operators above on that order —
+        // an `ORDER BY k DESC` over it needs no sort of its own. Lowered, such
+        // a query came back ascending (#89). DataFusion's ordered aggregate
+        // also streams with one group open, where the kernel holds them all.
+        // The test is the order promised, not the input order mode: a
+        // constant key runs in the ordered mode too, but promises no order
+        // (there is one group), and is lowered.
+        if let Some(ordering) = agg.properties().output_ordering() {
+            self.skip(
+                "AggregateExec",
+                format_args!(
+                    "its input is sorted on the grouping key, so DataFusion aggregates it in \
+                     order and the operators above rely on its output order [{ordering}]; \
+                     the device kernel emits groups by ascending key with NULL last"
+                ),
+            );
+            return Ok(None);
+        }
         // A multi-partition source keeps one `CoalescePartitionsExec` under the
         // exec. Embedded mode does not need it (the exec collects every input
         // partition itself), but Ballista's planner cuts shuffle stages exactly

@@ -231,6 +231,21 @@ versions (0.x) may contain breaking changes; they are always listed under a
   there) and lets its starting values through (`MAX` of {-inf} is
   `f64::MIN`); the GPU target's answer is the order-independent one.
 
+- **An `ORDER BY` over an aggregate of sorted input comes back in order
+  under a GPU target** (#89). DataFusion aggregates input that is sorted on
+  the grouping key in an ordered mode, emitting the groups in the input's
+  order, and plans the operators above on that order: `SELECT k, sum(v) FROM
+  (SELECT k, v FROM t ORDER BY k DESC LIMIT 1000) GROUP BY k ORDER BY k
+  DESC` needs no sort of its own. The placement rule replaced that aggregate
+  with a `GpuAggregateExec`, which emits groups by ascending key with the
+  `NULL` group last, so `--target cuda` and `metal` returned such queries
+  ascending, and `NULLS FIRST` with the `NULL` group last. The rule now
+  leaves an aggregate whose output is ordered on the CPU, and `oxide
+  explain` says why under `placement notes`. **Visible change:** these
+  aggregates no longer show as `GpuAggregateExec`; they run as stock
+  DataFusion's ordered aggregate, which streams with one group open at a
+  time.
+
 ### Security
 
 - **thrift is out of the dependency graph** (#4, #54). parquet 59 decodes
