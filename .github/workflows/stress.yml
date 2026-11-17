@@ -52,7 +52,7 @@ jobs:
           # only when told to (termlens 0.11.7, #597).
           INSTA_UPDATE: new
         run: make stress-tui
-      - uses: vyncint/termlens/.github/actions/report@484c02b2a124643c22412b6eb6bcd7016c1bfb90 # v0.11.9
+      - uses: vyncint/termlens/.github/actions/report@c5c05edf32a9ff807bea0e2f1d0991d7b95ece26 # v0.11.10
         if: failure()
         with:
           name: termlens-report-stress-${{ matrix.os }}
