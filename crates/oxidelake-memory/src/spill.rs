@@ -182,6 +182,10 @@ impl SpillManager {
     }
 
     /// Registers a host-resident batch and enforces the host budget.
+    ///
+    /// If room cannot be made, the error is returned and the batch is not
+    /// kept: the manager holds and counts what it did before the call, but
+    /// for batches the eviction had already moved (#115).
     pub async fn insert_host(&self, batch: RecordBatch) -> Result<BatchId, EngineError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let bytes = Self::batch_bytes(&batch);
@@ -198,12 +202,15 @@ impl SpillManager {
             },
         );
         state.used[Tier::Host.index()] += bytes;
-        self.enforce_host(&mut state).await?;
-        self.publish(&state);
-        Ok(id)
+        let enforced = self.enforce_host(&mut state).await;
+        self.finish_insert(&mut state, id, enforced)
     }
 
     /// Registers a device-resident batch and enforces the device and host budgets.
+    ///
+    /// If room cannot be made, the error is returned and the batch is not
+    /// kept: the manager holds and counts what it did before the call, but
+    /// for batches the eviction had already moved (#115).
     pub async fn insert_device(
         &self,
         resident: Box<dyn DeviceResident>,
@@ -224,10 +231,37 @@ impl SpillManager {
             },
         );
         state.used[Tier::Device.index()] += bytes;
-        self.enforce_device(&mut state)?;
-        self.enforce_host(&mut state).await?;
-        self.publish(&state);
-        Ok(id)
+        let enforced = match self.enforce_device(&mut state) {
+            Ok(()) => self.enforce_host(&mut state).await,
+            Err(err) => Err(err),
+        };
+        self.finish_insert(&mut state, id, enforced)
+    }
+
+    /// Ends an insert. One whose budgets could not be enforced forgets the
+    /// batch it registered, with its bytes, before returning the error
+    /// (#115): the caller never receives the id, so a batch kept registered
+    /// could be neither read nor removed, and its bytes would count against
+    /// every later insert. Batches the eviction had already moved stay
+    /// where it moved them.
+    fn finish_insert(
+        &self,
+        state: &mut State,
+        id: BatchId,
+        enforced: Result<(), EngineError>,
+    ) -> Result<BatchId, EngineError> {
+        if enforced.is_err() {
+            // The batch is still in memory, never on disk: eviction takes
+            // the coldest batch first and this one is the newest, so it is
+            // written only once it is the last batch on the host, and
+            // writing it empties the host.
+            if let Some(entry) = state.entries.remove(&id) {
+                let tier = entry.tier.index();
+                state.used[tier] = state.used[tier].saturating_sub(entry.bytes);
+            }
+        }
+        self.publish(state);
+        enforced.map(|()| id)
     }
 
     /// Returns a batch, promoting it from disk into host RAM if necessary.
@@ -550,5 +584,95 @@ mod tests {
         assert_eq!(mgr.schema_of(id).await.unwrap().fields().len(), 1);
         assert_eq!(mgr.tier_of(999).await, None);
         assert!(mgr.get(999).await.is_err());
+    }
+
+    // #115
+    #[tokio::test]
+    async fn a_failed_insert_leaves_nothing_registered_or_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        // A file where the spill directory belongs: every spill write fails,
+        // whoever runs the test (permissions would not stop root).
+        std::fs::write(dir.path().join("spill"), b"not a directory").unwrap();
+        let first = batch(0, 256);
+        let per_batch = SpillManager::batch_bytes(&first);
+        // Room for one batch: a second one must evict the first to disk.
+        let mgr = manager(dir.path(), 0, per_batch + per_batch / 2);
+        let kept = mgr.insert_host(first).await.unwrap();
+
+        let unchanged = |what: &str, usage: [u64; 3], entries: usize, gauge: u64| {
+            assert_eq!(usage, [0, per_batch, 0], "{what}: usage");
+            assert_eq!(
+                entries, 1,
+                "{what}: only the batch whose id the caller holds"
+            );
+            assert_eq!(gauge, per_batch, "{what}: the host gauge follows usage");
+        };
+        for start in [1000, 2000, 3000] {
+            let err = mgr.insert_host(batch(start, 256)).await.unwrap_err();
+            assert!(matches!(err, EngineError::Io(_)), "{err}");
+            unchanged(
+                "insert_host",
+                mgr.usage().await,
+                mgr.state.lock().await.entries.len(),
+                mgr.telemetry().snapshot().tiers.host_bytes,
+            );
+        }
+        // A device batch over a zero device budget is demoted to the host,
+        // which then has to evict — and cannot.
+        let err = mgr
+            .insert_device(
+                Box::new(FakeResident {
+                    batch: batch(4000, 256),
+                    bytes: 4096,
+                }),
+                batch(0, 1).schema(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Io(_)), "{err}");
+        unchanged(
+            "insert_device",
+            mgr.usage().await,
+            mgr.state.lock().await.entries.len(),
+            mgr.telemetry().snapshot().tiers.host_bytes,
+        );
+        assert_eq!(mgr.tier_of(kept).await, Some(Tier::Host));
+    }
+
+    #[tokio::test]
+    async fn a_failed_insert_publishes_what_its_eviction_did_move() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("spill"), b"not a directory").unwrap();
+        let first = batch(0, 256);
+        let per_batch = SpillManager::batch_bytes(&first);
+        // Room for one device batch and one host batch.
+        let mgr = manager(dir.path(), 4096, per_batch + per_batch / 2);
+        let device = |start| {
+            Box::new(FakeResident {
+                batch: batch(start, 256),
+                bytes: 4096,
+            })
+        };
+        let kept = mgr.insert_host(first).await.unwrap();
+        let moved = mgr
+            .insert_device(device(1000), batch(0, 1).schema())
+            .await
+            .unwrap();
+        // A second device batch demotes `moved` to the host, which must then
+        // evict `kept` to disk, and cannot. The demotion stands.
+        let err = mgr
+            .insert_device(device(2000), batch(0, 1).schema())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Io(_)), "{err}");
+        assert_eq!(mgr.tier_of(kept).await, Some(Tier::Host));
+        assert_eq!(mgr.tier_of(moved).await, Some(Tier::Host));
+        assert_eq!(mgr.usage().await, [0, 2 * per_batch, 0]);
+        let tiers = mgr.telemetry().snapshot().tiers;
+        assert_eq!(
+            [tiers.device_bytes, tiers.host_bytes, tiers.disk_bytes],
+            [0, 2 * per_batch, 0],
+            "the gauges follow usage"
+        );
     }
 }

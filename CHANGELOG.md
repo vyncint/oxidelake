@@ -318,6 +318,18 @@ versions (0.x) may contain breaking changes; they are always listed under a
   `Format`; code that matched on `EngineError::DataFusion` for such errors
   now gets `Format` or `Io` (#118).
 
+### Fixed
+
+- **A failed spill-manager insert no longer leaves its batch behind**
+  (#115). `SpillManager::insert_host` and `insert_device` registered the
+  batch and counted its bytes before evicting to make room, and when the
+  eviction failed they returned the error but kept the batch: registered
+  under an id the caller never received, so nothing could read or remove
+  it, and counted against the budget, so every failed insert made the next
+  eviction likelier to fail. A failed insert now forgets the batch and its
+  bytes and republishes the tier gauges; a batch the eviction had already
+  moved before it failed stays where it was moved.
+
 ### Security
 
 - **thrift is out of the dependency graph** (#4, #54). parquet 59 decodes
