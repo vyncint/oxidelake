@@ -273,6 +273,13 @@ versions (0.x) may contain breaking changes; they are always listed under a
   DataFusion's exchange between them, and each `GpuAggregateExec` declares
   the partitioning of the node it replaces.
 
+- **Breaking: `TelemetrySnapshot` gained a public field, `operator_totals`**
+  (#102): the lifetime totals per operator name and backend, as the new
+  `oxidelake_core::telemetry::OperatorTotals`, which is what
+  `to_prometheus` exports now. A struct literal over `TelemetrySnapshot` no
+  longer compiles; add `operator_totals: Vec::new()`, as the TUI's demo
+  model does.
+
 ### Fixed
 
 - **`predict` scores a feature vector with a NULL element as NULL** (#97).
@@ -288,6 +295,18 @@ versions (0.x) may contain breaking changes; they are always listed under a
   line continuations, so runs of 14 to 22 spaces from the source's
   indentation sat in the middle of each message. A script that matched one
   of them with the runs in it matches single spaces now.
+
+- **`/metrics` reports one series per operator and backend, and its
+  counters never go backwards** (#102). It printed a line for every exec
+  instance, several under the same labels, and Prometheus kept one of them:
+  a scraped counter stopped moving after the first query, then fell (from
+  1000000 to 5 in the reproduction) once that instance was evicted. Each
+  label set is now one series holding the total over every instance the
+  process has run, so a graph or alert on it sees every operator's work.
+  The per-query `INFO` line (`query finished … gpu_operators=…
+  fallback_batches=…`) summed every operator the session had ever run, so
+  the second run of a query logged twice the first's numbers; it now counts
+  that query's operators only.
 
 ### Security
 

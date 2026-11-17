@@ -121,6 +121,8 @@ pub fn demo_model() -> DashboardModel {
     DashboardModel {
         telemetry: TelemetrySnapshot {
             operators,
+            // The lifetime totals feed `/metrics`; no panel draws them (#102).
+            operator_totals: Vec::new(),
             tiers: TierSnapshot {
                 device_bytes: 6 * 1024 * 1024 * 1024,
                 host_bytes: 3 * 1024 * 1024 * 1024 / 2,
