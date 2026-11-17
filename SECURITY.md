@@ -31,6 +31,9 @@ What the project does continuously, enforced by required CI on every change:
   sized by it, so a corrupt or hostile file is an `EngineError::Format`
   rather than a panic or an allocation of whatever the footer declares
   (`ParquetScanGuard`; what it does not cover is in `STATUS.md`).
+  An Arrow IPC spill or cache file is checked against its own length before
+  arrow-ipc decodes it, so a corrupt one is an error, not a panic or an
+  allocation the file cannot back (#110).
 - **Dependency policy** (`deny` job): RUSTSEC advisories, a license allow-list,
   banned crates and crates.io-only sources on every PR; weekly grouped
   Dependabot updates that leave the DataFusion/Ballista chain's majors alone.

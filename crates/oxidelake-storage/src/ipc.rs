@@ -2,15 +2,15 @@
 //! aligned, no compression, so batches come back without decode.
 
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use arrow::ipc::MetadataVersion;
-use arrow::ipc::reader::FileReader;
 use arrow::ipc::writer::{FileWriter, IpcWriteOptions};
 use oxidelake_core::EngineError;
+use oxidelake_memory::ipc::read_batches;
 pub use oxidelake_memory::ipc::{IPC_ALIGNMENT, decode_batch, encode_batch};
 
 /// Writes `batches` as one Arrow IPC file; returns the file size in bytes.
@@ -31,16 +31,22 @@ pub fn write_ipc_file(
     Ok(std::fs::metadata(path)?.len())
 }
 
-/// Reads every batch of an Arrow IPC file. Corrupt or truncated files yield
-/// [`EngineError::Format`].
+/// Reads every batch of an Arrow IPC file.
+///
+/// The file is checked before arrow-ipc decodes it (#110, see
+/// [`oxidelake_memory::ipc`]): a corrupt or truncated file, or one whose
+/// batches are compressed, yields [`EngineError::Format`] naming the file and
+/// the defect, never a panic or an allocation the file cannot back. A file
+/// that cannot be opened or read yields [`EngineError::Io`].
 pub fn read_ipc_file(path: &Path) -> Result<Vec<RecordBatch>, EngineError> {
     let file = File::open(path)?;
-    let reader = FileReader::try_new(BufReader::new(file), None).map_err(|e| {
-        EngineError::format(format!("invalid Arrow IPC file {}: {e}", path.display()))
-    })?;
-    reader
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| EngineError::format(format!("corrupt Arrow IPC file {}: {e}", path.display())))
+    match read_batches(file) {
+        Ok((_, batches)) => Ok(batches),
+        Err(EngineError::Format(reason)) => {
+            Err(EngineError::format(format!("{}: {reason}", path.display())))
+        }
+        Err(other) => Err(other),
+    }
 }
 
 #[cfg(test)]
@@ -50,6 +56,7 @@ mod tests {
 
     use arrow::array::{Array, Float64Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field};
+    use arrow::ipc::{Block, root_as_footer};
 
     use super::*;
 
@@ -122,5 +129,59 @@ mod tests {
             read_ipc_file(&dir.path().join("missing")).unwrap_err(),
             EngineError::Io(_)
         ));
+    }
+
+    /// Writes one batch to a file, rewrites its record batch's `Block` in the
+    /// footer with `patch`, and reads the file back.
+    fn read_with_block(
+        patch: impl FnOnce(Block) -> Block,
+    ) -> Result<Vec<RecordBatch>, EngineError> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.arrow");
+        write_ipc_file(&path, &batch(0).schema(), &[batch(0)]).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let (at, new) = {
+            // The file ends with the footer, its length and the magic `ARROW1`.
+            let n = bytes.len();
+            let footer_len = u32::from_le_bytes(bytes[n - 10..n - 6].try_into().unwrap());
+            let footer_start = n - 10 - usize::try_from(footer_len).unwrap();
+            let footer = root_as_footer(&bytes[footer_start..n - 10]).unwrap();
+            let block = footer.recordBatches().unwrap().get(0);
+            let at = std::ptr::from_ref(block) as usize - bytes.as_ptr() as usize;
+            (at, patch(*block))
+        };
+        bytes[at..at + new.0.len()].copy_from_slice(&new.0);
+        std::fs::write(&path, bytes).unwrap();
+        read_ipc_file(&path)
+    }
+
+    fn assert_format_error_naming_the_file(result: Result<Vec<RecordBatch>, EngineError>) {
+        match result {
+            Err(EngineError::Format(message)) => {
+                assert!(message.contains("cache.arrow"), "{message}");
+            }
+            other => panic!("expected a format error, got {other:?}"),
+        }
+    }
+
+    // #110: arrow-ipc unwraps a block's lengths and allocates their sum
+    // before reading a byte; a corrupt length must not reach either.
+    #[test]
+    fn a_negative_block_length_is_a_format_error() {
+        assert_format_error_naming_the_file(read_with_block(|b| {
+            Block::new(b.offset(), b.metaDataLength(), -1)
+        }));
+    }
+
+    #[test]
+    fn a_huge_block_length_is_a_format_error() {
+        assert_format_error_naming_the_file(read_with_block(|b| {
+            Block::new(b.offset(), b.metaDataLength(), 1 << 62)
+        }));
+    }
+
+    #[test]
+    fn a_zero_length_block_is_a_format_error() {
+        assert_format_error_naming_the_file(read_with_block(|b| Block::new(b.offset(), 0, 0)));
     }
 }

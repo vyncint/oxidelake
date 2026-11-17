@@ -392,6 +392,26 @@ versions (0.x) may contain breaking changes; they are always listed under a
   scan with DataFusion's own reader. `register_local_store` now puts the store
   behind the new `BoundedReadStore`, which refuses a multi-range read past the
   end of an object before the store underneath reserves memory for it.
+- **A corrupt Arrow IPC file is refused instead of panicking or aborting
+  the process** (#110). `read_ipc_file` and the spill reader
+  (`oxidelake_memory::ipc::decode_batch`) handed the file to arrow-ipc,
+  which takes the lengths it declares at their word: a negative block
+  length, a zero-length block or a missing schema panicked, a buffer
+  reaching past its message's body panicked on a slice, and a block, a
+  footer or a compressed buffer declaring a huge size aborted the process
+  on the failed allocation. A record batch whose message header was zeroed
+  ended the file early, so the spill reader returned an empty batch with
+  no error. The footer, every block and every buffer are now checked
+  against the file before arrow decodes it, nothing is allocated at a size
+  the file has not been shown to hold, and the decode runs under
+  `catch_unwind` for what arrow only asserts; each case is an
+  `EngineError::Format` that names the defect. **A compressed IPC file is
+  now refused by both readers**: these files are written uncompressed, and
+  a compressed buffer's declared size is allocated before it can be
+  checked. Read a compressed file you trust with arrow's own `FileReader`.
+  A failing read is now `EngineError::Io` rather than `Format`, and the
+  checked reader is public as `oxidelake_memory::ipc::read_batches`, over
+  any `Read + Seek`.
 
 ## [0.2.0] - 2026-09-21
 

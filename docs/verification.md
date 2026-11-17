@@ -146,6 +146,7 @@ cargo test -p oxidelake-compute --features cuda -- --ignored
 | Unit | each crate, colocated `#[cfg(test)]` | std test; `insta` where output is structural |
 | Conformance | `oxidelake-compute` | `Gpu*Exec` on `CpuBackend` vs stock DataFusion operators over seeded random batches |
 | Storage | `oxidelake-storage/tests` | Parquet pruning metrics + equality; Arrow IPC spill round-trip; shared `ObjectStore` conformance for `LocalFileSystem` and `UringLocalFileSystem` (feature matrix) |
+| Corrupt Arrow IPC | `oxidelake-memory/tests/ipc_corrupt.rs` | one field of a valid file corrupted per case, found by parsing the file; both readers must refuse it by name. The binary's allocator refuses any request over 64 MiB, so a declared length that reaches an allocation fails the run instead of depending on the machine's memory |
 | Placement + codec | `oxidelake-planner` | mocked GPU-present detector; `EXPLAIN` text; codec encode → decode round-trip |
 | Distributed equivalence | `oxidelake-runtime/tests` | in-process Ballista scheduler + 2 executors on ephemeral ports; `Gpu*Exec` nodes through the codec |
 | Embedded GPU-target equivalence | `oxidelake-runtime/tests/embedded.rs` | the same queries under cpu/cuda/metal placement targets return identical rows (multi-partition plans included) |
