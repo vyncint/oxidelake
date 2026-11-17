@@ -7,6 +7,7 @@ use std::sync::Arc;
 use datafusion::arrow::error::ArrowError;
 use datafusion::error::DataFusionError;
 use oxidelake_core::EngineError;
+use parquet::errors::ParquetError;
 
 /// Classifies a DataFusion error raised while reading or planning over files.
 ///
@@ -18,7 +19,17 @@ use oxidelake_core::EngineError;
 /// corrupt footer found at registration (#118).
 pub fn classify_error(err: DataFusionError) -> EngineError {
     match err {
-        DataFusionError::ParquetError(e) => EngineError::format(format!("parquet: {e}")),
+        // Our own refusals (the Parquet scan guard's) travel through the
+        // parquet reader as `External`; they come back as themselves.
+        DataFusionError::ParquetError(e) => match *e {
+            ParquetError::External(inner) => match inner.downcast::<EngineError>() {
+                Ok(engine) => *engine,
+                Err(inner) => {
+                    EngineError::format(format!("parquet: {}", ParquetError::External(inner)))
+                }
+            },
+            other => EngineError::format(format!("parquet: {other}")),
+        },
         DataFusionError::ArrowError(e, context) => match *e {
             ArrowError::IoError(_, io) => EngineError::Io(io),
             other => {
@@ -35,6 +46,13 @@ pub fn classify_error(err: DataFusionError) -> EngineError {
                 std::io::ErrorKind::NotFound,
                 format!("{path}: {source}"),
             )),
+            // A store of ours refusing a read says why (BoundedReadStore).
+            object_store::Error::Generic { source, .. } if source.is::<EngineError>() => {
+                match source.downcast::<EngineError>() {
+                    Ok(engine) => *engine,
+                    Err(source) => EngineError::Io(std::io::Error::other(source.to_string())),
+                }
+            }
             other => EngineError::Io(std::io::Error::other(other.to_string())),
         },
         DataFusionError::Context(_, inner) | DataFusionError::Diagnostic(_, inner) => {
@@ -68,7 +86,13 @@ pub fn classify_error(err: DataFusionError) -> EngineError {
 /// that have no storage class; those are reported unchanged.
 fn classify_shared(err: &DataFusionError) -> Option<EngineError> {
     match err {
-        DataFusionError::ParquetError(e) => Some(EngineError::format(format!("parquet: {e}"))),
+        DataFusionError::ParquetError(e) => Some(match e.as_ref() {
+            ParquetError::External(inner) => match inner.downcast_ref::<EngineError>() {
+                Some(engine) => copy_class(engine)?,
+                None => EngineError::format(format!("parquet: {e}")),
+            },
+            other => EngineError::format(format!("parquet: {other}")),
+        }),
         DataFusionError::ArrowError(e, context) => Some(match e.as_ref() {
             ArrowError::IoError(_, io) => {
                 EngineError::Io(std::io::Error::new(io.kind(), io.to_string()))
@@ -86,25 +110,33 @@ fn classify_shared(err: &DataFusionError) -> Option<EngineError> {
             io.kind(),
             io.to_string(),
         ))),
-        DataFusionError::ObjectStore(e) => Some(EngineError::Io(match e.as_ref() {
-            object_store::Error::NotFound { path, source } => {
-                std::io::Error::new(std::io::ErrorKind::NotFound, format!("{path}: {source}"))
+        DataFusionError::ObjectStore(e) => match e.as_ref() {
+            object_store::Error::NotFound { path, source } => Some(EngineError::Io(
+                std::io::Error::new(std::io::ErrorKind::NotFound, format!("{path}: {source}")),
+            )),
+            object_store::Error::Generic { source, .. } if source.is::<EngineError>() => {
+                source.downcast_ref::<EngineError>().and_then(copy_class)
             }
-            other => std::io::Error::other(other.to_string()),
-        })),
+            other => Some(EngineError::Io(std::io::Error::other(other.to_string()))),
+        },
         DataFusionError::Context(_, inner) | DataFusionError::Diagnostic(_, inner) => {
             classify_shared(inner)
         }
         DataFusionError::Collection(errors) => errors.first().and_then(classify_shared),
         DataFusionError::Shared(inner) => classify_shared(inner),
-        DataFusionError::External(e) => match e.downcast_ref::<EngineError>() {
-            Some(EngineError::Format(m)) => Some(EngineError::Format(m.clone())),
-            Some(EngineError::Io(io)) => Some(EngineError::Io(std::io::Error::new(
-                io.kind(),
-                io.to_string(),
-            ))),
-            _ => None,
-        },
+        DataFusionError::External(e) => e.downcast_ref::<EngineError>().and_then(copy_class),
+        _ => None,
+    }
+}
+
+/// A copy of a borrowed `Format` or `Io` error; `None` for other classes.
+fn copy_class(err: &EngineError) -> Option<EngineError> {
+    match err {
+        EngineError::Format(m) => Some(EngineError::Format(m.clone())),
+        EngineError::Io(io) => Some(EngineError::Io(std::io::Error::new(
+            io.kind(),
+            io.to_string(),
+        ))),
         _ => None,
     }
 }
@@ -185,6 +217,42 @@ mod tests {
             )),
         );
         assert!(matches!(classify_error(nested), EngineError::Format(_)));
+    }
+
+    /// The scan guard's and the bounded store's refusals carry an
+    /// `EngineError` through parquet and object_store; it comes back as
+    /// itself, not wrapped in "parquet: External: ...".
+    #[test]
+    fn our_own_refusals_come_back_as_themselves() {
+        let refusal = || EngineError::format("parquet file t.parquet: row group 0 column k: bad");
+        let via_parquet =
+            DataFusionError::ParquetError(Box::new(ParquetError::External(Box::new(refusal()))));
+        assert!(matches!(
+            classify_error(via_parquet),
+            EngineError::Format(m) if m.starts_with("parquet file t.parquet")
+        ));
+        let via_store = DataFusionError::ObjectStore(Box::new(object_store::Error::Generic {
+            store: "BoundedReadStore",
+            source: Box::new(refusal()),
+        }));
+        assert!(matches!(classify_error(via_store), EngineError::Format(_)));
+        let shared = Arc::new(DataFusionError::ObjectStore(Box::new(
+            object_store::Error::Generic {
+                store: "BoundedReadStore",
+                source: Box::new(refusal()),
+            },
+        )));
+        let _other_consumer = Arc::clone(&shared);
+        assert!(matches!(
+            classify_error(DataFusionError::Shared(shared)),
+            EngineError::Format(_)
+        ));
+        // Any other store error is still IO.
+        let other = DataFusionError::ObjectStore(Box::new(object_store::Error::Generic {
+            store: "LocalFileSystem",
+            source: "disk".into(),
+        }));
+        assert!(matches!(classify_error(other), EngineError::Io(_)));
     }
 
     /// A repartitioned scan hands the *same* `Arc` to every consumer, so the

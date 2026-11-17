@@ -2,13 +2,29 @@
 //! proof that pruning actually happened (read back from the scan's metrics).
 
 use std::convert::Infallible;
+use std::ops::Range;
+use std::sync::Arc;
 
+use bytes::Bytes;
+use datafusion::datasource::listing::ListingTableUrl;
+// `metadata::`'s, the type DataFusion's metadata cache reads back: an entry
+// of the crate-root `CachedParquetMetaData` (another type) is a miss.
+use datafusion::datasource::physical_plan::parquet::metadata::CachedParquetMetaData;
+use datafusion::execution::SessionStateBuilder;
+use datafusion::execution::cache::cache_manager::CachedFileMetadataEntry;
 use datafusion::physical_plan::metrics::MetricValue;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanVisitor, accept};
 use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
+use futures::future::BoxFuture;
+use futures::{FutureExt, TryStreamExt};
+use object_store::path::Path;
+use object_store::{ObjectStore, ObjectStoreExt};
 use oxidelake_core::EngineError;
 
 use crate::errors::classify_error;
+use crate::parquet_check::{Fetch, read_checked_metadata};
+use crate::scan_guard::ParquetScanGuard;
+use crate::store::{default_object_store, register_local_store};
 
 /// Enables every Parquet pruning mechanism DataFusion offers — row-group
 /// statistics, the page index and Bloom filters — and keeps expression
@@ -50,21 +66,101 @@ pub fn with_pruning_disabled(config: SessionConfig) -> SessionConfig {
         .with_parquet_page_index_pruning(false)
 }
 
-/// A session with pruning enabled.
+/// A session with pruning enabled, the local store registered through
+/// [`register_local_store`] (ranged reads bounded by the object) and
+/// [`ParquetScanGuard`] installed (files checked when a scan opens them).
 pub fn pruning_session() -> SessionContext {
-    SessionContext::new_with_config(with_pruning(SessionConfig::new()))
+    let state = SessionStateBuilder::new()
+        .with_default_features()
+        .with_config(with_pruning(SessionConfig::new()))
+        .with_physical_optimizer_rule(Arc::new(ParquetScanGuard::new()))
+        .build();
+    let ctx = SessionContext::new_with_state(state);
+    register_local_store(&ctx, default_object_store());
+    ctx
 }
 
 /// Registers a Parquet file or directory as table `name`; file errors are
 /// classified into [`EngineError::Format`] / [`EngineError::Io`].
+///
+/// Every file the table has is checked before DataFusion reads any of it
+/// (#109): the footer's encoding, every column chunk, page index and Bloom
+/// filter range against the file's size, and every page against its chunk.
+/// A file that fails is refused with [`EngineError::Format`] naming it, and
+/// the row group and column where there is one; the table is not registered.
+/// The metadata that passed is handed to the session's metadata cache, so
+/// the scans that follow read what was checked rather than decoding the
+/// footer again.
+///
+/// This checks the files present now. A file added or replaced later is
+/// checked when a scan opens it only in sessions that install
+/// [`ParquetScanGuard`].
 pub async fn register_parquet_table(
     ctx: &SessionContext,
     name: &str,
     path: &str,
 ) -> Result<(), EngineError> {
-    ctx.register_parquet(name, path, ParquetReadOptions::default())
+    let options = ParquetReadOptions::default();
+    check_parquet_files(ctx, path, options.file_extension).await?;
+    ctx.register_parquet(name, path, options)
         .await
         .map_err(classify_error)
+}
+
+/// Lists the files `path` names the way DataFusion's table registration will,
+/// and checks each one.
+async fn check_parquet_files(
+    ctx: &SessionContext,
+    path: &str,
+    extension: &str,
+) -> Result<(), EngineError> {
+    let url = ListingTableUrl::parse(path).map_err(classify_error)?;
+    let state = ctx.state();
+    let store = ctx
+        .runtime_env()
+        .object_store(url.object_store())
+        .map_err(classify_error)?;
+    let files: Vec<_> = url
+        .list_all_files(&state, store.as_ref(), extension)
+        .await
+        .map_err(classify_error)?
+        .try_collect()
+        .await
+        .map_err(classify_error)?;
+    let cache = ctx.runtime_env().cache_manager.get_file_metadata_cache();
+    for meta in files {
+        let mut fetch = StoreFetch {
+            store: store.as_ref(),
+            location: &meta.location,
+        };
+        let metadata = read_checked_metadata(&mut fetch, meta.location.as_ref(), meta.size).await?;
+        cache.put(
+            &meta.location,
+            CachedFileMetadataEntry::new(
+                meta.clone(),
+                Arc::new(CachedParquetMetaData::new(Arc::new(metadata))),
+            ),
+        );
+    }
+    Ok(())
+}
+
+/// [`Fetch`] through the session's object store.
+struct StoreFetch<'a> {
+    store: &'a dyn ObjectStore,
+    location: &'a Path,
+}
+
+impl Fetch for StoreFetch<'_> {
+    fn fetch(&mut self, range: Range<u64>) -> BoxFuture<'_, Result<Bytes, EngineError>> {
+        async move {
+            self.store
+                .get_range(self.location, range)
+                .await
+                .map_err(|e| EngineError::Io(std::io::Error::other(e.to_string())))
+        }
+        .boxed()
+    }
 }
 
 /// Pruning counters summed over every scan node of an executed plan.

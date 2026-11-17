@@ -26,20 +26,25 @@ features = ["io-uring"]
 # -- `oxidelake-api` does (#41).
 default = ["datagen"]
 datagen = []
-io-uring = ["dep:io-uring", "dep:async-trait"]
+io-uring = ["dep:io-uring"]
 
 [dependencies]
 oxidelake-core.workspace = true
 oxidelake-memory.workspace = true
 arrow.workspace = true
-parquet.workspace = true
+# `async`: the scan guard wraps parquet's AsyncFileReader. DataFusion builds
+# parquet with it already, so this adds no crate; it only stops the storage
+# crate leaning on another dependency's feature choice.
+parquet = { workspace = true, features = ["async"] }
 object_store.workspace = true
 datafusion.workspace = true
 tokio.workspace = true
 futures.workspace = true
 bytes.workspace = true
 tracing.workspace = true
-async-trait = { workspace = true, optional = true }
+# Only to implement object_store's ObjectStore, a foreign #[async_trait]
+# trait (BoundedReadStore, and UringLocalFileSystem under io-uring).
+async-trait.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { workspace = true, optional = true }

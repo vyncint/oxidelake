@@ -284,7 +284,7 @@ opt-level = 2      # arrow/datafusion are unusably slow at -O0 in tests
 Feature wiring:
 
 - `oxidelake-memory`, `oxidelake-device`, `oxidelake-compute`: `cuda = ["dep:cudarc"]`; `metal = [...]` activating the macOS target-gated optional deps.
-- `oxidelake-storage`: `io-uring = ["dep:io-uring", "dep:async-trait"]` (Linux target-gated).
+- `oxidelake-storage`: `io-uring = ["dep:io-uring"]` (Linux target-gated). `async-trait` is a plain dependency since 0.3.0: `BoundedReadStore` implements `ObjectStore` in every build.
 - `oxidelake-runtime` and `oxidelake-api` forward: `cuda = ["oxidelake-device/cuda", "oxidelake-memory/cuda", "oxidelake-compute/cuda"]`, `metal = [...]`, `io-uring = ["oxidelake-storage/io-uring"]`. This is what makes `cargo check -p oxidelake-runtime --features cuda` the single GPU compile gate (a virtual workspace root rejects `--features`).
 - `oxidelake-api`: `python = ["dep:pyo3", "arrow/ffi"]` — add `pyo3` (latest, `abi3-py310`) only when Phase 7 reaches it.
 
