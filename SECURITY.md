@@ -64,6 +64,11 @@ re-examined at every chain bump. None is silent: they are listed here, in
 - **paste** (RUSTSEC-2024-0436) — a compile-time proc-macro dependency of the
   `metal` crate, which oxmera pulls on macOS under the `predict` feature
   (arrow-flight moved to `pastey` in 59); no runtime code.
+- **chrono**, **chrono-tz** and **humantime** (RUSTSEC-2026-0543, -0555,
+  -0542) — "unmaintained" notices, not vulnerabilities, with no maintained
+  release to move to. chrono and chrono-tz are arrow 59's date/time and
+  timezone support, under every DataFusion and Ballista crate; humantime is
+  `object_store` 0.13's duration parsing.
 
 ## Supported versions
 
