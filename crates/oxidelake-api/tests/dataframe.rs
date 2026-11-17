@@ -176,6 +176,28 @@ async fn vector_distance_matches_sql_and_lowers_on_gpu_targets() {
 }
 
 #[tokio::test]
+async fn vector_distance_rejects_empty_query_before_planning() {
+    let dir = demo_dir(2);
+    let session = session_over_demo(&dir, BackendKind::Cuda).await;
+    let frame = session.table("t").await.unwrap();
+
+    for metric in [DistanceMetric::L2, DistanceMetric::Cosine] {
+        let result = frame.clone().vector_distance("emb", &[], metric, "d");
+        let error = match result {
+            Ok(_) => panic!("an empty query vector should be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                &error,
+                EngineError::Plan(message) if message == "query vector must not be empty"
+            ),
+            "unexpected error: {error}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn read_parquet_and_explain_show_placement() {
     let dir = demo_dir(1000);
     let session = session_over_demo(&dir, BackendKind::Cuda).await;

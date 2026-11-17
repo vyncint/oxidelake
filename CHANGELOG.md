@@ -10,6 +10,10 @@ versions (0.x) may contain breaking changes; they are always listed under a
 
 ### Changed
 
+- **Breaking: `query_literal` now returns a result and rejects empty query
+  vectors.** `OxideFrame::vector_distance` propagates this planning error
+  instead of passing a zero-dimension fixed-size list to DataFusion and
+  panicking.
 - **Breaking: the dependency chain moves to Ballista 55, DataFusion 55 and
   arrow / parquet 59** (#40). DataFusion is this project's public
   vocabulary (ADR-0009: `OxideFrame::new`, `into_inner`,
