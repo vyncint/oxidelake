@@ -12,6 +12,7 @@ use datafusion::logical_expr::Operator;
 use datafusion::physical_expr::expressions::{BinaryExpr, Column, Literal};
 use datafusion::physical_expr::{PhysicalExpr, PhysicalExprRef, ScalarFunctionExpr};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::filter::FilterExec;
@@ -20,7 +21,7 @@ use datafusion::physical_plan::limit::LocalLimitExec;
 use datafusion::physical_plan::projection::{ProjectionExec, ProjectionExpr};
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
-use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
+use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use oxidelake_compute::{
     AggregateFunction, AggregateSpec, Comparison, GpuAggregateExec, GpuFilterExec, GpuHashJoinExec,
     GpuVectorDistanceExec, Literal as Lit, Predicate, distance_metric_for, literal_query,
@@ -476,48 +477,43 @@ impl HardwarePlacementRule {
         Ok(Some(lowered))
     }
 
+    /// Lowers one `AggregateExec` where it stands, keeping its input.
+    ///
+    /// The two halves of a two-phase aggregate are lowered separately and
+    /// DataFusion's exchange between them stays (#90). Each half aggregates
+    /// per input partition and declares the partitioning the node it replaces
+    /// declared, so the operators above — a partitioned join, the
+    /// `InterleaveExec` of a `UNION ALL` — get the N hash partitions they were
+    /// planned on, and Ballista still cuts its stages at the exchanges, which
+    /// is what keeps a distributed plan from reading one scan partition of
+    /// N. The rule used to fold the pair and the exchange into one
+    /// single-partition `GpuAggregateExec` over a `CoalescePartitionsExec`.
     fn lower_aggregate(&self, agg: &AggregateExec) -> Result<Option<GpuAggregateExec>> {
-        let (source, spec) = match agg.mode() {
-            AggregateMode::Single | AggregateMode::SinglePartitioned => {
-                let spec = match try_lower_aggregate_spec(agg) {
+        let spec = match agg.mode() {
+            // Rows in: a whole aggregate, or the partial half of one.
+            AggregateMode::Partial | AggregateMode::Single | AggregateMode::SinglePartitioned => {
+                match try_lower_aggregate_spec(agg) {
                     Ok(spec) => spec,
                     Err(why) => {
                         self.skip("AggregateExec", why);
                         return Ok(None);
                     }
-                };
-                (Arc::clone(agg.input()), spec)
+                }
             }
+            // Partial results in. Lowered only over a partial half that was
+            // lowered itself — the same aggregates, so the same verdict — and
+            // nothing to say when it was not: that half's note says why.
             AggregateMode::Final | AggregateMode::FinalPartitioned => {
-                // Look through the exchange between the final and partial halves.
-                let mut child = Arc::clone(agg.input());
-                loop {
-                    if child.downcast_ref::<RepartitionExec>().is_some()
-                        || child.downcast_ref::<CoalescePartitionsExec>().is_some()
-                    {
-                        let next = Arc::clone(child.children()[0]);
-                        child = next;
-                    } else {
-                        break;
-                    }
-                }
-                let Some(partial) = child.downcast_ref::<AggregateExec>() else {
+                let Some(partial) = lowered_partial(agg.input()) else {
                     return Ok(None);
                 };
-                if *partial.mode() != AggregateMode::Partial
-                    || partial.aggr_expr().len() != agg.aggr_expr().len()
-                    || partial.group_expr().expr().len() != agg.group_expr().expr().len()
-                {
-                    return Ok(None);
-                }
-                let spec = match try_lower_aggregate_spec(partial) {
+                match try_merge_spec(agg, partial.spec()) {
                     Ok(spec) => spec,
                     Err(why) => {
                         self.skip("AggregateExec", why);
                         return Ok(None);
                     }
-                };
-                (Arc::clone(partial.input()), spec)
+                }
             }
             _ => return Ok(None),
         };
@@ -542,20 +538,8 @@ impl HardwarePlacementRule {
             );
             return Ok(None);
         }
-        // A multi-partition source keeps one `CoalescePartitionsExec` under the
-        // exec. Embedded mode does not need it (the exec collects every input
-        // partition itself), but Ballista's planner cuts shuffle stages exactly
-        // at exchange nodes — without one, a distributed plan runs the whole
-        // scan + aggregate fragment as one stage and loses every partition but
-        // the task's own. Found running the README's 1M-row quickstart against
-        // a real cluster: files over 10 MiB are byte-range-split into
-        // multi-partition scans, which no smaller test had produced.
-        let source = if source.output_partitioning().partition_count() > 1 {
-            Arc::new(CoalescePartitionsExec::new(source)) as Arc<dyn ExecutionPlan>
-        } else {
-            source
-        };
-        let exec = GpuAggregateExec::try_new(source, spec, self.target)?;
+        let exec =
+            GpuAggregateExec::try_new_partitioned(Arc::clone(agg.input()), spec, self.target)?;
         match exec.with_output_schema(agg.schema()) {
             Ok(exec) => Ok(Some(
                 self.instrument(exec, GpuAggregateExec::with_telemetry),
@@ -597,6 +581,90 @@ fn refusal(err: &DataFusionError) -> String {
         DataFusionError::Plan(reason) => reason.clone(),
         other => other.to_string(),
     }
+}
+
+/// The lowered partial half under a final aggregate, looking through the
+/// nodes DataFusion puts between the halves, or `None` when that half stayed
+/// on the CPU. Only nodes that pass every row and column through are looked
+/// through, so what is found is the final's input as it was planned.
+fn lowered_partial(input: &Arc<dyn ExecutionPlan>) -> Option<&GpuAggregateExec> {
+    let mut node = input;
+    loop {
+        if let Some(partial) = node.downcast_ref::<GpuAggregateExec>() {
+            return Some(partial);
+        }
+        let passes_rows = node.fetch().is_none()
+            && (node.downcast_ref::<RepartitionExec>().is_some()
+                || node.downcast_ref::<CoalescePartitionsExec>().is_some()
+                || node.downcast_ref::<SortExec>().is_some()
+                || node.downcast_ref::<SortPreservingMergeExec>().is_some());
+        if !passes_rows {
+            return None;
+        }
+        node = node.children().into_iter().next()?;
+    }
+}
+
+/// The final half of a two-phase aggregate whose partial half was lowered
+/// with `partial`, as an aggregate over the partial results: the key is
+/// column 0 and aggregate `i`'s partial value column `1 + i` (one state field
+/// each for `SUM/COUNT/MIN/MAX`). The `SUM`, `MIN` or `MAX` of partial
+/// `SUM`s, `MIN`s or `MAX`s is the function again, and partial counts add up,
+/// so a `COUNT` becomes a `SUM` here — on the device as on the CPU reference.
+///
+/// DataFusion only plans a final half over its own partial half, so the
+/// check below is the cheap insurance that what was found under the
+/// exchanges is that half: merging the wrong partials would not fail, it
+/// would compute.
+fn try_merge_spec(
+    agg: &AggregateExec,
+    partial: &AggregateSpec,
+) -> std::result::Result<AggregateSpec, String> {
+    let group = agg.group_expr();
+    let merges: Vec<Option<AggregateFunction>> = agg
+        .aggr_expr()
+        .iter()
+        .map(|e| device_function(e.fun().name()).filter(|_| !e.is_distinct()))
+        .collect();
+    let lowered: Vec<Option<AggregateFunction>> =
+        partial.aggregates.iter().map(|(f, _)| Some(*f)).collect();
+    if merges != lowered
+        || !group.is_single()
+        || group.expr().len() != 1
+        || column_index(&group.expr()[0].0) != Some(0)
+        || agg.filter_expr().iter().any(Option::is_some)
+    {
+        return Err(format!(
+            "the final half ({}) does not merge the partial half lowered below it ({})",
+            agg.aggr_expr()
+                .iter()
+                .map(|e| e.fun().name())
+                .collect::<Vec<_>>()
+                .join(", "),
+            partial
+                .aggregates
+                .iter()
+                .map(|(f, _)| f.name())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    let aggregates = partial
+        .aggregates
+        .iter()
+        .enumerate()
+        .map(|(i, (func, _))| {
+            let merge = match func {
+                AggregateFunction::Count => AggregateFunction::Sum,
+                other => *other,
+            };
+            (merge, 1 + i)
+        })
+        .collect();
+    Ok(AggregateSpec {
+        group_by: 0,
+        aggregates,
+    })
 }
 
 /// Drops a `SortExec` that only exists to feed a merge join (no `LIMIT`).
@@ -797,6 +865,17 @@ pub fn lower_aggregate_spec(agg: &AggregateExec) -> Option<AggregateSpec> {
     try_lower_aggregate_spec(agg).ok()
 }
 
+/// The device kernel for DataFusion's aggregate function `name`, if any.
+fn device_function(name: &str) -> Option<AggregateFunction> {
+    Some(match name {
+        "sum" => AggregateFunction::Sum,
+        "count" => AggregateFunction::Count,
+        "min" => AggregateFunction::Min,
+        "max" => AggregateFunction::Max,
+        _ => return None,
+    })
+}
+
 /// [`lower_aggregate_spec`], keeping the reason so it can be shown (#32).
 fn try_lower_aggregate_spec(agg: &AggregateExec) -> std::result::Result<AggregateSpec, String> {
     let group = agg.group_expr();
@@ -823,17 +902,12 @@ fn try_lower_aggregate_spec(agg: &AggregateExec) -> std::result::Result<Aggregat
     }
     let mut aggregates = Vec::with_capacity(agg.aggr_expr().len());
     for expr in agg.aggr_expr() {
-        let func = match expr.fun().name() {
-            "sum" => AggregateFunction::Sum,
-            "count" => AggregateFunction::Count,
-            "min" => AggregateFunction::Min,
-            "max" => AggregateFunction::Max,
-            other => {
-                return Err(format!(
-                    "`{other}` is not one of the aggregates the device kernels \
-                     implement (sum, count, min, max)"
-                ));
-            }
+        let Some(func) = device_function(expr.fun().name()) else {
+            return Err(format!(
+                "`{}` is not one of the aggregates the device kernels \
+                 implement (sum, count, min, max)",
+                expr.fun().name()
+            ));
         };
         if expr.is_distinct() {
             return Err(format!(

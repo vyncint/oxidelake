@@ -205,6 +205,20 @@ versions (0.x) may contain breaking changes; they are always listed under a
   suite's GPU pass pin the kernel to the reference's wrapped answer when
   they next run on a CUDA machine.
 
+- **`GpuAggregateExec` aggregates each input partition on its own** (#90).
+  `GpuAggregateExec::try_new` still builds a complete aggregate of any
+  input, but merges a multi-partition input with a `CoalescePartitionsExec`
+  that `input()` now returns, where it used to read every partition inside
+  `execute(0)`; the new `GpuAggregateExec::try_new_partitioned` aggregates
+  per partition and declares its input's partitioning, which is what the
+  placement rule and the plan codec build, and what `with_new_children`
+  keeps. Code that builds the exec with `try_new` gets the same rows;
+  code that walked from it to its input sees the merge node first.
+  **`EXPLAIN` shows two `GpuAggregateExec` nodes for a two-phase
+  aggregate**, the final half over DataFusion's `RepartitionExec` or
+  `CoalescePartitionsExec` over the partial half; the final half merges
+  partial results, so a `COUNT` reads there as `SUM(count(t.v)[count])`.
+
 ### Fixed
 
 - **`SUM(Int64)` wraps on overflow under a GPU target, as it does in stock
@@ -245,6 +259,19 @@ versions (0.x) may contain breaking changes; they are always listed under a
   aggregates no longer show as `GpuAggregateExec`; they run as stock
   DataFusion's ordered aggregate, which streams with one group open at a
   time.
+
+- **`UNION ALL` of two aggregates, and a partitioned join over one, work
+  under a GPU target** (#90), embedded and on a cluster. DataFusion plans a
+  two-phase aggregate's final half on N hash partitions and the operators
+  above it on those: a `UNION ALL` interleaves two such aggregates, a
+  partitioned join (or Ballista's sort-merge join) pairs partition i with
+  partition i. The placement rule replaced both halves and the exchange
+  between them with one `GpuAggregateExec` that declared a single
+  partition, so the first failed to plan (`Can not create InterleaveExec`)
+  and the second with `HashJoinExec requires children [0, 1] to be
+  co-partitioned`. The rule now lowers each half where it stands and keeps
+  DataFusion's exchange between them, and each `GpuAggregateExec` declares
+  the partitioning of the node it replaces.
 
 ### Security
 
