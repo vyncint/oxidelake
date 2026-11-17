@@ -33,6 +33,15 @@ ignore = [
     # depends on for macOS under `predict` (`cargo deny --all-features` sees
     # it; the default graph does not). No runtime exposure.
     { id = "RUSTSEC-2024-0436", reason = "compile-time proc-macro dependency of the metal crate (oxmera, macOS, predict); no runtime code" },
+    # Three "unmaintained" notices published 2026-11-16/17, none a known
+    # vulnerability and none with a maintained release to move to. chrono and
+    # chrono-tz are arrow's (59) date/time and timezone support, under every
+    # DataFusion and Ballista crate; humantime is object_store 0.13's duration
+    # parsing. None can leave the graph without leaving the pinned chain;
+    # revisit at the next DataFusion/Ballista bump.
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained (no vulnerability); arrow 59 depends on it throughout the DataFusion/Ballista chain" },
+    { id = "RUSTSEC-2026-0555", reason = "chrono-tz is unmaintained (no vulnerability); arrow-array 59's timezone support" },
+    { id = "RUSTSEC-2026-0542", reason = "humantime is unmaintained (no vulnerability); object_store 0.13's duration parsing under DataFusion and Ballista" },
 ]
 
 [licenses]
