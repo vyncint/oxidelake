@@ -101,6 +101,11 @@ not the query interface.
   column indices, types, dimensions, a cap on predicate size) so a malformed
   payload yields an error rather than a panic, but a *malicious* scheduler is
   outside the threat model: it can already run arbitrary SQL.
+- **A scheduler's build check is not authentication.** `oxide-scheduler`
+  refuses a worker whose plan fingerprint differs from its own, so a
+  mismatched deployment fails when the worker registers rather than in a
+  query. The worker declares that fingerprint itself (in its executor id),
+  so the check stops accidents, not an attacker who can reach the port.
 - **The `oxide` CLI reads any Parquet path you give it** with your privileges;
   identifiers you pass (`--table NAME=PATH`) are quoted before they are used in
   generated SQL.

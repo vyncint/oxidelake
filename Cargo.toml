@@ -49,7 +49,7 @@ object_store = "0.13"                # ObjectStore trait; io_uring local store i
 tokio = { version = "1.52", features = ["full"] }
 futures = "0.3"
 bytes = "1"
-async-trait = "0.1"                  # only to implement object_store's ObjectStore (foreign trait)
+async-trait = "0.1"                  # only to implement foreign traits: object_store's ObjectStore, Ballista's ClusterState
 # parallelism
 rayon = "1"
 # syscalls the standard library does not expose: installing a SIGUSR1 handler

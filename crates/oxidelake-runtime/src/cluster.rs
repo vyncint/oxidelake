@@ -20,14 +20,17 @@ use ballista_core::serde::protobuf::scheduler_grpc_client::SchedulerGrpcClient;
 use ballista_core::serde::{
     BallistaCodec, BallistaLogicalExtensionCodec, BallistaPhysicalExtensionCodec,
 };
+use ballista_core::utils::{default_config_producer, default_session_builder};
 use ballista_core::{ConfigProducer, RuntimeProducer};
 use ballista_executor::executor_process::{ExecutorProcessConfig, start_executor_process};
 use ballista_executor::new_standalone_executor_from_builder;
 use ballista_scheduler::cluster::BallistaCluster;
+use ballista_scheduler::cluster::memory::InMemoryJobState;
 use ballista_scheduler::config::SchedulerConfig;
 use ballista_scheduler::scheduler_process::start_server;
 use ballista_scheduler::scheduler_server::SessionBuilder;
 use ballista_scheduler::standalone::new_standalone_scheduler_with_builder;
+use ballista_scheduler::state::session_manager::share_file_statistics_cache;
 use datafusion::config::{ConfigEntry, ConfigExtension, ExtensionOptions};
 use datafusion::error::DataFusionError;
 use datafusion::execution::SessionStateBuilder;
@@ -38,9 +41,14 @@ use datafusion::prelude::SessionConfig;
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use oxidelake_compute::oxide_udfs;
 use oxidelake_core::{BackendKind, EngineError};
+use oxidelake_planner::codec::build_description;
 use oxidelake_planner::{HardwarePlacementRule, OxidePhysicalCodec, physical_optimizer_rules};
 use oxidelake_storage::{
     BoundedReadStore, ParquetScanGuard, default_object_store, with_gpu_batch_size, with_pruning,
+};
+
+use crate::admission::{
+    REFUSED, SameBuildClusterState, failing_without_a_usable_worker, tagged_executor_id,
 };
 
 fn ballista_error(err: impl std::fmt::Display) -> EngineError {
@@ -259,20 +267,49 @@ pub fn scheduler_config(bind_host: &str, port: u16, target: BackendKind) -> Sche
 }
 
 /// Runs a Ballista scheduler until it exits.
+///
+/// The scheduler admits only workers of its own build (#92): one whose plan
+/// fingerprint differs is refused when it registers, and a query sent to a
+/// cluster whose workers were all refused fails at once with the reason,
+/// where Ballista would hold it for a worker that is never coming.
 pub async fn run_scheduler(config: SchedulerConfig) -> Result<(), EngineError> {
     let address: SocketAddr = format!("{}:{}", config.bind_host, config.bind_port)
         .parse()
         .map_err(|e| EngineError::plan(format!("invalid scheduler bind address: {e}")))?;
-    let config = Arc::new(config);
-    let cluster = BallistaCluster::new_from_config(&config)
-        .await
-        .map_err(ballista_error)?;
-    start_server(cluster, address, config)
+    let cluster = same_build_cluster(&config);
+    start_server(cluster, address, Arc::new(config))
         .await
         .map_err(ballista_error)
 }
 
+/// What `BallistaCluster::new_from_config` builds, in-memory cluster and job
+/// state, with the cluster state admitting only workers of this build and
+/// the session builder failing a query that no admitted worker can run.
+fn same_build_cluster(config: &SchedulerConfig) -> BallistaCluster {
+    let state = Arc::new(SameBuildClusterState::default());
+    let session_builder = config
+        .override_session_builder
+        .clone()
+        .unwrap_or_else(|| Arc::new(default_session_builder));
+    let config_producer = config
+        .override_config_producer
+        .clone()
+        .unwrap_or_else(|| Arc::new(default_config_producer));
+    let jobs = InMemoryJobState::new(
+        config.scheduler_id.clone(),
+        share_file_statistics_cache(failing_without_a_usable_worker(
+            session_builder,
+            Arc::clone(&state),
+        )),
+        config_producer,
+    );
+    BallistaCluster::new(state, Arc::new(jobs))
+}
+
 /// Executor configuration with OxideLake's hooks installed.
+///
+/// The executor id carries this build's plan fingerprint, which is what a
+/// scheduler checks when the executor registers (#92).
 pub fn executor_config(
     scheduler_host: &str,
     scheduler_port: u16,
@@ -283,6 +320,7 @@ pub fn executor_config(
 ) -> ExecutorProcessConfig {
     let defaults = ExecutorProcessConfig::default();
     ExecutorProcessConfig {
+        executor_id: tagged_executor_id(&defaults.executor_id),
         scheduler_host: scheduler_host.to_owned(),
         scheduler_port,
         port,
@@ -300,10 +338,24 @@ pub fn executor_config(
 }
 
 /// Runs a Ballista executor until it exits.
+///
+/// A scheduler of another build refuses it when it registers (#92), and this
+/// returns that refusal with the executor's own build added, so the two
+/// builds are named side by side in the worker's log.
 pub async fn run_executor(config: ExecutorProcessConfig) -> Result<(), EngineError> {
     start_executor_process(Arc::new(config))
         .await
-        .map_err(ballista_error)
+        .map_err(|err| {
+            let text = err.to_string();
+            if text.contains(REFUSED) {
+                EngineError::execution(format!(
+                    "ballista: {text}. This worker is {}",
+                    build_description()
+                ))
+            } else {
+                ballista_error(err)
+            }
+        })
 }
 
 /// Starts an in-process scheduler plus `executors` executors on ephemeral

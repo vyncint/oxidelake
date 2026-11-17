@@ -390,6 +390,26 @@ versions (0.x) may contain breaking changes; they are always listed under a
   datafusion.execution.batch_size` is kept as well, unless it is 8192,
   which the scheduler cannot tell from the default.
 
+- **A worker of another build is refused when it joins, and a CUDA worker
+  is no longer one** (#92). The plan fingerprint (#42) counted the `cuda`
+  and `metal` features, which change where an operator runs but not what a
+  plan says, so a default-build scheduler with `--features cuda` workers
+  failed every GPU-placed query. It now counts only the release and
+  `predict` (`oxidelake_compute::FEATURE_MASK` keeps bits 1 and 2, always
+  zero). It was also checked only inside a task launch, so a real mismatch
+  failed queries with "task could not be prepared or was rejected by
+  executor" and the reason in the worker's log (a hang under Ballista 54),
+  and a `cpu` cluster never checked at all. Now `oxide-worker` carries its
+  build's fingerprint in its executor id (`oxl<8 hex digits>-<uuid>`), and
+  `oxide-scheduler` refuses a worker of another build when it registers: the
+  worker exits non-zero naming both builds, and a query on a cluster whose
+  workers were all refused fails at once with that reason. Run the same
+  release, with or without `predict` alike, on the scheduler and every
+  worker; a plain Ballista executor, or an `oxide-worker` older than 0.3.0,
+  is refused. `oxidelake_planner::codec::PLAN_FINGERPRINT` and
+  `build_description()` are public, and `make test-mixed-build` runs both
+  cases with real binaries.
+
 ### Security
 
 - **thrift is out of the dependency graph** (#4, #54). parquet 59 decodes
