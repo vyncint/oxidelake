@@ -351,6 +351,12 @@ versions (0.x) may contain breaking changes; they are always listed under a
   file. Spill files are now named `batch-<tag>-<id>.arrow`, with a random
   tag per manager.
 
+- **Dropping a spill manager deletes the spill files it still holds**
+  (#117). They were left in the spill directory. A drop cannot await, so
+  the deletes run on a thread and runtime of their own and the drop waits
+  for them; after 30 seconds it stops waiting and lets them finish in the
+  background. A file that cannot be deleted is logged at `warn`.
+
 ### Security
 
 - **thrift is out of the dependency graph** (#4, #54). parquet 59 decodes

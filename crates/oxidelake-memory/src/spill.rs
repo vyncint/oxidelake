@@ -14,8 +14,9 @@ use std::collections::HashMap;
 use std::collections::hash_map::RandomState;
 use std::fmt;
 use std::hash::{BuildHasher, Hasher};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, mpsc};
+use std::time::Duration;
 
 use arrow::array::{Array, ArrayData, ArrayRef, MAX_INLINE_VIEW_LEN, RecordBatch};
 use arrow::datatypes::{DataType, SchemaRef};
@@ -117,7 +118,8 @@ impl State {
 ///
 /// Its spill files are named `batch-<tag>-<id>.arrow` under its prefix, with
 /// a tag drawn at random for this manager, so managers can share a store and
-/// a prefix (#114).
+/// a prefix (#114). Dropping the manager deletes the spill files it still
+/// holds, waiting up to 30 seconds for the deletes (#117).
 pub struct SpillManager {
     budget: SpillBudget,
     store: Arc<dyn ObjectStore>,
@@ -499,6 +501,94 @@ fn view_bytes(data: &ArrayData) -> usize {
         .fold(own, |sum, child| sum.saturating_add(view_bytes(child)))
 }
 
+impl Drop for SpillManager {
+    fn drop(&mut self) {
+        let paths: Vec<Path> = self
+            .state
+            .get_mut()
+            .entries
+            .values()
+            .filter_map(|entry| match &entry.payload {
+                Payload::Disk(path) => Some(path.clone()),
+                Payload::Device(_) | Payload::Host(_) => None,
+            })
+            .collect();
+        if !paths.is_empty() {
+            delete_on_drop(Arc::clone(&self.store), paths);
+        }
+    }
+}
+
+/// How long dropping a manager waits for its spill files to be deleted
+/// before it lets the deletes finish in the background.
+const DROP_DELETE_WAIT: Duration = Duration::from_secs(30);
+
+/// Deletes the spill files of a dropped manager (#117).
+///
+/// `drop` cannot await, so the deletes run on a thread of their own with a
+/// runtime of its own, and the drop waits for them: blocking in place panics
+/// on a current-thread runtime, and a task spawned on the caller's runtime
+/// would not have run by the time the drop returns, or at all if that
+/// runtime is shutting down. The wait is bounded because a store whose
+/// deletes need the very runtime the dropping thread is blocking (a network
+/// store on a current-thread runtime) would hang the drop; past the bound
+/// the deletes carry on in the background.
+fn delete_on_drop(store: Arc<dyn ObjectStore>, paths: Vec<Path>) {
+    let files = paths.len();
+    let (done, finished) = mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("oxide-spill-drop".to_owned())
+        .spawn(move || {
+            match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime.block_on(async {
+                    for path in &paths {
+                        match store.delete(path).await {
+                            Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                            Err(err) => tracing::warn!(
+                                error = %err,
+                                path = %path,
+                                "spill file left behind: its manager was dropped and it could not be deleted"
+                            ),
+                        }
+                    }
+                }),
+                Err(err) => tracing::warn!(
+                    error = %err,
+                    files,
+                    "spill files left behind: no runtime to delete them with"
+                ),
+            }
+            // Fails only once the drop has stopped waiting.
+            let _ = done.send(());
+        });
+    match spawned {
+        Ok(thread) => match finished.recv_timeout(DROP_DELETE_WAIT) {
+            Ok(()) => {
+                // The runtime is gone by now; this only reaps the thread.
+                let _ = thread.join();
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => tracing::warn!(
+                files,
+                "dropped spill manager: its spill files are still being deleted after {} s; \
+                 carrying on in the background",
+                DROP_DELETE_WAIT.as_secs()
+            ),
+            Err(mpsc::RecvTimeoutError::Disconnected) => tracing::warn!(
+                files,
+                "spill files may be left behind: the thread deleting them panicked"
+            ),
+        },
+        Err(err) => tracing::warn!(
+            error = %err,
+            files,
+            "spill files left behind: no thread to delete them on"
+        ),
+    }
+}
+
 impl fmt::Debug for SpillManager {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SpillManager")
@@ -819,5 +909,61 @@ mod tests {
             .map(|i| SpillManager::batch_bytes(&whole.slice(i * 250, 250)))
             .sum();
         assert_eq!(quarters, whole_bytes);
+    }
+
+    // #117
+    /// The names of the files in the spill directory, sorted.
+    fn spill_files(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir.join("spill"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A spill directory that already holds a file of someone else's.
+    fn occupied_spill_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("spill")).unwrap();
+        std::fs::write(dir.path().join("spill/keep.arrow"), b"not the manager's").unwrap();
+        dir
+    }
+
+    /// A manager with three batches spilled to `dir`.
+    async fn spill_three(dir: &std::path::Path) -> Arc<SpillManager> {
+        let mgr = manager(dir, 0, 0);
+        for start in [0, 1000, 2000] {
+            let id = mgr.insert_host(batch(start, 64)).await.unwrap();
+            assert_eq!(mgr.tier_of(id).await, Some(Tier::Disk));
+        }
+        assert_eq!(spill_files(dir).len(), 4);
+        mgr
+    }
+
+    #[test]
+    fn a_manager_dropped_outside_a_runtime_deletes_its_spill_files() {
+        let dir = occupied_spill_dir();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mgr = rt.block_on(spill_three(dir.path()));
+        drop(mgr);
+        assert_eq!(spill_files(dir.path()), ["keep.arrow"]);
+    }
+
+    #[tokio::test]
+    async fn a_manager_dropped_on_a_current_thread_runtime_deletes_its_spill_files() {
+        let dir = occupied_spill_dir();
+        drop(spill_three(dir.path()).await);
+        assert_eq!(spill_files(dir.path()), ["keep.arrow"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_manager_dropped_on_a_multi_thread_runtime_deletes_its_spill_files() {
+        let dir = occupied_spill_dir();
+        drop(spill_three(dir.path()).await);
+        assert_eq!(spill_files(dir.path()), ["keep.arrow"]);
     }
 }
