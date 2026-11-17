@@ -54,6 +54,14 @@ versions (0.x) may contain breaking changes; they are always listed under a
   current releases no longer pull the unmaintained `pin-utils`
   (RUSTSEC-2026-0441).
 
+- **Three "unmaintained" notices are accepted, with their reasons**:
+  `chrono` (RUSTSEC-2026-0543) and `chrono-tz` (RUSTSEC-2026-0555), which
+  are arrow 59's date/time and timezone support under every DataFusion and
+  Ballista crate, and `humantime` (RUSTSEC-2026-0542), `object_store` 0.13's
+  duration parsing. None is a known vulnerability and none has a maintained
+  release to move to inside the pinned chain; each is listed in `deny.toml`,
+  `SECURITY.md` and `STATUS.md` and revisited at the next chain bump.
+
 ## [0.2.0] - 2026-09-21
 
 The observability release. A GPU deployment that silently ran everything on

@@ -35,7 +35,7 @@ jobs:
     name: tag matches workspace version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
@@ -72,7 +72,7 @@ jobs:
     needs: verify-version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
@@ -87,7 +87,7 @@ jobs:
       - name: Skip (first release, no baseline)
         if: steps.published.outputs.found != 'true'
         run: echo "oxidelake-core is not on crates.io yet; skipping semver checks gracefully."
-      - uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2
+      - uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2.9
         if: steps.published.outputs.found == 'true'
         with:
           package: oxidelake-core,oxidelake-memory,oxidelake-device,oxidelake-compute,oxidelake-storage,oxidelake-planner,oxidelake-tui,oxidelake-runtime,oxidelake-api
@@ -103,7 +103,7 @@ jobs:
       contents: read
       id-token: write # crates.io Trusted Publishing (GitHub OIDC)
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
@@ -207,7 +207,7 @@ jobs:
     permissions:
       contents: write # create the release
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
