@@ -65,7 +65,7 @@ jobs:
           - target: x86_64-apple-darwin
             os: macos-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           ref: ${{ env.TAG }}
@@ -221,7 +221,7 @@ jobs:
       # Checkout does the authentication rather than the token being spliced
       # into a remote URL by hand. The credential is scoped to one repository
       # and pushing back is this job's whole business.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: steps.token.outputs.usable == 'true'
         with:
           repository: vyncint/homebrew-tap
