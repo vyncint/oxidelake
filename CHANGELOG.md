@@ -342,6 +342,15 @@ versions (0.x) may contain breaking changes; they are always listed under a
   batch reports less than it did. The buffers the slices share stay
   allocated while any of them lives, which no per-batch measure can see.
 
+- **Two spill managers on one store and prefix no longer overwrite each
+  other's files** (#114). Each manager numbers its batches from 1 and
+  named their files `batch-<id>.arrow`, so a second manager on the same
+  prefix, in the same process or another one, wrote over the first one's
+  spill files: the first manager read back the second one's rows, and the
+  second one's batch was gone once the first promoted it and deleted the
+  file. Spill files are now named `batch-<tag>-<id>.arrow`, with a random
+  tag per manager.
+
 ### Security
 
 - **thrift is out of the dependency graph** (#4, #54). parquet 59 decodes

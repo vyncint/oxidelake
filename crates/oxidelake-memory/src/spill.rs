@@ -11,7 +11,9 @@
 //! size and how to copy itself back to a host `RecordBatch`.
 
 use std::collections::HashMap;
+use std::collections::hash_map::RandomState;
 use std::fmt;
+use std::hash::{BuildHasher, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -112,6 +114,10 @@ impl State {
 }
 
 /// The spill manager. Cheap to share via `Arc`.
+///
+/// Its spill files are named `batch-<tag>-<id>.arrow` under its prefix, with
+/// a tag drawn at random for this manager, so managers can share a store and
+/// a prefix (#114).
 pub struct SpillManager {
     budget: SpillBudget,
     store: Arc<dyn ObjectStore>,
@@ -120,6 +126,8 @@ pub struct SpillManager {
     state: Mutex<State>,
     next_id: AtomicU64,
     clock: AtomicU64,
+    /// Sets this manager's file names apart from any other's (#114).
+    tag: String,
 }
 
 fn store_error(err: object_store::Error) -> EngineError {
@@ -148,6 +156,7 @@ impl SpillManager {
             state: Mutex::new(State::default()),
             next_id: AtomicU64::new(1),
             clock: AtomicU64::new(0),
+            tag: instance_tag(),
         })
     }
 
@@ -184,7 +193,7 @@ impl SpillManager {
     }
 
     fn spill_path(&self, id: BatchId) -> Path {
-        Path::from(format!("{}/batch-{id}.arrow", self.prefix))
+        Path::from(format!("{}/batch-{}-{id}.arrow", self.prefix, self.tag))
     }
 
     fn publish(&self, state: &State) {
@@ -435,6 +444,21 @@ impl SpillManager {
     }
 }
 
+/// A tag for one manager's file names that no other manager will draw, in
+/// this process or another one writing to the same store (#114). Every
+/// manager numbers its batches from 1, so two on one prefix would otherwise
+/// write, read and delete each other's files.
+fn instance_tag() -> String {
+    static MANAGERS: AtomicU64 = AtomicU64::new(0);
+    // `RandomState` keys its hasher from the operating system's randomness,
+    // and no two instances share keys: the entropy std offers. The process
+    // id and a count of managers make the input distinct as well.
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u32(std::process::id());
+    hasher.write_u64(MANAGERS.fetch_add(1, Ordering::Relaxed));
+    format!("{:016x}", hasher.finish())
+}
+
 /// Bytes in one Arrow view: a string's length, then its first bytes, or the
 /// buffer and offset where it lives when it is too long to be inlined.
 const VIEW_LEN: usize = 16;
@@ -480,6 +504,7 @@ impl fmt::Debug for SpillManager {
         f.debug_struct("SpillManager")
             .field("budget", &self.budget)
             .field("prefix", &self.prefix)
+            .field("tag", &self.tag)
             .finish_non_exhaustive()
     }
 }
@@ -638,6 +663,24 @@ mod tests {
         assert_eq!(mgr.schema_of(id).await.unwrap().fields().len(), 1);
         assert_eq!(mgr.tier_of(999).await, None);
         assert!(mgr.get(999).await.is_err());
+    }
+
+    // #114: ids start at 1 in every manager, so the file names must carry
+    // something only this manager has.
+    #[tokio::test]
+    async fn two_managers_on_one_store_and_prefix_keep_their_own_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        // A host budget of zero spills every batch as it is inserted.
+        let a = manager(dir.path(), 0, 0);
+        let b = manager(dir.path(), 0, 0);
+        let mine = batch(0, 64);
+        let theirs = batch(1_000_000, 64);
+        let ia = a.insert_host(mine.clone()).await.unwrap();
+        let ib = b.insert_host(theirs.clone()).await.unwrap();
+        assert_eq!(a.tier_of(ia).await, Some(Tier::Disk));
+        assert_eq!(b.tier_of(ib).await, Some(Tier::Disk));
+        assert_eq!(a.get(ia).await.unwrap(), mine);
+        assert_eq!(b.get(ib).await.unwrap(), theirs);
     }
 
     // #115
