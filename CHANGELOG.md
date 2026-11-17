@@ -455,6 +455,15 @@ versions (0.x) may contain breaking changes; they are always listed under a
   filter emitting 129 rows and one emitting 1451 both read `6000 in / 1580
   out`. Each plan node's counters are now read from the node itself
   (#123).
+- **A dashboard whose refresh brings the plan can select all of it.**
+  `run_terminal` bounded the selection by the plan the model had before
+  the first refresh, so with a tick and a `refresh` that supplies the plan
+  or grows it, as its documentation invites, `↓` stopped at the old
+  length — on the first operator when the model started empty. The
+  selection now follows the plan's length after every refresh, and moves to
+  the last operator left when the plan shrinks under it. `oxide tui` never
+  refreshes and was not affected. A loop of your own around `AppState` and
+  `render` gets the same from the new `AppState::set_node_count` (#126).
 
 ### Security
 
