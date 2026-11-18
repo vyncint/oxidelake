@@ -34,6 +34,41 @@ versions (0.x) may contain breaking changes; they are always listed under a
   DataFusion's pool unbounded: a DataFusion operator on a worker that used to
   grow without limit now spills, or fails with a resources-exhausted error.
   The `Gpu*Exec` operators do not reserve from it.
+- `GpuOperator::hash_join` takes the batch size and returns a `JoinProbe`,
+  whose output `GpuOperator::next_join_chunk` hands out one batch of at
+  most that size at a time, in place of one `RecordBatch` holding every
+  match (#95). *Migration:* `let mut probe = op.hash_join(&left, &build,
+  key, projection, batch_size)?;` then `while let Some(batch) =
+  op.next_join_chunk(&mut probe, &build)? { … }`.
+- **`GpuBackend` prepares a hash join's build side once and probes it in
+  two steps** (the join half of #45). The CUDA backend used to rebuild its
+  join table for every probe batch; `prepare_join_build` now indexes the
+  build side once per operator and returns a `DeviceJoinTable`,
+  `probe_join` returns a probe batch's `DeviceJoinMatches`, numbered in
+  probe-row order and then build order as the CPU reference numbers them,
+  and `hash_join` gathers a range of those matches, so a skewed probe batch
+  leaves the device in pieces of at most a batch (#95). Breaking for code
+  that implements the trait or builds `HashJoinArgs`, which now carries
+  `table`, `matches`, `first` and `rows` in place of `left_key` and
+  `right_key`. *Migration:* an external backend that runs joins implements
+  the two new methods and gathers the range `HashJoinArgs` names. Until it
+  does, both default to `Unsupported`, so its joins take the CPU reference
+  path, counted in `fallback_batches`, and it is handed the build side once
+  rather than once per probe batch. Compiled, not yet run on a GPU:
+  STATUS.md has the T4 commands. The aggregate half of #45 is still open.
+- **The CUDA hash join keeps one slot per distinct build key** (#108). A
+  key repeated D times on the build side took D slots, so building the
+  table cost O(D²) `atomicCAS` attempts per probe batch and a probe row
+  landing in the run walked O(D) slots: for a 100 000-row single-key build
+  side, 5.0e9 attempts and 19 050 slot reads per absent probe key (the
+  0.2.0 kernel itself, compiled on the CPU under a shim that counts its
+  `atomicCAS` calls). The index now holds each key once with its run of
+  build rows. It is built on the host from the table the CPU path already
+  holds and only read on the device, so the device makes no `atomicCAS`
+  at all and a probe reads a bounded number of slots however often a key
+  repeats (1.1 to 1.8 on average for the same shapes), and a key's matches
+  come back in build order, as the CPU reference returns them. Not yet run
+  on a GPU (STATUS.md).
 
 ### Fixed
 
@@ -95,6 +130,34 @@ versions (0.x) may contain breaking changes; they are always listed under a
   would not promise``. The device join also declares its two keys equal,
   which DataFusion plans on: a window partitioned by one key over a lowered
   hash join, DataFusion's default join, failed with the same error.
+
+- **A GPU join's counters include its build side, and a sliced batch counts
+  what it moves** (#103). `GpuHashJoinExec` on a device now adds its
+  build-side upload to `bytes_h2d` (once per operator, where the upload
+  happens) and its build rows to `rows_in` (once per join). Both were
+  missing, so a join against 200 000 build rows reported a few hundred
+  bytes moved. Every operator's `bytes_h2d` and `bytes_d2h` now count the
+  bytes a transfer copies instead of the capacity of the buffers behind each
+  array: a filter over ten rows of a 200 000-row batch reported 3.2 MB and
+  now reports 162 bytes. The Inspector, `/metrics`
+  (`oxide_operator_bytes_h2d_total`, `oxide_operator_bytes_d2h_total`,
+  `oxide_operator_rows_in_total`) and `OperatorSnapshot` change with them;
+  a dashboard that charts those series will show a step at the upgrade.
+- **A join whose key repeats on both sides no longer aborts the process**
+  (#95). `GpuHashJoinExec` gathered every match of a probe batch into one
+  output batch, so a key repeated on both sides arrived as the product of
+  its two counts at once: 65 536 probe rows against 4 000 build rows of one
+  key are 262 million rows, and `oxide sql --target cuda` died with
+  `memory allocation of 2097152000 bytes failed` (SIGABRT, no error, no
+  fallback) where stock DataFusion streams the same join in 74 MB. A probe
+  batch's output now leaves in batches of at most the session's batch size,
+  and that query completes in 83 MB under a 4 GB cap. On a GPU the pieces
+  are gathered on the device from matches that stay there (#45). A join's
+  `batches` counter now counts the batches it emits, which is its probe
+  batches unless one of them joined to more than a batch.
+  `oxidelake_device::cpu::kernels` gains `JoinMatches` and
+  `hash_join_gather`, the reference for gathering a range of a probe's
+  matches.
 
 ### Security
 

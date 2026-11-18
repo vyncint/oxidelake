@@ -6,8 +6,13 @@ use arrow::array::RecordBatch;
 use oxidelake_core::params::Predicate;
 use oxidelake_core::{BackendKind, DeviceId, EngineError};
 
-use crate::args::{AggregateArgs, FilterProjectArgs, HashJoinArgs, VectorDistanceArgs};
-use crate::handles::{DeviceBatch, DeviceBuffer, DeviceStream, HostBuffer};
+use crate::args::{
+    AggregateArgs, FilterProjectArgs, HashJoinArgs, JoinBuildArgs, JoinProbeArgs,
+    VectorDistanceArgs,
+};
+use crate::handles::{
+    DeviceBatch, DeviceBuffer, DeviceJoinMatches, DeviceJoinTable, DeviceStream, HostBuffer,
+};
 
 /// Memory capacity report for one backend device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,12 +101,66 @@ pub trait GpuBackend: Send + Sync + fmt::Debug {
         args: FilterProjectArgs<'_>,
     ) -> Result<DeviceBatch, EngineError>;
 
-    /// Inner hash join on one `Int64` key.
+    /// Inner hash join on one `Int64` key: matches `args.first..args.first +
+    /// args.rows` of a probe ([`Self::probe_join`]), as the probe side's
+    /// columns followed by the build side's, gathered at each match's probe
+    /// row and build row.
+    ///
+    /// An operator calls this once per output chunk of at most a batch, so
+    /// the product of a key that repeats on both sides is never materialised
+    /// in one piece (#95). A join runs as [`Self::prepare_join_build`] once,
+    /// then [`Self::probe_join`] and one or more `hash_join` calls per probe
+    /// batch.
     fn hash_join(
         &self,
         stream: &DeviceStream,
         args: HashJoinArgs<'_>,
     ) -> Result<DeviceBatch, EngineError>;
+
+    /// Prepares a hash join's build side once, for every probe batch of one
+    /// operator (#45): typically an index of the build rows in device memory,
+    /// freed when the operator drops it.
+    ///
+    /// The default declines with [`EngineError::Unsupported`], so the join
+    /// takes the CPU reference path — counted as a fallback — rather than
+    /// handing a backend arguments it does not read. A backend that runs
+    /// joins implements this, [`Self::probe_join`] and [`Self::hash_join`]
+    /// together.
+    fn prepare_join_build(
+        &self,
+        stream: &DeviceStream,
+        args: JoinBuildArgs<'_>,
+    ) -> Result<DeviceJoinTable, EngineError> {
+        let _ = (stream, args);
+        Err(EngineError::unsupported(
+            "backend.prepare_join_build",
+            format!(
+                "backend `{}` does not prepare hash-join build sides",
+                self.kind()
+            ),
+        ))
+    }
+
+    /// Probes one batch against a prepared build side: which build rows each
+    /// probe row's key matches, kept for [`Self::hash_join`] to gather in
+    /// ranges. Declines by default, like [`Self::prepare_join_build`].
+    ///
+    /// The matches must be numbered as the CPU reference numbers them
+    /// ([`crate::cpu::kernels::JoinMatches`]): in probe-row order, and in
+    /// build order within a probe row. An operator relies on it to finish a
+    /// probe batch on the CPU from any match when a range is declined,
+    /// without repeating or losing a row.
+    fn probe_join(
+        &self,
+        stream: &DeviceStream,
+        args: JoinProbeArgs<'_>,
+    ) -> Result<DeviceJoinMatches, EngineError> {
+        let _ = (stream, args);
+        Err(EngineError::unsupported(
+            "backend.probe_join",
+            format!("backend `{}` does not probe hash joins", self.kind()),
+        ))
+    }
 
     /// Grouped aggregation.
     fn aggregate(

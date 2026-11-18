@@ -18,7 +18,7 @@ use arrow::array::{
     RecordBatch, Scalar, UInt32Array,
 };
 use arrow::compute::kernels::cmp;
-use arrow::compute::{and_kleene, filter_record_batch, take};
+use arrow::compute::{TakeOptions, and_kleene, filter_record_batch, take};
 use arrow::datatypes::{DataType, Field, Schema};
 use oxidelake_core::EngineError;
 use oxidelake_core::params::{
@@ -189,6 +189,27 @@ impl JoinTable {
         }
     }
 
+    /// `(start, count)` of `key`'s run in [`Self::row_indices`].
+    fn run(&self, key: i64) -> Option<(u32, u32)> {
+        self.ranges.get(&key).copied()
+    }
+
+    /// Every distinct key with its run in [`Self::row_indices`], as
+    /// `(key, start, count)`, in no particular order. A backend builds its
+    /// device index from these rather than hashing the build side again
+    /// (see `GpuBackend::prepare_join_build`).
+    pub fn runs(&self) -> impl Iterator<Item = (i64, u32, u32)> + '_ {
+        self.ranges
+            .iter()
+            .map(|(&key, &(start, count))| (key, start, count))
+    }
+
+    /// The build rows with a non-`NULL` key, grouped by key and in build
+    /// order within a key: the array every run indexes.
+    pub fn row_indices(&self) -> &[u32] {
+        &self.rows
+    }
+
     /// Number of distinct non-`NULL` keys.
     pub fn distinct_keys(&self) -> usize {
         self.ranges.len()
@@ -213,9 +234,15 @@ pub fn hash_join(
     hash_join_probe(left, left_key, right, &table, None)
 }
 
-/// Probes `left` against a prebuilt [`JoinTable`] over `right`. The output is
-/// `left ++ right` columns, or the `projection` subset (indices into that
-/// concatenation) in projection order — columns outside it are never gathered.
+/// Probes `left` against a prebuilt [`JoinTable`] over `right` and returns
+/// every match in one batch. The output is `left ++ right` columns, or the
+/// `projection` subset (indices into that concatenation) in projection order
+/// — columns outside it are never gathered.
+///
+/// One batch holds the whole product, however large: a key that repeats on
+/// both sides makes it the product of the two counts. A caller that must
+/// stay within a batch size probes with [`JoinMatches`] and gathers ranges
+/// with [`hash_join_gather`].
 pub fn hash_join_probe(
     left: &RecordBatch,
     left_key: usize,
@@ -223,21 +250,143 @@ pub fn hash_join_probe(
     table: &JoinTable,
     projection: Option<&[usize]>,
 ) -> Result<RecordBatch, EngineError> {
-    let lk = int64_column(left, left_key, "left join key")?;
-    let mut left_idx = Vec::new();
-    let mut right_idx = Vec::new();
-    for (i, key) in lk.iter().enumerate() {
-        let Some(key) = key else { continue };
-        let matches = table.matches(key);
-        if matches.is_empty() {
-            continue;
+    let matches = JoinMatches::probe(left, left_key, table)?;
+    let rows = usize::try_from(matches.len())
+        .map_err(|_| EngineError::execution("join output exceeds usize::MAX rows"))?;
+    hash_join_gather(left, right, table, &matches, 0, rows, projection)
+}
+
+/// One probe batch's matches against a [`JoinTable`]: a sequence in
+/// probe-row order, and in build order within a probe row, kept as each
+/// row's run in the table and the running total of the matches before it.
+/// Nothing is materialised: [`hash_join_gather`] turns any range of the
+/// sequence into output rows, so a probe batch's output can be emitted in
+/// batches of a bounded size however often its keys repeat (#95).
+#[derive(Debug, Clone, Default)]
+pub struct JoinMatches {
+    /// `offsets[i]` is probe row `i`'s first match; one entry more than
+    /// there are rows, the last being the total. `u64`: one batch's matches
+    /// can pass `u32::MAX` however its output is cut.
+    offsets: Vec<u64>,
+    /// Where probe row `i`'s run starts in the table's row array (zero when
+    /// its key matches nothing).
+    starts: Vec<u32>,
+}
+
+impl JoinMatches {
+    /// Looks every row of `left`'s `Int64` column `left_key` up in `table`.
+    /// `NULL` keys match nothing.
+    pub fn probe(
+        left: &RecordBatch,
+        left_key: usize,
+        table: &JoinTable,
+    ) -> Result<Self, EngineError> {
+        let keys = int64_column(left, left_key, "left join key")?;
+        // Output rows are gathered with `u32` probe-row indices.
+        index_u32(keys.len())?;
+        let mut offsets = Vec::with_capacity(keys.len() + 1);
+        let mut starts = Vec::with_capacity(keys.len());
+        let mut total = 0u64;
+        for key in keys.iter() {
+            offsets.push(total);
+            let (start, count) = key.and_then(|k| table.run(k)).unwrap_or((0, 0));
+            starts.push(start);
+            total += u64::from(count);
         }
-        let i = index_u32(i)?;
-        left_idx.extend(std::iter::repeat_n(i, matches.len()));
-        right_idx.extend_from_slice(matches);
+        offsets.push(total);
+        Ok(Self { offsets, starts })
     }
-    let left_idx = UInt32Array::from(left_idx);
-    let right_idx = UInt32Array::from(right_idx);
+
+    /// Total matches: the rows this probe batch joins to.
+    pub fn len(&self) -> u64 {
+        self.offsets.last().copied().unwrap_or(0)
+    }
+
+    /// `true` when no probe row matched.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Probe rows looked up.
+    pub fn probe_rows(&self) -> usize {
+        self.starts.len()
+    }
+
+    /// The probe row and the build row of matches `first..first + rows`.
+    pub fn pairs(
+        &self,
+        table: &JoinTable,
+        first: u64,
+        rows: usize,
+    ) -> Result<(UInt32Array, UInt32Array), EngineError> {
+        let end = u64::try_from(rows)
+            .ok()
+            .and_then(|r| first.checked_add(r))
+            .filter(|&end| end <= self.len())
+            .ok_or_else(|| {
+                EngineError::execution(format!(
+                    "matches {first}..+{rows} are outside a probe with {} matches",
+                    self.len()
+                ))
+            })?;
+        let mut left = Vec::with_capacity(rows);
+        let mut right = Vec::with_capacity(rows);
+        // The probe row holding match `first` is the last one whose offset
+        // is at most `first`: a row with no matches shares its offset with
+        // the row after it, so it never wins.
+        let mut row = self
+            .offsets
+            .partition_point(|&offset| offset <= first)
+            .saturating_sub(1);
+        let mut at = first;
+        while at < end {
+            // `at < end <= total == offsets[probe_rows]`, so `row` is a probe
+            // row and `row + 1` an offset.
+            let (lo, hi) = (self.offsets[row], self.offsets[row + 1]);
+            let upto = hi.min(end);
+            if upto > at {
+                let start = self.starts[row] as usize;
+                let run = table
+                    .rows
+                    .get(start + (at - lo) as usize..start + (upto - lo) as usize)
+                    .ok_or_else(|| {
+                        EngineError::execution("join matches were probed against another table")
+                    })?;
+                left.extend(std::iter::repeat_n(index_u32(row)?, run.len()));
+                right.extend_from_slice(run);
+                at = upto;
+            }
+            row += 1;
+        }
+        Ok((UInt32Array::from(left), UInt32Array::from(right)))
+    }
+}
+
+/// Gathers matches `first..first + rows` of `matches` (probed from `left`
+/// against `table`, built over `right`) as output rows. The output is
+/// `left ++ right` columns, or the `projection` subset (indices into that
+/// concatenation) in projection order — columns outside it are never
+/// gathered.
+pub fn hash_join_gather(
+    left: &RecordBatch,
+    right: &RecordBatch,
+    table: &JoinTable,
+    matches: &JoinMatches,
+    first: u64,
+    rows: usize,
+    projection: Option<&[usize]>,
+) -> Result<RecordBatch, EngineError> {
+    if matches.probe_rows() != left.num_rows() {
+        return Err(EngineError::execution(format!(
+            "join matches cover {} probe rows but the probe batch has {}",
+            matches.probe_rows(),
+            left.num_rows()
+        )));
+    }
+    let (left_idx, right_idx) = matches.pairs(table, first, rows)?;
+    // A table built over another batch must not index past this one: checked
+    // here, where it costs one pass over a chunk, rather than trusted.
+    let checked = Some(TakeOptions { check_bounds: true });
 
     let all_fields: Vec<_> = left
         .schema()
@@ -261,9 +410,13 @@ pub fn hash_join_probe(
             ))
         })?;
         let array = if index < width {
-            take(left.column(index).as_ref(), &left_idx, None)?
+            take(left.column(index).as_ref(), &left_idx, checked.clone())?
         } else {
-            take(right.column(index - width).as_ref(), &right_idx, None)?
+            take(
+                right.column(index - width).as_ref(),
+                &right_idx,
+                checked.clone(),
+            )?
         };
         fields.push(Arc::clone(field));
         columns.push(array);
@@ -694,6 +847,69 @@ mod tests {
         let mut got: Vec<&str> = names.iter().flatten().collect();
         got.sort_unstable();
         assert_eq!(got, vec!["two-a", "two-a", "two-b", "two-b"]);
+    }
+
+    /// Gathering a probe's matches in ranges of any size, cut inside a probe
+    /// row's matches or across rows with none, yields exactly the one-batch
+    /// result, in the same order (#95).
+    #[test]
+    fn join_matches_gather_in_ranges_equal_one_gather() {
+        let right = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("rk", DataType::Int64, true),
+                Field::new("name", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![
+                    Some(2),
+                    Some(2),
+                    None,
+                    Some(9),
+                    Some(2),
+                    Some(5),
+                ])),
+                Arc::new(StringArray::from(vec![
+                    "a", "b", "null", "nine", "c", "five",
+                ])),
+            ],
+        )
+        .unwrap();
+        let left = batch();
+        let table = JoinTable::build(&right, 0).unwrap();
+        let matches = JoinMatches::probe(&left, 0, &table).unwrap();
+        let whole = hash_join_probe(&left, 0, &right, &table, None).unwrap();
+        // k = 1, 2, NULL, 2, 5 against three 2s and one 5.
+        assert_eq!(matches.len(), 7);
+        assert_eq!(whole.num_rows(), 7);
+        let projection = [0, 1, 3, 4];
+        for chunk in 1..=8 {
+            let mut parts = Vec::new();
+            let mut first = 0;
+            while first < matches.len() {
+                let rows = chunk.min(usize::try_from(matches.len() - first).unwrap());
+                let part = hash_join_gather(
+                    &left,
+                    &right,
+                    &table,
+                    &matches,
+                    first,
+                    rows,
+                    Some(&projection),
+                )
+                .unwrap();
+                assert_eq!(part.num_rows(), rows);
+                parts.push(part);
+                first += rows as u64;
+            }
+            let joined = arrow::compute::concat_batches(&parts[0].schema(), &parts).unwrap();
+            assert_eq!(joined, whole.project(&projection).unwrap(), "chunk {chunk}");
+        }
+        // Out of range, or probed against another table: an error, never a panic.
+        assert!(matches.pairs(&table, 7, 1).is_err());
+        assert!(matches.pairs(&table, 0, usize::MAX).is_err());
+        let other = JoinTable::build(&right.slice(0, 2), 0).unwrap();
+        assert!(hash_join_gather(&left, &right, &other, &matches, 0, 7, None).is_err());
+        assert!(hash_join_gather(&left.slice(0, 2), &right, &table, &matches, 0, 1, None).is_err());
     }
 
     #[test]

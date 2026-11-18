@@ -14,7 +14,7 @@ Conventions (docs/SPEC.md §2.3):
 | File | Operator | Notes |
 |---|---|---|
 | `filter_project.cu` | fused filter + projection | predicate mask + block-scan stream compaction |
-| `hash_join.cu` | inner hash join on one `Int64` key | open addressing, atomic CAS build, parallel probe |
+| `hash_join.cu` | inner hash join on one `Int64` key | one slot per distinct key (indexed on the host, read-only on the device), parallel probe, output expanded in ranges |
 | `aggregation.cu` | `SUM/COUNT/MIN/MAX` grouped by one `Int64` key | atomic / radix reduction |
 | `vector_distance.cu` | L2 and cosine distance | shared memory + warp shuffles |
 

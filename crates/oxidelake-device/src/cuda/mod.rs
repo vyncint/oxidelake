@@ -27,11 +27,15 @@ use oxidelake_core::{BackendKind, DeviceId, EngineError};
 use oxidelake_memory::HostAlloc;
 use oxidelake_memory::pinned::CudaPinnedProvider;
 
-use crate::args::{AggregateArgs, FilterProjectArgs, HashJoinArgs, VectorDistanceArgs};
+use crate::args::{
+    AggregateArgs, FilterProjectArgs, HashJoinArgs, JoinBuildArgs, JoinProbeArgs,
+    VectorDistanceArgs,
+};
 use crate::backend::{GpuBackend, MemoryInfo};
 use crate::columns::{self, ColumnBytes};
 use crate::handles::{
-    BatchInner, DeviceBatch, DeviceBuffer, DeviceBufferInner, DeviceStream, HostBuffer, StreamInner,
+    BatchInner, DeviceBatch, DeviceBuffer, DeviceBufferInner, DeviceJoinMatches, DeviceJoinTable,
+    DeviceStream, HostBuffer, StreamInner,
 };
 
 pub mod ops;
@@ -450,6 +454,22 @@ impl GpuBackend for CudaBackend {
         args: HashJoinArgs<'_>,
     ) -> Result<DeviceBatch, EngineError> {
         ops::hash_join(self, self.stream(stream)?, args)
+    }
+
+    fn prepare_join_build(
+        &self,
+        stream: &DeviceStream,
+        args: JoinBuildArgs<'_>,
+    ) -> Result<DeviceJoinTable, EngineError> {
+        ops::prepare_join_build(self.stream(stream)?, args)
+    }
+
+    fn probe_join(
+        &self,
+        stream: &DeviceStream,
+        args: JoinProbeArgs<'_>,
+    ) -> Result<DeviceJoinMatches, EngineError> {
+        ops::probe_join(self, self.stream(stream)?, args)
     }
 
     fn aggregate(

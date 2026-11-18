@@ -18,7 +18,7 @@ use arrow::buffer::NullBuffer;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 use datafusion::physical_plan::{ExecutionPlan, collect, displayable};
-use datafusion::prelude::SessionContext;
+use datafusion::prelude::{SessionConfig, SessionContext};
 use oxidelake_compute::{
     AggregateFunction, AggregateSpec, Comparison, DistanceMetric, GpuAggregateExec, GpuFilterExec,
     GpuHashJoinExec, GpuOperator, GpuVectorDistanceExec, Literal, Predicate,
@@ -181,6 +181,53 @@ async fn check_join(backend: Arc<dyn GpuBackend>, seed: u64, rows: usize) {
     assert_eq!(actual, expected, "join seed={seed} rows={rows}");
 }
 
+/// `batch` with its `Int64` column `column` reduced modulo `keys`, NULLs kept.
+fn skew(batch: &RecordBatch, column: usize, keys: i64) -> RecordBatch {
+    let mut columns = batch.columns().to_vec();
+    columns[column] =
+        arrow::compute::kernels::numeric::rem(&columns[column], &Int64Array::new_scalar(keys))
+            .unwrap();
+    RecordBatch::try_new(batch.schema(), columns).unwrap()
+}
+
+/// A probe batch whose matches outnumber the session's batch size comes out
+/// in batches of at most that size, with stock DataFusion's rows (#95). Three
+/// keys on each side make every probe row match about a third of the build
+/// side, so chunk boundaries fall inside one probe row's matches as well as
+/// between rows; `CHUNK` is prime so they do not line up with either.
+async fn check_join_chunked(backend: Arc<dyn GpuBackend>, seed: u64) {
+    const CHUNK: usize = 61;
+    let stock = SessionContext::new();
+    let left = skew(&gen_left(seed, 300), 0, 3);
+    let right = skew(&gen_right(seed, 200), 0, 3);
+    stock.register_batch("l", left.clone()).unwrap();
+    stock.register_batch("r", right.clone()).unwrap();
+    let expected = sql_rows(
+        &stock,
+        "SELECT l.k, l.v, l.s, l.vec, r.rk, r.name FROM l INNER JOIN r ON l.k = r.rk",
+    )
+    .await;
+    assert!(expected.len() > 50 * CHUNK, "{} rows", expected.len());
+
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_batch_size(CHUNK));
+    let exec = GpuHashJoinExec::try_new(
+        physical_plan(&ctx, left).await,
+        physical_plan(&ctx, right).await,
+        0,
+        0,
+        backend.kind(),
+    )
+    .unwrap()
+    .with_backend(backend);
+    let batches = collect(Arc::new(exec), ctx.task_ctx()).await.unwrap();
+    let largest = batches.iter().map(RecordBatch::num_rows).max().unwrap_or(0);
+    assert!(
+        largest <= CHUNK,
+        "seed={seed}: a {largest}-row batch from a join whose session batch size is {CHUNK}"
+    );
+    assert_eq!(sorted_rows(&batches), expected, "chunked join seed={seed}");
+}
+
 async fn check_aggregate(backend: Arc<dyn GpuBackend>, seed: u64, rows: usize) {
     let ctx = SessionContext::new();
     let batch = gen_left(seed, rows);
@@ -295,6 +342,7 @@ async fn check_vector(
 
 async fn run_all(backend: Arc<dyn GpuBackend>) {
     for &seed in &SEEDS {
+        check_join_chunked(Arc::clone(&backend), seed).await;
         for &rows in &SIZES {
             check_filter(Arc::clone(&backend), seed, rows).await;
             check_join(Arc::clone(&backend), seed, rows).await;
