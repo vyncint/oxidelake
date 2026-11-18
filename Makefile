@@ -141,7 +141,7 @@ coherence: ## no duplicate arrow / parquet / datafusion / object_store / tonic /
 release-scripts: ## the changelog extractor's own tests (release.yml depends on it)
 	./.github/scripts/test-extract-changelog.sh
 
-crate-metadata: ## every published crate carries README, repository, keywords, categories, docs.rs link
+crate-metadata: ## every published crate carries README, repository, keywords, categories, docs.rs link; README links absolute
 	./.github/scripts/check-crate-metadata.sh
 
 ci-scripts: ## CI change detection, required results, Metal build reuse and stress coverage

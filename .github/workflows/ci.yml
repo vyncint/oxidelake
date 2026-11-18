@@ -349,7 +349,9 @@ jobs:
       - run: ./.github/scripts/test-extract-changelog.sh
       # What crates.io will show for every crate: README, repository,
       # keywords, categories, docs.rs link. Inherited fields must be opted
-      # into per manifest; 0.1.0 shipped without them.
+      # into per manifest; 0.1.0 shipped without them. The README's links
+      # must be absolute: crates.io resolves a relative one against each
+      # crate's directory, and 0.2.0's were all 404s there (#129).
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable

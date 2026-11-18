@@ -268,7 +268,8 @@ class MetalBuildTests(unittest.TestCase):
 
 
 class MetadataTests(unittest.TestCase):
-    def run_metadata(self, overrides=None, packaged=True):
+    def run_metadata(self, overrides=None, packaged=True,
+                     readme="[repo](https://github.com/vyncint/oxidelake)\n"):
         metadata = {"name": "oxidelake-core", "publish": None, "readme": "README.md",
                     "repository": "https://github.com/vyncint/oxidelake", "homepage": "https://github.com/vyncint/oxidelake",
                     "documentation": "https://docs.rs/oxidelake-core", "keywords": ["gpu"],
@@ -280,6 +281,10 @@ class MetadataTests(unittest.TestCase):
             scripts.mkdir(parents=True)
             script = scripts / "check-crate-metadata.sh"
             script.write_text((SCRIPTS / script.name).read_text())
+            links = scripts / "check-readme-links.sh"
+            links.write_text((SCRIPTS / links.name).read_text())
+            links.chmod(0o755)
+            (root / "README.md").write_text(readme)
             (root / "metadata.json").write_text(json.dumps({"packages": [metadata]}))
             cargo = root / "cargo"
             cargo.write_text('#!/bin/sh\ncase "$1" in\nmetadata) cat metadata.json ;;\npackage) printf "%s\\n" "$PACKAGED_FILE" ;;\n*) exit 2 ;;\nesac\n')
@@ -299,6 +304,64 @@ class MetadataTests(unittest.TestCase):
             with self.subTest(overrides=overrides):
                 self.assertNotEqual(self.run_metadata(overrides).returncode, 0)
         self.assertNotEqual(self.run_metadata(packaged=False).returncode, 0)
+
+    def test_a_relative_readme_link_fails_the_metadata_gate(self):
+        run = self.run_metadata(readme="see [the spec](docs/SPEC.md)\n")
+        self.assertNotEqual(run.returncode, 0, run.stdout)
+        self.assertIn("relative link 'docs/SPEC.md'", run.stdout)
+
+
+class ReadmeLinkTests(unittest.TestCase):
+    """README.md's links work on crates.io, which renders it from each crate's directory (#129)."""
+
+    REPO = "https://github.com/vyncint/oxidelake"
+
+    def check(self, readme, files=()):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scripts = root / ".github/scripts"
+            scripts.mkdir(parents=True)
+            script = scripts / "check-readme-links.sh"
+            script.write_text((SCRIPTS / script.name).read_text())
+            (root / "README.md").write_text(readme)
+            for name in files:
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).write_text("")
+            return subprocess.run(["/bin/bash", str(script)], text=True, capture_output=True)
+
+    def test_the_committed_readme_passes(self):
+        run = subprocess.run(["/bin/bash", str(SCRIPTS / "check-readme-links.sh")],
+                             text=True, capture_output=True, cwd=ROOT)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+
+    def test_absolute_links_to_paths_that_are_here_pass(self):
+        run = self.check(
+            f"[spec]({self.REPO}/blob/main/docs/SPEC.md#phases) [crates]({self.REPO}/tree/main/crates)\n"
+            f"[ci]({self.REPO}/actions) [top](#top) [mail](mailto:a@example.invalid)\n"
+            '<img src="https://img.shields.io/badge/x-y-blue">\n\n'
+            f"[ref]: {self.REPO}/blob/main/LICENSE\n",
+            files=("docs/SPEC.md", "crates/oxidelake-core/Cargo.toml", "LICENSE"))
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+
+    def test_every_form_of_relative_link_fails_and_names_it(self):
+        for readme, link in (("see [spec](docs/SPEC.md)\n", "docs/SPEC.md"),
+                             ('see [spec](<docs/SPEC.md> "the spec")\n', "docs/SPEC.md"),
+                             ("see [spec][s]\n\n[s]: docs/SPEC.md\n", "docs/SPEC.md"),
+                             ("<img src='docs/logo.png'>\n", "docs/logo.png"),
+                             ('<a href="CHANGELOG.md">changes</a>\n', "CHANGELOG.md"),
+                             ("[license](./LICENSE)\n", "./LICENSE")):
+            with self.subTest(readme=readme):
+                run = self.check(readme, files=(link,))
+                self.assertNotEqual(run.returncode, 0, run.stdout)
+                self.assertIn(f"relative link '{link}'", run.stdout)
+
+    def test_a_link_into_this_repository_must_name_a_path_that_is_here(self):
+        run = self.check(f"[gone]({self.REPO}/blob/main/docs/GONE.md#top)\n", files=("docs/SPEC.md",))
+        self.assertNotEqual(run.returncode, 0, run.stdout)
+        self.assertIn("names docs/GONE.md, which is not in this repository", run.stdout)
+
+    def test_finding_no_links_is_a_failure_not_a_pass(self):
+        self.assertNotEqual(self.check("A README with no links.\n").returncode, 0)
 
 
 class SkillVersionTests(unittest.TestCase):

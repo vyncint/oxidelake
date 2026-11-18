@@ -488,6 +488,13 @@ versions (0.x) may contain breaking changes; they are always listed under a
   `cargo deny` saw it, through `--all-features`, and rustdoc does not
   type-check function bodies. `make lint-metrics` and `make test-metrics`
   are now in the gate and in CI's clippy and Linux test matrices (#128).
+- **Every link on the nine crates.io pages works.** Each crate's README is
+  the workspace README, and crates.io resolves a relative link against that
+  crate's own directory, so all 28 relative targets in it (`docs/SPEC.md`,
+  `CHANGELOG.md`, `crates/oxidelake-core`, …) were 404s on every page. The
+  README now links with absolute GitHub URLs, and `make crate-metadata` fails
+  on a relative link or on a link into this repository that names a path it
+  does not have (#129).
 
 ### Security
 

@@ -8,7 +8,9 @@ CI separates default, io_uring, predict and metrics tests into four Linux
 jobs. Clippy also has default / CUDA / predict / metrics jobs. macOS runs Metal lint, Metal package
 tests together with the PTY suite, then on-device conformance when a device is
 available. The remaining checks are MSRV, all-feature rustdoc, `cargo deny`,
-release scripts, crate metadata, CI policy tests, the vendored termlens
+release scripts, crate metadata (with the README's links: absolute only,
+since crates.io resolves a relative one against each crate's directory, and
+every path into this repository present, #129), CI policy tests, the vendored termlens
 skill's version and `zizmor`. The Linux and macOS test lanes run with
 `TERMLENS_ARTIFACT_DIR` set and, on failure, render every screen the PTY
 suite left behind into the job summary. `required-green`
@@ -97,7 +99,8 @@ It checks that every `oxidelake-runtime` feature is compiled by a target
 `ci.yml` runs (`--all-features` in `doc` and `deny` does not count: rustdoc
 type-checks no function body), with `metrics` linted and tested and both
 targets in `make gate` (#128).
-It also verifies the metadata checker under the platform's Bash and the MSRV
+It also verifies the metadata checker under the platform's Bash, its README
+link check on every form a link can take (#129), and the MSRV
 target with a standalone Cargo ahead of the Rustup proxy on `PATH`, checks
 that the `msrv` job compiles with the declared `rust-version` rather than
 `rust-toolchain.toml`'s 1.98.0 (every step that compiles sets
