@@ -138,7 +138,8 @@ check-cuda: ## the GPU compile gate: cuda code builds with no CUDA installed
 # Not part of `make gate`: it executes CUDA, so it needs an NVIDIA GPU, its
 # driver and NVRTC, which no gate machine and no hosted runner has. gpu.yml
 # runs it on demand on a self-hosted runner labelled `gpu` (#38). The three
-# suites are the ones the 2026-09-06 T4 session ran (STATUS.md). Unlike
+# suites are ones the T4 sessions of 2026-09-06 and 2026-11-18 ran
+# (STATUS.md). Unlike
 # test-metal-device it fails, never skips, without a device: its whole
 # purpose is execution, and a skip would be a green run that executed
 # nothing. OXIDE_BACKEND=cuda makes the detector refuse to fall back to the

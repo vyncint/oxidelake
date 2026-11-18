@@ -3,9 +3,10 @@
 # Nothing else here executes CUDA code. ci.yml runs on hosted runners with
 # no GPU, so the `cuda` feature is compiled and linted there (`make
 # check-cuda`, `make lint-cuda`) and every test that needs a device is
-# #[ignore]d. The only CUDA execution on record is the manual T4 session of
+# #[ignore]d. The only CUDA executions on record are two manual T4 sessions:
 # 2026-09-06, which found a correctness bug in the aggregation kernel that
-# 3 seeds x 5 sizes of CPU conformance had not (STATUS.md). "Compiles with
+# 3 seeds x 5 sizes of CPU conformance had not, and 2026-11-18, which ran
+# 0.3.0's CUDA changes before they merged (STATUS.md). "Compiles with
 # --features cuda" is not a verification status; this is how a release
 # candidate gets one. docs/RELEASING.md step 0 requires it.
 #

@@ -164,7 +164,7 @@ cargo check -p oxidelake-runtime --features cuda
 # Metal (macOS): the conformance suite executes on the device
 cargo test -p oxidelake-compute --features metal -- --ignored
 
-# On a CUDA machine (run on a T4 since 2026-09-06; see STATUS.md):
+# On a CUDA machine (run on a T4 on 2026-09-06 and 2026-11-18; see STATUS.md):
 OXIDE_BACKEND=cuda cargo test -p oxidelake-compute --features cuda -- --ignored
 ```
 

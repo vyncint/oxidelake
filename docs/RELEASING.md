@@ -49,14 +49,17 @@ Trusted Publishing.
 ```sh
 # 0. Green main, and no flakes: run the stress workflow and wait for it.
 gh workflow run stress.yml && gh run watch
-#    Then execute CUDA on the same commit: CI only compiles it, and the one
-#    device run on record (2026-09-06, T4) found a kernel bug that CPU
+#    Then execute CUDA on the same commit: CI only compiles it, and the
+#    first device run (2026-09-06, T4) found a kernel bug that CPU
 #    conformance had passed. gpu.yml runs `make test-cuda-device` on the
 #    self-hosted `gpu` runner. Required: put the run's GPU, driver and commit
 #    in STATUS.md's matrix in the release PR (step 3). release.yml does not
 #    check this; the checklist is the gate. With no `gpu` runner (the case
-#    until one is registered), the release PR and the release notes say the
-#    CUDA paths of this release are compiled-only, as ADR-0012 requires.
+#    until one is registered), the release PR and the release notes say
+#    exactly what did run, as ADR-0012 requires: a manual device session on
+#    the release's changes (0.3.0: a T4 on 2026-11-18, on the fix branches
+#    before they merged, not on the tagged commit), or, with none, that the
+#    CUDA paths of this release are compiled-only.
 gh workflow run gpu.yml --ref main && gh run watch
 
 # 1. Bump `version` in the workspace [workspace.package] AND every internal
