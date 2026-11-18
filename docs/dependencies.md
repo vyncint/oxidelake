@@ -17,7 +17,7 @@ The pins live in [SPEC.md §4](SPEC.md). This page records *why* those numbers, 
 | `ballista`, `ballista-core`, `ballista-scheduler`, `ballista-executor` | 55 (55.0.0, 2026-10-06) | `datafusion ^55`, `datafusion-proto ^55`, `arrow-flight ^59.2`, `object_store ^0.13.2`, `tonic ^0.14`, `prost ^0.14` | Declares MSRV 1.94.0, but `ballista-core` bundles the AWS SDK (`aws-config` → `aws-types` …) whose locked versions need **rustc 1.94.1** — the lockfile's true floor and therefore the workspace `rust-version` (verified by `make msrv` / the `msrv` CI job) |
 | `datafusion` | 55 (55.2.0, 2026-10-07) | `arrow ^59.2.0`, `parquet ^59.2.0`, `object_store ^0.13.2`, `tokio ^1.52`, `sqlparser ^0.62` | MSRV 1.94.0 |
 | `datafusion-proto` | 55 (55.2.0) | `arrow ^59.2.0`, `prost ^0.14.1` | `PhysicalExtensionCodec` for `Gpu*Exec`; since 55 its `try_decode`/`try_encode` take a `PhysicalProtoConverterExtension`, which our codec passes through to Ballista's |
-| `arrow` | 59 (59.3.2) | — | default features + `prettyprint`; `ffi` only under `oxidelake-api/python`; MSRV 1.85 |
+| `arrow` | 59 (59.3.2) | — | default features + `prettyprint`; `ffi` is not enabled (it was planned for `oxidelake-api`'s `python` feature, which was deferred and does not exist, STATUS.md); MSRV 1.85 |
 | `parquet` | 59 (59.3.2) | — | default features cover arrow, snap, lz4, zstd; Bloom filters and page index are built in; **no `thrift` dependency** from 59 (58 pulled `thrift ^0.17` and its advisory, #4); MSRV 1.85 |
 | `object_store` | 0.13 | — | `ObjectStore` trait implemented by `UringLocalFileSystem` |
 | `arrow-flight` / `tonic` / `prost` | *(transitive)* | arrow-flight 59.3 → `tonic ^0.14.1`, `prost ^0.14.1` | brought by Ballista; checked only by the duplicate gate |

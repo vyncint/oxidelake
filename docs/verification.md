@@ -125,28 +125,34 @@ Why the GPU gate is `-p oxidelake-runtime --features cuda`: the workspace root i
 
 ## What can and cannot be verified on the dev boxes
 
-Two dev boxes so far: Linux 7.0 x86_64 (2026-08-25, phases 0–6; no GPU, no
-CUDA toolkit, not macOS) and macOS on an Apple M4 Pro (since 2026-09-01,
-Metal 4, 24 GiB unified memory), where the whole default gate re-ran green
-and the Metal backend executes for real.
+Two dev boxes: Linux 7.0 x86_64 (2026-08-25, phases 0–6; no GPU, no CUDA
+toolkit, not macOS) and macOS on an Apple M4 Pro (since 2026-09-01, Metal 4,
+24 GiB unified memory), where the whole default gate re-ran green and the
+Metal backend executes for real. And one CUDA session: an AWS `g4dn.xlarge`
+with an NVIDIA Tesla T4 (2026-09-06, driver 595.71, CUDA 13.2, Rust 1.98.0),
+where the CUDA path executed for the first time and found the aggregation
+kernel bug [STATUS.md](../STATUS.md) records. It was a manual session:
+nothing on record has executed CUDA code since, and no CI job does (#38).
 
 | Claim | Verifiable | How / where |
 |---|---|---|
-| Pure-CPU build, tests, clippy, docs | yes | the gate (both boxes) |
-| CUDA code compiles and lints | yes | `check` / `clippy -p oxidelake-runtime --features cuda` (no CUDA installed anywhere) |
+| Pure-CPU build, tests, clippy, docs | yes | the gate (both dev boxes) |
+| CUDA code compiles and lints | yes | `check` / `clippy -p oxidelake-runtime --features cuda` (no CUDA installed on either dev box or in CI) |
 | `metal` feature is a no-op on Linux | yes | `cargo check -p oxidelake-runtime --features metal` on Linux |
 | Metal compile, lint, **execution** | yes (macOS) | the Metal lane above; the conformance suite runs on the actual device |
 | Cluster mode (Ballista scheduler + executors, codec, placement) | yes | in-process scheduler + 2 executors, where every `Gpu*Exec` the cluster's `EXPLAIN` shows must also have run on an executor (the process-wide telemetry hub, #134); spawned binaries in the Phase 7 E2E — executors take the CPU path |
 | Embedded GPU-target ≡ CPU results | yes | `oxidelake-runtime/tests/embedded.rs` over cpu/cuda/metal targets |
 | Parquet pruning | yes | scan metrics + result equality against a pruning-disabled run |
-| CPU ↔ CUDA operator equivalence | **no** | conformance suite is `#[ignore]` for CUDA; run on a CUDA box |
-| CUDA kernel *execution* and performance | **no** | never claim; record as "compiled only" |
+| CPU ↔ CUDA operator equivalence | on a CUDA machine only | the conformance suite is `#[ignore]`d for CUDA; green on the T4 (2026-09-06), with the transfer-counter witness, and not run since |
+| CUDA kernel *execution* | on a CUDA machine only | executed on the T4 (2026-09-06): device tests, conformance, `embedded.rs` under the cuda target. A kernel or `ops.rs` change since then is "compiled only" until it runs on a device |
+| CUDA performance | **no** | no CUDA timing is on record; never claim a number |
 | io_uring object store | Linux only | skips with a logged reason when `io_uring_setup` returns EPERM/ENOSYS |
 
-On a CUDA machine (still unverified — no such box has run this yet):
+On a CUDA machine, what the T4 session ran (STATUS.md's matrix):
 
 ```bash
-cargo test -p oxidelake-compute --features cuda -- --ignored
+cargo test -p oxidelake-device --features cuda -- --include-ignored
+OXIDE_BACKEND=cuda cargo test -p oxidelake-compute --features cuda -- --ignored
 ```
 
 ## Honesty rule

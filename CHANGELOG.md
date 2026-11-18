@@ -495,6 +495,17 @@ versions (0.x) may contain breaking changes; they are always listed under a
   README now links with absolute GitHub URLs, and `make crate-metadata` fails
   on a relative link or on a link into this repository that names a path it
   does not have (#129).
+- **The documentation describes the code that exists** (#132). The spill
+  manager has no watermarks, no background demotion and no throughput
+  metric: the call that takes a tier over its byte budget demotes its least
+  recently touched batches before it returns, and the counters are running
+  totals (`docs/SPEC.md`, `docs/architecture.md`, `docs/roadmap.md`; the
+  dashboard's PCIe/NVMe figures are totals too, not the rates SPEC
+  promised). `docs/verification.md` records the 2026-09-06 T4 session
+  instead of saying no CUDA machine had run anything. `oxidelake-api`'s
+  crates.io description no longer offers PyO3 bindings, which were
+  deferred and do not exist. An io_uring comment named a test file that does
+  not exist; it names the test that does.
 
 ### Security
 
