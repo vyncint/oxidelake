@@ -464,6 +464,19 @@ versions (0.x) may contain breaking changes; they are always listed under a
   the last operator left when the plan shrinks under it. `oxide tui` never
   refreshes and was not affected. A loop of your own around `AppState` and
   `render` gets the same from the new `AppState::set_node_count` (#126).
+- **The dashboard no longer cuts numbers at 80x24 or 120x40.** The
+  Describe panel asked for 62 columns whatever it held, so in any terminal
+  narrower than 128 every cell was clipped without a mark: the README's own
+  `oxide tui` at 80x24 showed `id`'s largest value, 999999, as `9999` and
+  `k`'s 19880 nulls as `198`, and at 120x40 `Float64` read `Float6`. Each
+  column is now as wide as its widest value, and a column there is no room
+  for is left out whole and named in the title — at 80x24 the panel reads
+  `Describe (hidden: p99)` for the demo and `Describe (hidden: type p25
+  p99)` for the README table; widen the terminal to see them. A tiny value
+  no longer rounds to zero (`-0.000012345678` printed `-0` in seven
+  columns; it is `-1.2e-5`). At 24 rows the Inspector now keeps its
+  `H2D / D2H` and `cpu fallback` lines, which needed 28, and Telemetry the
+  line saying whether its gauges can move at all, which needed 26 (#122).
 
 ### Security
 

@@ -93,7 +93,7 @@ flowchart LR
 
 ## Telemetry and TUI
 
-`TelemetryHub` (in `oxidelake-core`) is the only coupling between engine and dashboard; in v1 it observes the local process only. The TUI is a state machine with a pure `render(state, frame)`; repaints are bracketed in DEC 2026 synchronized updates. Four panels: Plan DAG with hardware tags, Inspector, Telemetry gauges, Describe (P25/P50/P99).
+`TelemetryHub` (in `oxidelake-core`) is the only coupling between engine and dashboard; in v1 it observes the local process only. The TUI is a state machine with a pure `render(state, frame)`; repaints are bracketed in DEC 2026 synchronized updates. Four panels: Plan DAG with hardware tags, Inspector, Telemetry gauges, Describe (P25/P50/P99). Describe never cuts a value to fit: each column is as wide as its widest value, a number too long for its column is rounded (`1.98e6`) rather than truncated, and a column the panel has no room for is left out whole and named in its title, `Describe (hidden: p99)` at 80×24 (#122).
 
 ### Observability
 
