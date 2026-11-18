@@ -49,10 +49,19 @@ struct Cli {
     /// again elsewhere without counting.
     #[arg(long, default_value_t = 4, value_name = "N", value_parser = at_least_one)]
     task_max_failures: usize,
-    /// Times a stage may run again because a shuffle fetch failed, its input
-    /// lost with a worker, before its query fails; 1 means no retry
-    /// (Ballista's `stage_max_failures`).
-    #[arg(long, default_value_t = 4, value_name = "N", value_parser = at_least_one)]
+    /// Times a stage may fail because a shuffle fetch failed, its input lost
+    /// with a worker, before its query fails (Ballista's
+    /// `stage_max_failures`). The default, 1, fails the query at the first
+    /// such failure, naming the worker; it does not cover a worker that is
+    /// stopped or goes silent (#148). Raising it turns on Ballista 55's re-run
+    /// of the stage, which can return duplicated rows with exit 0 or never
+    /// finish (fixed upstream by apache/datafusion-ballista#2677, unreleased).
+    #[arg(
+        long,
+        default_value_t = cluster::DEFAULT_STAGE_MAX_FAILURES,
+        value_name = "N",
+        value_parser = at_least_one
+    )]
     stage_max_failures: usize,
     /// Seconds a worker may go without a heartbeat before it is presumed lost
     /// and its tasks run elsewhere. Until then a query holding tasks on a dead
@@ -198,14 +207,16 @@ mod tests {
         assert_eq!(config.no_executors_grace_period_seconds, 9);
     }
 
-    /// Unset, they are Ballista's own defaults, so this changes nothing for a
-    /// scheduler that does not ask.
+    /// Unset, they are Ballista's own defaults, save one: a stage is not run
+    /// again after a lost worker's shuffle output could not be fetched
+    /// (#148), where Ballista would try 4 times.
     #[test]
-    fn the_defaults_are_ballistas() {
+    fn the_defaults_are_ballistas_but_a_lost_worker_is_not_retried() {
         let ballista = SchedulerConfig::default();
         let config = config(&parse(&[]).unwrap(), BackendKind::CpuSimd);
         assert_eq!(config.task_max_failures, ballista.task_max_failures);
-        assert_eq!(config.stage_max_failures, ballista.stage_max_failures);
+        assert_eq!(ballista.stage_max_failures, 4, "Ballista's default moved");
+        assert_eq!(config.stage_max_failures, 1);
         assert_eq!(
             config.executor_timeout_seconds,
             ballista.executor_timeout_seconds

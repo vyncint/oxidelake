@@ -1229,24 +1229,47 @@ fn the_resilience_flags_appear_in_help() {
     }
 }
 
-/// A worker killed in the middle of a query, with stage retries off (#31):
-/// the query fails within seconds naming the worker it lost, rather than
-/// waiting for it, and the next query runs on the worker that is left.
+/// What a client sees when a worker is lost in the middle of its query:
+/// the query fails, prints no rows, and the error names the worker (#31,
+/// #148). Then the next query runs on the workers left, with the right rows.
+fn assert_the_query_fails_naming(cluster: &TestCluster, worker: &str, query: Child, then: &str) {
+    let (succeeded, stdout, stderr) = finish_sql(cluster, "query", query, Duration::from_secs(120));
+    assert!(!succeeded, "{stderr}\n{}", cluster.logs());
+    assert_eq!(stdout, "", "no rows are printed for a failed query");
+    let port = format!("127.0.0.1:{}", cluster.flight_port(worker));
+    assert!(
+        stderr.contains(&port),
+        "the error names the lost worker, {port}:\n{stderr}"
+    );
+    let table_arg = format!("t={}", cluster.dir.display());
+    let output = cluster.sql(QUERY, &table_arg);
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        cluster.logs()
+    );
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), then);
+}
+
+/// A worker killed in the middle of a query (#31): with the scheduler's
+/// defaults the query fails within seconds naming the worker it lost,
+/// rather than running the lost work again (#148).
 ///
 /// The join tasks still to run cannot fetch the dead worker's shuffle
 /// output; Ballista retries each fetch three times, three seconds apart,
-/// then fails the stage, and `--stage-max-failures 1` makes that the
-/// query's end. Ballista's 180-second wait on the dead worker's heartbeat
-/// is far longer than that, so it never decides the outcome here.
+/// then fails the stage, and the default `--stage-max-failures 1` makes
+/// that the query's end. Ballista's 180-second wait on the dead worker's
+/// heartbeat is far longer than that, so it never decides the outcome here.
 #[test]
 #[cfg(unix)]
-fn a_query_that_loses_a_worker_fails_naming_it_when_stage_retries_are_off() {
+fn a_query_that_loses_a_worker_fails_naming_it() {
     let dir = tempfile::tempdir().unwrap();
     gen_data(dir.path(), 600_000);
     let table_arg = format!("t={}", dir.path().display());
     let after = embedded_sql(QUERY, &table_arg);
 
-    let mut cluster = TestCluster::start(dir.path(), "cpu", &["--stage-max-failures", "1"]);
+    let mut cluster = TestCluster::start(dir.path(), "cpu", &[]);
     cluster.spawn_worker("w1", &this_worker(), &[]);
     let lost = cluster.spawn_worker("w2", &this_worker(), &[]);
     cluster.wait_ready(2);
@@ -1259,37 +1282,26 @@ fn a_query_that_loses_a_worker_fails_naming_it_when_stage_retries_are_off() {
         starts_stage(JOIN_STAGE),
     );
     cluster.signal(lost, "KILL");
-    let (succeeded, _, stderr) = finish_sql(&cluster, "query", query, Duration::from_secs(120));
-    assert!(!succeeded, "{stderr}");
-    assert!(stderr.contains("has failed 1 times"), "{stderr}");
-    let port = format!("127.0.0.1:{}", cluster.flight_port("w2"));
-    assert!(
-        stderr.contains(&port),
-        "the error names the lost worker, {port}:\n{stderr}"
-    );
-
-    let output = cluster.sql(QUERY, &table_arg);
-    assert!(
-        output.status.success(),
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stderr),
-        cluster.logs()
-    );
-    assert_eq!(String::from_utf8(output.stdout).unwrap(), after);
+    assert_the_query_fails_naming(&cluster, "w2", query, &after);
 }
 
-/// What #31 asked for, and what Ballista 55 does not do: a query that loses
-/// a worker while retries are allowed should come back with exactly the rows
-/// it would have had. Run here (Ballista 55.0.0, the static planner #134
-/// requires, kill -9 as the worker starts its first join task), 9 runs in
-/// 12 returned the 100 groups plus 13 of them a second time, exit 0: 7 of 8
-/// from a shell loop, 2 of 4 of this test. A lost worker's rollback can also
-/// leave a surviving worker's task slots unreturned, so a query waits until
-/// fresh capacity joins. Run by name to reproduce; it fails when either
-/// happens, which is not every run.
+/// What #31 asked for, and what Ballista 55.0.0 does not do: with stage
+/// retries raised to Ballista's own default of 4, a query that loses a
+/// worker should come back with exactly the rows it would have had. It
+/// does not, which is why OxideLake's default is 1 (#148): the rolled-back
+/// stage keeps its partial outputs, fixed upstream by
+/// apache/datafusion-ballista#2677 (merged after 55.0.0, unreleased), and
+/// the tasks the rollback cancels never return their slots, so a query can
+/// wait for capacity that does not come back (see
+/// apache/datafusion-ballista#2539 and #2698). Measured with this setup
+/// (`kill -9` as the worker starts its first join task): 12 runs in 15
+/// returned the 100 groups plus 13 or 14 of them a second time, exit 0,
+/// 7 of 8 from a shell loop and 5 of 7 of this test. Run by name to reproduce; it
+/// fails when either happens, which is not every run. Remove the `ignore`
+/// once the chain is on a Ballista with the fix.
 #[test]
 #[cfg(unix)]
-#[ignore = "Ballista 55 can recover a query that lost a worker into duplicated rows (#31)"]
+#[ignore = "Ballista 55 can recover a query that lost a worker into duplicated rows (#148)"]
 fn a_query_that_loses_a_worker_comes_back_with_the_right_rows() {
     let dir = tempfile::tempdir().unwrap();
     gen_data(dir.path(), 600_000);
@@ -1297,7 +1309,7 @@ fn a_query_that_loses_a_worker_comes_back_with_the_right_rows() {
     let query = slow_join(200_000);
     let expected = embedded_sql(&query, &table_arg);
 
-    let mut cluster = TestCluster::start(dir.path(), "cpu", &[]);
+    let mut cluster = TestCluster::start(dir.path(), "cpu", &["--stage-max-failures", "4"]);
     cluster.spawn_worker("w1", &this_worker(), &[]);
     let lost = cluster.spawn_worker("w2", &this_worker(), &[]);
     cluster.wait_ready(2);

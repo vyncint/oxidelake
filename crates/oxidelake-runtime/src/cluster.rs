@@ -259,7 +259,21 @@ pub fn function_registry() -> BallistaFunctionRegistry {
     registry
 }
 
-/// Scheduler configuration with OxideLake's hooks installed.
+/// How many failed attempts a stage may have before its query fails, unless
+/// told otherwise: one, so a stage whose shuffle input was lost with a
+/// worker is never run again (#148).
+///
+/// Ballista's default is 4, and every retry rolls the stage back, which in
+/// Ballista 55 can return some rows twice with exit 0 or never finish
+/// (apache/datafusion-ballista#2677, unreleased after 55.0.0, and #2539,
+/// #2698). At 1 the first failed fetch fails the query, naming the worker.
+/// Only a failed fetch counts: Ballista rolls back a worker that is stopped,
+/// or silent past its timeout, whatever this says.
+pub const DEFAULT_STAGE_MAX_FAILURES: usize = 1;
+
+/// Scheduler configuration with OxideLake's hooks installed, failing a query
+/// whose shuffle input was lost with a worker
+/// ([`DEFAULT_STAGE_MAX_FAILURES`]).
 pub fn scheduler_config(bind_host: &str, port: u16, target: BackendKind) -> SchedulerConfig {
     SchedulerConfig {
         bind_host: bind_host.to_owned(),
@@ -267,6 +281,7 @@ pub fn scheduler_config(bind_host: &str, port: u16, target: BackendKind) -> Sche
         override_session_builder: Some(session_builder(target)),
         override_config_producer: Some(config_producer()),
         override_physical_codec: Some(oxide_codec()),
+        stage_max_failures: DEFAULT_STAGE_MAX_FAILURES,
         ..SchedulerConfig::default()
     }
 }
