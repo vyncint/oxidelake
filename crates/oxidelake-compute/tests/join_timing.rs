@@ -146,6 +146,16 @@ async fn device_hash_join_timings() {
         "no GPU backend detected: {:?}",
         gpu.kind()
     );
+    // Metal declines the join up front (it has no join kernel), so on a Mac
+    // every batch would run on the CPU and there is no device time to take.
+    // The on-device suite runs every ignored test there; say so and stop.
+    if !gpu.supports_hash_join() {
+        println!(
+            "skipped: the {:?} backend has no device hash join, so there is nothing to time",
+            gpu.kind()
+        );
+        return;
+    }
     let cpu: Arc<dyn GpuBackend> = Arc::new(CpuBackend::new());
     let ctx =
         SessionContext::new_with_config(SessionConfig::new().with_batch_size(BATCH)).task_ctx();
