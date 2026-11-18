@@ -227,6 +227,8 @@ async fn check_join_chunked(backend: Arc<dyn GpuBackend>, seed: u64) {
         "seed={seed}: a {largest}-row batch from a join whose session batch size is {CHUNK}"
     );
     assert_eq!(sorted_rows(&batches), expected, "chunked join seed={seed}");
+}
+
 /// `batch` as one partition of `piece`-row batches, the way a scan hands
 /// them over (one empty batch when `batch` has no rows).
 fn in_pieces(batch: &RecordBatch, piece: usize) -> Arc<dyn ExecutionPlan> {
