@@ -1454,6 +1454,14 @@ fn sigterm_stops_a_worker_within_its_drain_timeout_with_exit_zero() {
     let idle = cluster.spawn_worker("idle", &this_worker(), &[]);
     let busy = cluster.spawn_worker("busy", &this_worker(), &["--drain-timeout", "1"]);
     cluster.wait_ready(2);
+    // Ballista's executor listens for the signal only once it is up, just
+    // after it has registered; the Flight server's line is its last step
+    // before that. A signal sent earlier is seen by OxideLake alone, and the
+    // worker then waits out its drain timeout (`run_executor_with_shutdown`).
+    cluster.wait_log("idle", "that it is up", Duration::from_secs(60), |line| {
+        line.contains("arrow flight server listening")
+    });
+    std::thread::sleep(Duration::from_millis(300));
 
     let started = Instant::now();
     cluster.signal(idle, "TERM");

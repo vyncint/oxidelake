@@ -504,6 +504,12 @@ pub async fn run_executor(config: ExecutorProcessConfig) -> Result<(), EngineErr
 /// is killed. When the bound passes, or a second signal comes, this returns
 /// [`Stopped::Abandoned`] and the caller should exit without waiting for the
 /// tasks still running.
+///
+/// Ballista's executor starts listening only once it has registered, a
+/// fraction of a second after the worker starts. A signal that arrives
+/// before that is seen here alone: the worker then stops when the drain
+/// timeout passes, still with exit 0, and the scheduler learns it is gone
+/// from its missed heartbeats.
 pub async fn run_executor_with_shutdown(
     config: ExecutorProcessConfig,
     mut signal: ShutdownSignal,
