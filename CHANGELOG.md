@@ -353,6 +353,51 @@ versions (0.x) may contain breaking changes; they are always listed under a
 
 ### Fixed
 
+- **A refused `oxide gen-data` no longer empties the table it would have
+  replaced** (#119). `--row-group-rows 0` truncated the existing
+  `t.parquet` to zero bytes before refusing the flag. The options are now
+  checked before anything is created, and `ParquetFileWriter` (so
+  `write_parquet`, `write_demo_table` and `gen-data`) writes a temporary
+  `.t.parquet.<pid>.<n>.tmp` beside the destination and renames it into
+  place only once the file is complete: a refused, failed or abandoned
+  write leaves the previous file as it was, a reader sees the old file
+  until the rename, and a symlink at the destination is replaced rather
+  than written through. A process killed mid-write can leave the temporary
+  file behind; delete it.
+
+- **The io_uring store's `put` is atomic and answers like
+  `LocalFileSystem`** (#111). `UringLocalFileSystem` truncated the object
+  and rewrote it in place, so a put that failed part way (a full disk, a
+  file size limit) destroyed the object it was replacing, and a put to a
+  path that was a symlink wrote through it to a file outside the store's
+  root. It now writes a staged `<name>#<n>` file beside the object and
+  renames it into place, as `LocalFileSystem` does: the old object stays
+  whole until the new one is, and a symlink is replaced. A put now returns
+  the e_tag `head` reports, where it returned none, and a put with
+  attributes is refused with `NotImplemented`, where they were accepted and
+  dropped.
+
+- **The io_uring store reads the file it checked a get's preconditions
+  against** (#113). `UringLocalFileSystem::get_opts` checked `if_match`
+  and `if_modified_since` against a stat of the path, then opened the path
+  again to read it, so an object replaced in between came back as the new
+  bytes under the old object's size and e_tag. The file is now opened once,
+  by `LocalFileSystem::get_opts`, which checks the preconditions against
+  that descriptor, and every byte is read from it; `get_ranges` likewise
+  reads all its ranges from one descriptor rather than opening the path
+  once per range. An invalid range now fails with `LocalFileSystem`'s error
+  for it.
+
+- **The io_uring store streams a get instead of buffering all of it**
+  (#112). `UringLocalFileSystem::get_opts` read the whole requested range
+  into one buffer before returning its stream, so streaming a 1 GiB object
+  cost 1 GiB of memory, and an object larger than the address space left
+  aborted the process on the allocation. The stream now reads chunks of at
+  most 8 MiB on the ring as the consumer pulls them: a 3 GiB object streams
+  in 384 chunks with a peak RSS of 12 MiB. `GetResult::bytes()`, and so
+  `get_range`, still returns one buffer the size of the range; a range
+  over 8 MiB is now assembled from chunks, at the cost of one copy.
+
 - **A failed spill-manager insert no longer leaves its batch behind**
   (#115). `SpillManager::insert_host` and `insert_device` registered the
   batch and counted its bytes before evicting to make room, and when the

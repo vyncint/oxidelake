@@ -141,13 +141,18 @@ pub struct DemoTable {
 }
 
 /// Writes the demo table to `<dir>/t.parquet` with Bloom filters on `id` and
-/// `k` and page statistics on, creating `dir` if needed.
+/// `k` and page statistics on, creating `dir` if needed. An existing
+/// `t.parquet` is replaced only once the new one is complete, and invalid
+/// `options` are refused before anything is created (#119).
 pub fn write_demo_table(
     dir: &Path,
     rows: u64,
     seed: u64,
     options: &ParquetWriteOptions,
 ) -> Result<DemoTable, EngineError> {
+    // `ParquetFileWriter::create` checks them too, but only after the
+    // directory below exists; a refused run should leave nothing behind.
+    options.writer_properties()?;
     std::fs::create_dir_all(dir)?;
     let path = dir.join("t.parquet");
     let mut writer = ParquetFileWriter::create(&path, demo_schema(), options)?;
@@ -216,5 +221,26 @@ mod tests {
                 .bloom_filter_offset()
                 .is_some()
         );
+    }
+
+    /// A refused run changes nothing (#119): the existing table keeps its
+    /// bytes and a missing output directory is not created.
+    #[test]
+    fn a_refused_run_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = write_demo_table(
+            dir.path(),
+            1000,
+            1,
+            &demo_write_options(500, Compression::None),
+        )
+        .unwrap();
+        let before = std::fs::read(&table.path).unwrap();
+        let refused = demo_write_options(0, Compression::None);
+        assert!(write_demo_table(dir.path(), 2000, 2, &refused).is_err());
+        assert!(std::fs::read(&table.path).unwrap() == before);
+        let missing = dir.path().join("new");
+        assert!(write_demo_table(&missing, 2000, 2, &refused).is_err());
+        assert!(!missing.exists(), "a refused run creates no directory");
     }
 }

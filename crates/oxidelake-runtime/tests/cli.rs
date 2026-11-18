@@ -536,6 +536,45 @@ fn a_zero_batch_size_is_refused_rather_than_returning_nothing() {
     assert!(stderr.contains("at least 1 row"), "{stderr}");
 }
 
+/// The reproduction from #119: `gen-data` over an existing table with a
+/// flag it refuses used to empty `t.parquet` first (211,115 bytes to 0).
+#[test]
+fn a_refused_gen_data_leaves_the_existing_table_intact() {
+    let dir = tempfile::tempdir().unwrap();
+    gen_data(dir.path(), 1_000);
+    let table = dir.path().join("t.parquet");
+    let before = std::fs::read(&table).unwrap();
+    let assert = oxide()
+        .args([
+            "gen-data",
+            "--rows",
+            "2000",
+            "--out",
+            dir.path().to_str().unwrap(),
+            "--row-group-rows",
+            "0",
+        ])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("row_group_rows must be positive"),
+        "{stderr}"
+    );
+    let after = std::fs::read(&table).unwrap();
+    assert!(
+        after == before,
+        "t.parquet is {} bytes after the refused run, was {}",
+        after.len(),
+        before.len()
+    );
+    let names: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names, ["t.parquet"], "nothing is left beside the table");
+}
+
 #[test]
 fn an_unknown_output_format_names_the_ones_that_exist() {
     let assert = oxide()
