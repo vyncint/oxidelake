@@ -1,8 +1,12 @@
 //! `oxide-worker` — a Ballista executor that can run OxideLake's `Gpu*Exec` operators.
 
+use std::time::Duration;
+
 use clap::Parser;
 use oxidelake_core::BackendKind;
 use oxidelake_runtime::cluster;
+use oxidelake_runtime::exposure::{check_listen_address, warn_unless_loopback};
+use oxidelake_runtime::shutdown::{ShutdownSignal, Stopped};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -18,6 +22,14 @@ struct Cli {
     /// Scheduler port.
     #[arg(long, default_value_t = 50050)]
     scheduler_port: u16,
+    /// Address the Flight and gRPC ports bind: loopback or private (10/8,
+    /// 172.16/12, 192.168/16, fc00::/7). They have no authentication or
+    /// encryption, so a public address, or every address (0.0.0.0, ::),
+    /// needs `--allow-insecure-bind`. The scheduler connects back to the
+    /// address it sees this worker connect from, so bind the interface that
+    /// faces the scheduler.
+    #[arg(long, default_value = "127.0.0.1")]
+    bind_host: String,
     /// Arrow Flight port for shuffle data.
     #[arg(long, default_value_t = 50051)]
     port: u16,
@@ -41,9 +53,25 @@ struct Cli {
     /// interface, as the Ballista ports already are.
     #[arg(long, value_name = "PORT")]
     metrics_port: Option<u16>,
-    /// Address the metrics endpoint binds to.
+    /// Address the metrics endpoint binds to, held to the same rule as
+    /// `--bind-host`.
     #[arg(long, default_value = "127.0.0.1", value_name = "HOST")]
     metrics_host: String,
+    /// Listen on a public address, or on every address, although the ports
+    /// have no authentication or encryption: say so only when a firewall or
+    /// an authenticating proxy already decides who can connect (SECURITY.md).
+    #[arg(long)]
+    allow_insecure_bind: bool,
+    /// Seconds between this worker's heartbeats. The scheduler presumes a
+    /// worker lost after its `--worker-timeout` (180 s by default) without
+    /// one, so keep this well below that.
+    #[arg(long, default_value_t = 60, value_name = "SECS", value_parser = clap::value_parser!(u64).range(1..))]
+    heartbeat_interval: u64,
+    /// On SIGTERM or SIGINT, take no new tasks and give the running ones this
+    /// long to finish, then exit 0; the scheduler runs them again elsewhere.
+    /// A second signal exits at once.
+    #[arg(long, default_value_t = 20, value_name = "SECS")]
+    drain_timeout: u64,
 }
 
 #[tokio::main]
@@ -57,6 +85,16 @@ async fn main() -> anyhow::Result<()> {
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .init();
     let cli = Cli::parse();
+    // Before the worker joins, so a stop request during startup is held for
+    // the shutdown below rather than killing the process.
+    let signal = ShutdownSignal::listen()?;
+    // Before anything listens: the ports are unauthenticated, so where they
+    // listen is the whole of the security boundary (#30).
+    let exposure = check_listen_address("--bind-host", &cli.bind_host, cli.allow_insecure_bind)?;
+    if cli.metrics_port.is_some() {
+        check_listen_address("--metrics-host", &cli.metrics_host, cli.allow_insecure_bind)?;
+    }
+    warn_unless_loopback("this worker", &cli.bind_host, exposure);
     // Selected before anything runs: operators read the memoised
     // `local_backend()`, so a choice made after the first task would be
     // accepted and then ignored.
@@ -70,15 +108,24 @@ async fn main() -> anyhow::Result<()> {
         "worker backend"
     );
     serve_metrics(cli.metrics_port, &cli.metrics_host).await?;
-    cluster::run_executor(cluster::executor_config(
+    let mut config = cluster::executor_config(
         &cli.scheduler_host,
         cli.scheduler_port,
         cli.port,
         cli.grpc_port,
         cli.concurrent_tasks,
         cli.work_dir,
-    ))
-    .await?;
+    );
+    config.executor_heartbeat_interval_seconds = cli.heartbeat_interval;
+    config.bind_host = cli.bind_host;
+    let stopped =
+        cluster::run_executor_with_shutdown(config, signal, Duration::from_secs(cli.drain_timeout))
+            .await?;
+    if stopped == Stopped::Abandoned {
+        // Returning would drop the runtime, which waits for the tasks still
+        // running: the very wait the drain timeout bounds.
+        std::process::exit(0);
+    }
     Ok(())
 }
 

@@ -189,12 +189,36 @@ impl Drop for ClusterGuard {
     }
 }
 
+/// A port on 127.0.0.1 that nothing listens on, for a process this test is
+/// about to start.
+///
+/// Not port 0's choice: the kernel hands out source ports for outgoing
+/// connections from that same range (`ip_local_port_range`, 32768-60999 on
+/// Linux, 49152 and up on macOS), so a port taken from there and released
+/// was at times reused by some connection on a busy machine before the
+/// worker meant to bind it had started, and the worker died with "Address
+/// already in use" (twice under `make test`, 2026-11-18). Below that range
+/// no one hands ports out but this function, which gives each call in this
+/// binary a different one, from an offset in the process id so that two
+/// test binaries running at once seldom meet, and checks it is free.
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    use std::sync::atomic::{AtomicU32, Ordering};
+    const LOW: u32 = 20_000;
+    const SPAN: u32 = 12_000;
+    static NEXT: AtomicU32 = AtomicU32::new(u32::MAX);
+    let _ = NEXT.compare_exchange(
+        u32::MAX,
+        std::process::id() % SPAN,
+        Ordering::SeqCst,
+        Ordering::SeqCst,
+    );
+    for _ in 0..SPAN {
+        let port = u16::try_from(LOW + NEXT.fetch_add(1, Ordering::SeqCst) % SPAN).unwrap();
+        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+    panic!("no free port in {LOW}..{}", LOW + SPAN)
 }
 
 fn wait_for_port(port: u16, what: &str) {
@@ -825,6 +849,9 @@ struct TestCluster {
     dir: std::path::PathBuf,
     scheduler_port: u16,
     processes: Vec<(String, Child)>,
+    /// Each worker's Arrow Flight port, which is how a failed shuffle fetch
+    /// names the worker it could not reach.
+    flight_ports: Vec<(String, u16)>,
 }
 
 impl TestCluster {
@@ -835,6 +862,7 @@ impl TestCluster {
             dir: dir.to_owned(),
             scheduler_port,
             processes: Vec::new(),
+            flight_ports: Vec::new(),
         };
         let scheduler = StdCommand::new(env!("CARGO_BIN_EXE_oxide-scheduler"))
             .args([
@@ -880,6 +908,8 @@ impl TestCluster {
     /// for: a refused worker never opens its ports for long.
     fn spawn_worker(&mut self, name: &str, bin: &Path, args: &[&str]) -> usize {
         let work_dir = self.dir.join(format!("{name}-shuffle"));
+        let flight_port = free_port();
+        self.flight_ports.push((name.to_owned(), flight_port));
         let worker = StdCommand::new(bin)
             .args([
                 "--scheduler-host",
@@ -887,7 +917,7 @@ impl TestCluster {
                 "--scheduler-port",
                 &self.scheduler_port.to_string(),
                 "--port",
-                &free_port().to_string(),
+                &flight_port.to_string(),
                 "--grpc-port",
                 &free_port().to_string(),
                 "--concurrent-tasks",
@@ -941,6 +971,82 @@ impl TestCluster {
             .output()
             .unwrap()
     }
+}
+
+impl TestCluster {
+    /// Sends `signal` (`TERM`, `KILL`, …) to process `index`.
+    fn signal(&self, index: usize, signal: &str) {
+        let pid = self.processes[index].1.id().to_string();
+        let sent = StdCommand::new("kill")
+            .args([&format!("-{signal}"), &pid])
+            .status()
+            .unwrap();
+        assert!(sent.success(), "kill -{signal} {pid}");
+    }
+
+    /// Waits until `name`'s log has a line `matches` accepts, up to `limit`.
+    fn wait_log(&self, name: &str, what: &str, limit: Duration, matches: impl Fn(&str) -> bool) {
+        let deadline = Instant::now() + limit;
+        while !self.log(name).lines().any(&matches) {
+            assert!(
+                Instant::now() < deadline,
+                "{name} never logged {what} within {limit:?}\n{}",
+                self.logs()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn flight_port(&self, name: &str) -> u16 {
+        self.flight_ports
+            .iter()
+            .find_map(|(worker, port)| (worker == name).then_some(*port))
+            .unwrap()
+    }
+
+    /// `oxide sql --cluster` in the background, writing `<dir>/<name>.out`
+    /// and `<dir>/<name>.log`, for a query that is to be interrupted.
+    fn spawn_sql(&self, name: &str, query: &str, table_arg: &str) -> Child {
+        StdCommand::new(assert_cmd::cargo::cargo_bin("oxide"))
+            .args([
+                "sql",
+                "-q",
+                query,
+                "--table",
+                table_arg,
+                "--cluster",
+                &self.url(),
+            ])
+            .stdout(File::create(self.dir.join(format!("{name}.out"))).unwrap())
+            .stderr(self.log_file(name))
+            .spawn()
+            .unwrap()
+    }
+}
+
+/// Reaps a background query (or kills it after `limit`), and returns whether
+/// it succeeded with its stdout and stderr.
+fn finish_sql(
+    cluster: &TestCluster,
+    name: &str,
+    mut child: Child,
+    limit: Duration,
+) -> (bool, String, String) {
+    let status = wait_exit(&mut child, limit);
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let stdout =
+        std::fs::read_to_string(cluster.dir.join(format!("{name}.out"))).unwrap_or_default();
+    let stderr = cluster.log(name);
+    let status = status.unwrap_or_else(|| {
+        panic!(
+            "`{name}` was still running after {limit:?}\n{stderr}\n{}",
+            cluster.logs()
+        )
+    });
+    (status.success(), stdout, stderr)
 }
 
 impl Drop for TestCluster {
@@ -1112,6 +1218,493 @@ fn mixed_build_a_predict_worker_is_refused_by_a_default_scheduler() {
     assert!(!output.status.success(), "{stderr}");
     assert!(stderr.contains("no worker it can use"), "{stderr}");
     assert!(started.elapsed() < Duration::from_secs(30));
+}
+
+// --- resilience: worker loss, retry limits, SIGTERM (#31) -------------------
+
+/// A query slow enough to stop a process in the middle of: a self-join that
+/// fans out on `k` (about 6,000 rows a key), whose `id` bound sets the work.
+/// Ballista runs it in four stages, two scans, the join ([`JOIN_STAGE`]) and
+/// the final aggregate, and the join's 16 tasks run in waves on two workers
+/// of two tasks each, so a worker stopped as its first join task starts
+/// leaves join tasks still to run that read its shuffle output.
+fn slow_join(rows: u64) -> String {
+    format!(
+        "SELECT a.k, COUNT(*) AS n, SUM(a.v + b.v) AS sv FROM t a JOIN t b ON a.k = b.k \
+         WHERE a.id < {rows} GROUP BY a.k ORDER BY a.k"
+    )
+}
+
+const JOIN_STAGE: usize = 3;
+
+/// Whether `line` is Ballista's executor starting a task of `stage` (its
+/// first attempt): `Execute task  : [TID <job>/<stage>.<attempt>/<partition>.<attempt>]`.
+fn starts_stage(stage: usize) -> impl Fn(&str) -> bool {
+    let needle = format!("/{stage}.0/");
+    move |line| line.contains("Execute task") && line.contains(&needle)
+}
+
+fn embedded_sql(query: &str, table_arg: &str) -> String {
+    let assert = oxide()
+        .args(["sql", "-q", query, "--table", table_arg])
+        .assert()
+        .success();
+    String::from_utf8(assert.get_output().stdout.clone()).unwrap()
+}
+
+fn this_worker() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_oxide-worker"))
+}
+
+/// The knobs are documented in the README tables, so they must be
+/// discoverable from `--help` (#31).
+#[test]
+fn the_resilience_flags_appear_in_help() {
+    for (bin, flags) in [
+        (
+            "oxide-scheduler",
+            &[
+                "--task-max-failures",
+                "--stage-max-failures",
+                "--worker-timeout",
+                "--drain-timeout",
+            ][..],
+        ),
+        (
+            "oxide-worker",
+            &["--heartbeat-interval", "--drain-timeout"][..],
+        ),
+    ] {
+        let assert = Command::cargo_bin(bin)
+            .unwrap()
+            .arg("--help")
+            .assert()
+            .success();
+        let help = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+        for flag in flags {
+            assert!(help.contains(flag), "{bin} --help lacks {flag}\n{help}");
+        }
+    }
+}
+
+/// How a worker was lost, which decides what its query's error can say.
+#[derive(Clone, Copy, PartialEq)]
+enum Lost {
+    /// Stopped with `SIGTERM`: it keeps serving its shuffle data while it
+    /// drains, and OxideLake fails the query naming it.
+    Stopped,
+    /// Killed: a fetch from it fails and the error names its address,
+    /// unless it died in the middle of sending a shuffle block to a task
+    /// still running, when Ballista reports that broken stream instead
+    /// (`IpcError ... error reading a body from connection`). That error
+    /// carries no address, but it fails the stage at once, with no
+    /// rollback, so the query still fails cleanly (1 run in about 8 of the
+    /// silent-worker test, 2026-11-18).
+    Killed,
+}
+
+/// What a client sees when a worker is lost in the middle of its query:
+/// the query fails, prints no rows, and the error says why (#31, #148).
+/// Then the next query runs on the workers left, with the right rows.
+fn assert_the_query_fails_naming(
+    cluster: &TestCluster,
+    worker: &str,
+    how: Lost,
+    query: Child,
+    then: &str,
+) {
+    let (succeeded, stdout, stderr) = finish_sql(cluster, "query", query, Duration::from_secs(120));
+    assert!(!succeeded, "{stderr}\n{}", cluster.logs());
+    assert_eq!(stdout, "", "no rows are printed for a failed query");
+    let port = format!("127.0.0.1:{}", cluster.flight_port(worker));
+    let broken_stream = how == Lost::Killed && stderr.contains("IpcError");
+    assert!(
+        stderr.contains(&port) || broken_stream,
+        "the error names the lost worker, {port}:\n{stderr}"
+    );
+    let table_arg = format!("t={}", cluster.dir.display());
+    let output = cluster.sql(QUERY, &table_arg);
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        cluster.logs()
+    );
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), then);
+}
+
+/// A worker killed in the middle of a query (#31): with the scheduler's
+/// defaults the query fails within seconds naming the worker it lost,
+/// rather than running the lost work again (#148).
+///
+/// The join tasks still to run cannot fetch the dead worker's shuffle
+/// output; Ballista retries each fetch three times, three seconds apart,
+/// then fails the stage, and the default `--stage-max-failures 1` makes
+/// that the query's end. Ballista's 180-second wait on the dead worker's
+/// heartbeat is far longer than that, so it never decides the outcome here.
+#[test]
+#[cfg(unix)]
+fn a_query_that_loses_a_worker_fails_naming_it() {
+    let dir = tempfile::tempdir().unwrap();
+    gen_data(dir.path(), 600_000);
+    let table_arg = format!("t={}", dir.path().display());
+    let after = embedded_sql(QUERY, &table_arg);
+
+    let mut cluster = TestCluster::start(dir.path(), "cpu", &[]);
+    cluster.spawn_worker("w1", &this_worker(), &[]);
+    let lost = cluster.spawn_worker("w2", &this_worker(), &[]);
+    cluster.wait_ready(2);
+
+    let query = cluster.spawn_sql("query", &slow_join(200_000), &table_arg);
+    cluster.wait_log(
+        "w2",
+        "a join task",
+        Duration::from_secs(120),
+        starts_stage(JOIN_STAGE),
+    );
+    cluster.signal(lost, "KILL");
+    assert_the_query_fails_naming(&cluster, "w2", Lost::Killed, query, &after);
+}
+
+/// A worker stopped with `SIGTERM` in the middle of a query (#31, #148):
+/// the worker exits 0, and the query fails at once naming it. Ballista
+/// would have rolled the query back and run the lost work again, which on
+/// 55.0.0 hung in both runs tried; OxideLake fails the query before that
+/// rollback can start.
+#[test]
+#[cfg(unix)]
+fn a_query_whose_worker_stops_fails_naming_it() {
+    let dir = tempfile::tempdir().unwrap();
+    gen_data(dir.path(), 600_000);
+    let table_arg = format!("t={}", dir.path().display());
+    let after = embedded_sql(QUERY, &table_arg);
+
+    let mut cluster = TestCluster::start(dir.path(), "cpu", &[]);
+    cluster.spawn_worker("w1", &this_worker(), &[]);
+    let stopped = cluster.spawn_worker("w2", &this_worker(), &[]);
+    cluster.wait_ready(2);
+
+    let query = cluster.spawn_sql("query", &slow_join(200_000), &table_arg);
+    cluster.wait_log(
+        "w2",
+        "a join task",
+        Duration::from_secs(120),
+        starts_stage(JOIN_STAGE),
+    );
+    cluster.signal(stopped, "TERM");
+    let status = wait_exit(&mut cluster.processes[stopped].1, Duration::from_secs(60))
+        .unwrap_or_else(|| panic!("the stopped worker did not exit\n{}", cluster.logs()));
+    assert_eq!(status.code(), Some(0), "{}", cluster.logs());
+    assert_the_query_fails_naming(&cluster, "w2", Lost::Stopped, query, &after);
+    let stderr = cluster.log("query");
+    assert!(
+        stderr.contains("was lost while this query ran") && stderr.contains("#148"),
+        "OxideLake's reason, not Ballista's \"Cancelled\":\n{stderr}"
+    );
+}
+
+/// A worker that goes silent in the middle of a query (#31, #148): once
+/// `--worker-timeout` passes without its heartbeat the query fails naming
+/// it, here before any shuffle fetch from it has run out of retries. With
+/// Ballista's recovery the same run returned duplicated rows.
+#[test]
+#[cfg(unix)]
+fn a_query_whose_worker_goes_silent_fails_naming_it() {
+    let dir = tempfile::tempdir().unwrap();
+    gen_data(dir.path(), 600_000);
+    let table_arg = format!("t={}", dir.path().display());
+    let after = embedded_sql(QUERY, &table_arg);
+
+    let mut cluster = TestCluster::start(dir.path(), "cpu", &["--worker-timeout", "5"]);
+    cluster.spawn_worker("w1", &this_worker(), &["--heartbeat-interval", "1"]);
+    let lost = cluster.spawn_worker("w2", &this_worker(), &["--heartbeat-interval", "1"]);
+    cluster.wait_ready(2);
+
+    let query = cluster.spawn_sql("query", &slow_join(200_000), &table_arg);
+    cluster.wait_log(
+        "w2",
+        "a join task",
+        Duration::from_secs(120),
+        starts_stage(JOIN_STAGE),
+    );
+    cluster.signal(lost, "KILL");
+    assert_the_query_fails_naming(&cluster, "w2", Lost::Killed, query, &after);
+}
+
+/// What #31 asked for, and what Ballista 55.0.0 does not do: with stage
+/// retries raised to Ballista's own default of 4, a query that loses a
+/// worker should come back with exactly the rows it would have had. It
+/// does not, which is why OxideLake's default is 1 (#148): the rolled-back
+/// stage keeps its partial outputs, fixed upstream by
+/// apache/datafusion-ballista#2677 (merged after 55.0.0, unreleased), and
+/// the tasks the rollback cancels never return their slots, so a query can
+/// wait for capacity that does not come back (see
+/// apache/datafusion-ballista#2539 and #2698). Measured with this setup
+/// (`kill -9` as the worker starts its first join task): 12 runs in 15
+/// returned the 100 groups plus 13 or 14 of them a second time, exit 0,
+/// 7 of 8 from a shell loop and 5 of 7 of this test. Run by name to reproduce; it
+/// fails when either happens, which is not every run. Remove the `ignore`
+/// once the chain is on a Ballista with the fix.
+#[test]
+#[cfg(unix)]
+#[ignore = "Ballista 55 can recover a query that lost a worker into duplicated rows (#148)"]
+fn a_query_that_loses_a_worker_comes_back_with_the_right_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    gen_data(dir.path(), 600_000);
+    let table_arg = format!("t={}", dir.path().display());
+    let query = slow_join(200_000);
+    let expected = embedded_sql(&query, &table_arg);
+
+    let mut cluster = TestCluster::start(dir.path(), "cpu", &["--stage-max-failures", "4"]);
+    cluster.spawn_worker("w1", &this_worker(), &[]);
+    let lost = cluster.spawn_worker("w2", &this_worker(), &[]);
+    cluster.wait_ready(2);
+    let running = cluster.spawn_sql("query", &query, &table_arg);
+    cluster.wait_log(
+        "w2",
+        "a join task",
+        Duration::from_secs(120),
+        starts_stage(JOIN_STAGE),
+    );
+    cluster.signal(lost, "KILL");
+    let (succeeded, stdout, stderr) =
+        finish_sql(&cluster, "query", running, Duration::from_secs(300));
+    assert!(succeeded, "{stderr}");
+    assert_eq!(stdout, expected, "{}", cluster.logs());
+}
+
+/// `SIGTERM` stops a worker within its `--drain-timeout`, with exit 0 (#31).
+/// An idle worker stops at once, and the scheduler stops counting it. A
+/// worker running join tasks far longer than its timeout stops when the
+/// timeout passes, leaving them to the scheduler; without the bound it
+/// waited for them, however long they took.
+#[test]
+#[cfg(unix)]
+fn sigterm_stops_a_worker_within_its_drain_timeout_with_exit_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    gen_data(dir.path(), 600_000);
+    let table_arg = format!("t={}", dir.path().display());
+    let mut cluster = TestCluster::start(dir.path(), "cpu", &[]);
+    let idle = cluster.spawn_worker("idle", &this_worker(), &[]);
+    let busy = cluster.spawn_worker("busy", &this_worker(), &["--drain-timeout", "1"]);
+    cluster.wait_ready(2);
+    // Ballista's executor listens for the signal only once it is up, just
+    // after it has registered; the Flight server's line is its last step
+    // before that. A signal sent earlier is seen by OxideLake alone, and the
+    // worker then waits out its drain timeout (`run_executor_with_shutdown`).
+    cluster.wait_log("idle", "that it is up", Duration::from_secs(60), |line| {
+        line.contains("arrow flight server listening")
+    });
+    std::thread::sleep(Duration::from_millis(300));
+
+    let started = Instant::now();
+    cluster.signal(idle, "TERM");
+    let status = wait_exit(&mut cluster.processes[idle].1, Duration::from_secs(20))
+        .unwrap_or_else(|| panic!("an idle worker ignored SIGTERM\n{}", cluster.logs()));
+    assert_eq!(status.code(), Some(0), "{}", cluster.logs());
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+    cluster.wait_ready(1);
+
+    // Every row joins about 6,000 others: each of the 16 join tasks is a
+    // sixteenth of 3.6 billion rows, about five seconds on the machine this
+    // was written on, so a task outlasts the one-second bound with room.
+    let query = cluster.spawn_sql("query", &slow_join(600_000), &table_arg);
+    cluster.wait_log(
+        "busy",
+        "a join task",
+        Duration::from_secs(120),
+        starts_stage(JOIN_STAGE),
+    );
+    let started = Instant::now();
+    cluster.signal(busy, "TERM");
+    let status =
+        wait_exit(&mut cluster.processes[busy].1, Duration::from_secs(30)).unwrap_or_else(|| {
+            panic!(
+                "a busy worker outlived its drain timeout\n{}",
+                cluster.logs()
+            )
+        });
+    let took = started.elapsed();
+    assert_eq!(status.code(), Some(0), "{}", cluster.logs());
+    assert!(
+        took >= Duration::from_secs(1) && took < Duration::from_secs(10),
+        "stopped after {took:?}\n{}",
+        cluster.log("busy")
+    );
+    assert!(
+        cluster.log("busy").contains("drain timeout passed"),
+        "{}",
+        cluster.log("busy")
+    );
+    // A worker draining in the middle of a query must not lead that query
+    // into Ballista's rollback (#148): the query fails at once, naming the
+    // worker, rather than waiting for one that is never coming back.
+    let (succeeded, stdout, stderr) = finish_sql(&cluster, "query", query, Duration::from_secs(60));
+    assert!(!succeeded, "{stderr}");
+    assert_eq!(stdout, "", "no rows are printed for a failed query");
+    let port = format!("127.0.0.1:{}", cluster.flight_port("busy"));
+    assert!(
+        stderr.contains("was lost while this query ran") && stderr.contains(&port),
+        "{stderr}"
+    );
+}
+
+/// `SIGTERM` stops a scheduler gracefully (#31): a query sent from then on
+/// is refused saying why, the query already running finishes with the right
+/// rows, and the scheduler then exits 0. It used to die of the signal
+/// (status 143) and take the running query with it.
+#[test]
+#[cfg(unix)]
+fn sigterm_drains_a_scheduler_and_exits_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    gen_data(dir.path(), 600_000);
+    let table_arg = format!("t={}", dir.path().display());
+    let query = slow_join(200_000);
+    let expected = embedded_sql(&query, &table_arg);
+
+    let mut cluster = TestCluster::start(dir.path(), "cpu", &["--drain-timeout", "120"]);
+    cluster.spawn_worker("w1", &this_worker(), &[]);
+    cluster.spawn_worker("w2", &this_worker(), &[]);
+    cluster.wait_ready(2);
+    let running = cluster.spawn_sql("running", &query, &table_arg);
+    cluster.wait_log(
+        "scheduler",
+        "the query's job",
+        Duration::from_secs(120),
+        |line| line.contains("Job submitted"),
+    );
+    cluster.signal(0, "TERM");
+    cluster.wait_log(
+        "scheduler",
+        "that it is shutting down",
+        Duration::from_secs(20),
+        |line| line.contains("shutting down") && line.contains("running=1"),
+    );
+
+    let refused = cluster.sql("SELECT COUNT(*) FROM t", &table_arg);
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(!refused.status.success(), "{stderr}");
+    assert!(stderr.contains("shutting down"), "{stderr}");
+
+    let (succeeded, stdout, stderr) =
+        finish_sql(&cluster, "running", running, Duration::from_secs(120));
+    assert!(succeeded, "{stderr}\n{}", cluster.logs());
+    assert_eq!(stdout, expected);
+    let status = wait_exit(&mut cluster.processes[0].1, Duration::from_secs(30))
+        .unwrap_or_else(|| panic!("the scheduler did not exit\n{}", cluster.logs()));
+    assert_eq!(status.code(), Some(0), "{}", cluster.logs());
+    assert!(
+        cluster
+            .log("scheduler")
+            .contains("every running query finished"),
+        "{}",
+        cluster.log("scheduler")
+    );
+}
+
+/// `--worker-timeout` and `--heartbeat-interval` reach the processes (#31):
+/// a worker killed while idle stops counting once the timeout passes, and
+/// the live one, heartbeating more often than that, keeps counting. With
+/// Ballista's 60-second heartbeat the live one would be presumed lost too;
+/// with its 180-second timeout the dead one would still count. The timeout
+/// is five heartbeats, not two: Ballista keeps heartbeat times in whole
+/// seconds, and this test shares the machine with joins.
+#[test]
+#[cfg(unix)]
+fn a_silent_worker_stops_counting_after_the_worker_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cluster = TestCluster::start(dir.path(), "cpu", &["--worker-timeout", "5"]);
+    cluster.spawn_worker("w1", &this_worker(), &["--heartbeat-interval", "1"]);
+    let lost = cluster.spawn_worker("w2", &this_worker(), &["--heartbeat-interval", "1"]);
+    cluster.wait_ready(2);
+    let killed = Instant::now();
+    cluster.signal(lost, "KILL");
+    cluster.wait_ready(1);
+    assert!(
+        killed.elapsed() < Duration::from_secs(20),
+        "{:?}",
+        killed.elapsed()
+    );
+    // Twice the timeout later, the live worker still counts.
+    std::thread::sleep(Duration::from_secs(10));
+    let body = http_get(cluster.scheduler_port, "/readyz").unwrap_or_default();
+    assert!(
+        body.contains("ready: 1 executors registered"),
+        "{body}\n{}",
+        cluster.logs()
+    );
+}
+
+// --- where cluster processes may listen (#30) -------------------------------
+
+/// A scheduler or worker asked to listen on a public address, or on every
+/// address, without `--allow-insecure-bind` refuses before it listens, and
+/// says what to do (#30). The ports are unauthenticated, so this is the
+/// whole of the security boundary until OxideLake has TLS and auth.
+///
+/// Port 1 keeps a regression from exposing anything while this runs: an
+/// unprivileged process cannot bind it, so a scheduler that skipped the
+/// check would fail on the bind, with another message, instead of
+/// listening on every interface.
+#[test]
+fn a_public_or_wildcard_listener_is_refused_without_the_flag() {
+    let refusals = [
+        (
+            "oxide-scheduler",
+            &["--bind-host", "0.0.0.0", "--port", "1"][..],
+        ),
+        ("oxide-scheduler", &["--bind-host", "::", "--port", "1"][..]),
+        (
+            "oxide-scheduler",
+            &["--bind-host", "203.0.113.7", "--port", "1"][..],
+        ),
+        (
+            "oxide-scheduler",
+            &[
+                "--port",
+                "1",
+                "--metrics-port",
+                "1",
+                "--metrics-host",
+                "0.0.0.0",
+            ][..],
+        ),
+        (
+            "oxide-worker",
+            &["--bind-host", "0.0.0.0", "--port", "1", "--grpc-port", "1"][..],
+        ),
+        (
+            "oxide-worker",
+            &["--metrics-port", "1", "--metrics-host", "203.0.113.7"][..],
+        ),
+    ];
+    for (bin, args) in refusals {
+        let assert = Command::cargo_bin(bin)
+            .unwrap()
+            .args(args)
+            .timeout(Duration::from_secs(30))
+            .assert()
+            .failure();
+        let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+        assert!(
+            stderr.contains("--allow-insecure-bind") && stderr.contains("no authentication"),
+            "{bin} {args:?}: {stderr}"
+        );
+    }
+    for bin in ["oxide-scheduler", "oxide-worker"] {
+        let assert = Command::cargo_bin(bin)
+            .unwrap()
+            .arg("--help")
+            .assert()
+            .success();
+        let help = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+        assert!(help.contains("--allow-insecure-bind"), "{bin}\n{help}");
+        assert!(help.contains("--bind-host"), "{bin}\n{help}");
+    }
 }
 
 /// `gen-data --special-floats` writes every IEEE special value into `v`, and

@@ -9,10 +9,13 @@
 mod admission;
 pub mod cluster;
 pub mod dashboard;
+pub mod exposure;
 #[cfg(feature = "metrics")]
 pub mod metrics;
 pub mod output;
 pub mod session;
+pub mod shutdown;
+mod worker_loss;
 
 pub use output::OutputFormat;
 pub use oxidelake_compute::udf;

@@ -10,6 +10,21 @@ versions (0.x) may contain breaking changes; they are always listed under a
 
 ### Added
 
+- **Graceful shutdown, Ballista's retry limits, and what losing a worker
+  does** (#31). `oxide-scheduler` handled no signal: `SIGTERM` killed it
+  (status 143) with every query it was running. It now refuses new queries
+  on `SIGTERM` or `SIGINT`, saying it is shutting down, gives the running
+  ones up to `--drain-timeout` (20 s) to finish, and exits 0.
+  `oxide-worker` already stopped gracefully through Ballista (no new tasks,
+  its scheduler runs its tasks elsewhere, then it waits for them) but waited
+  for ever; `--drain-timeout` now bounds the wait, and it exits 0 either
+  way. A second signal stops either at once. New scheduler flags
+  `--task-max-failures` and `--stage-max-failures` (Ballista's retry
+  limits, 4 and 1) and `--worker-timeout` (seconds a silent worker still
+  counts, 180), and worker flag `--heartbeat-interval` (60); the defaults
+  are Ballista's but for `--stage-max-failures`, which is 1 so that a lost
+  worker fails its queries instead of being retried (#148, under Changed).
+
 - **`operator_stats()` on `GpuFilterExec`, `GpuHashJoinExec`,
   `GpuAggregateExec` and `GpuVectorDistanceExec`** returns the counters
   that exec instance has reported to its telemetry hub (`None` before it
@@ -457,6 +472,24 @@ versions (0.x) may contain breaking changes; they are always listed under a
   partition coalescing are therefore not available on an OxideLake cluster
   until the placement rule can run inside the adaptive planner.
 
+- **A cluster no longer retries a query that loses a worker** (#148).
+  Ballista 55 recovers such a query by rolling back the stages that read the
+  lost worker's output and running them again, and in 55.0.0 that recovery
+  is not safe: a self-join that lost a worker mid-flight came back with 13
+  or 14 of its 100 groups twice, exit 0, in 12 runs of 15 (fixed upstream by
+  apache/datafusion-ballista#2677, unreleased), and a worker stopped with
+  `SIGTERM` mid-query left it hanging (apache/datafusion-ballista#2539,
+  #2698). `oxide-scheduler` now fails a query that held output on a worker
+  it loses, whether killed, stopped or silent past `--worker-timeout`, with
+  an error naming the worker (one killed in the middle of a transfer shows
+  as a broken shuffle stream instead), and `--stage-max-failures` defaults
+  to 1, so
+  a failed fetch from a lost worker ends the query too; a query whose tasks
+  on that worker had not finished anything still runs them again elsewhere.
+  **Migration:** a query that used to survive losing a worker now fails;
+  run it again. To get Ballista's stage retries back, pass
+  `--stage-max-failures 4`, which brings the bug back with them.
+
 ### Fixed
 
 - **Cluster mode returns the right rows for `NOT IN (subquery)`** (#91).
@@ -671,6 +704,20 @@ versions (0.x) may contain breaking changes; they are always listed under a
   RUSTSEC-2026-0414, -0433), and the AWS SDK crates Ballista bundles, whose
   current releases no longer pull the unmaintained `pin-utils`
   (RUSTSEC-2026-0441).
+
+- **A cluster process refuses to listen beyond a private network**
+  (#30). The scheduler's and workers' ports have no authentication or
+  encryption, and `oxide-scheduler --bind-host 0.0.0.0` started without a
+  word. Now `oxide-scheduler` and `oxide-worker` exit 1 when `--bind-host`
+  or `--metrics-host` is a public address or every address (`0.0.0.0`,
+  `::`), naming the risk and the way out: bind a loopback or private address
+  (10/8, 172.16/12, 192.168/16, fc00::/7), or pass `--allow-insecure-bind`
+  when a firewall or an authenticating proxy already decides who connects.
+  Either logs a warning whenever it listens beyond loopback. `oxide-worker
+  --bind-host` is new: the worker listened on `127.0.0.1` only, so a
+  scheduler on another machine could not reach it. TLS and authentication
+  are not built yet; README and SECURITY.md say what a production
+  deployment must put in front of the ports.
 
 - **Three "unmaintained" notices are accepted, with their reasons**:
   `chrono` (RUSTSEC-2026-0543) and `chrono-tz` (RUSTSEC-2026-0555), which

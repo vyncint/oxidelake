@@ -29,6 +29,8 @@ use ballista_scheduler::state::task_manager::JobInfoCache;
 use datafusion::error::DataFusionError;
 use oxidelake_planner::codec::{PLAN_FINGERPRINT, build_description};
 
+use crate::worker_loss::WorkerLoss;
+
 /// Starts the build tag in an `oxide-worker`'s executor id.
 const BUILD_TAG: &str = "oxl";
 
@@ -95,14 +97,24 @@ fn is_active(heartbeat: &ExecutorHeartbeat) -> bool {
 ///
 /// Every other method is Ballista's own: this is the in-memory state that
 /// `BallistaCluster::new_from_config` would have built, with one check in
-/// front of the two ways a worker's metadata enters it.
+/// front of the two ways a worker's metadata enters it, and one notice on
+/// the way out: a removed worker's queries are failed before Ballista can
+/// roll them back (#148, [`WorkerLoss`]).
 #[derive(Default)]
 pub(crate) struct SameBuildClusterState {
     inner: InMemoryClusterState,
     refusals: Mutex<Vec<String>>,
+    loss: Arc<WorkerLoss>,
 }
 
 impl SameBuildClusterState {
+    pub(crate) fn new(loss: Arc<WorkerLoss>) -> Self {
+        Self {
+            loss,
+            ..Self::default()
+        }
+    }
+
     fn admit(&self, metadata: &ExecutorMetadata) -> Result<()> {
         let Some(why) = refusal(metadata) else {
             return Ok(());
@@ -183,8 +195,21 @@ impl ClusterState for SameBuildClusterState {
         self.inner.save_executor_heartbeat(heartbeat).await
     }
 
+    // Every removal, whatever its cause, comes through here, and Ballista
+    // posts the event that rolls the worker's queries back only after this
+    // returns. The worker is removed first, so the cancellation that follows
+    // cannot reach it: it is being lost, and Ballista's own clean-up does not
+    // reach it either.
     async fn remove_executor(&self, executor_id: &str) -> Result<()> {
-        self.inner.remove_executor(executor_id).await
+        let address = self
+            .inner
+            .get_executor_metadata(executor_id)
+            .await
+            .map(|worker| format!("{}:{}", worker.host, worker.port))
+            .unwrap_or_else(|_| "address unknown".to_owned());
+        let removed = self.inner.remove_executor(executor_id).await;
+        self.loss.lost(executor_id, &address).await;
+        removed
     }
 
     fn executor_heartbeats(&self) -> HashMap<String, ExecutorHeartbeat> {
