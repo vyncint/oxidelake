@@ -7,6 +7,7 @@
 //! scheduler and executor processes, plus an in-process standalone cluster for
 //! tests and the CLI.
 
+use std::any::Any;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -19,14 +20,19 @@ use ballista_core::serde::protobuf::scheduler_grpc_client::SchedulerGrpcClient;
 use ballista_core::serde::{
     BallistaCodec, BallistaLogicalExtensionCodec, BallistaPhysicalExtensionCodec,
 };
+use ballista_core::utils::{default_config_producer, default_session_builder};
 use ballista_core::{ConfigProducer, RuntimeProducer};
 use ballista_executor::executor_process::{ExecutorProcessConfig, start_executor_process};
 use ballista_executor::new_standalone_executor_from_builder;
 use ballista_scheduler::cluster::BallistaCluster;
+use ballista_scheduler::cluster::memory::InMemoryJobState;
 use ballista_scheduler::config::SchedulerConfig;
 use ballista_scheduler::scheduler_process::start_server;
 use ballista_scheduler::scheduler_server::SessionBuilder;
 use ballista_scheduler::standalone::new_standalone_scheduler_with_builder;
+use ballista_scheduler::state::session_manager::share_file_statistics_cache;
+use datafusion::config::{ConfigEntry, ConfigExtension, ExtensionOptions};
+use datafusion::error::DataFusionError;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
@@ -35,9 +41,14 @@ use datafusion::prelude::SessionConfig;
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use oxidelake_compute::oxide_udfs;
 use oxidelake_core::{BackendKind, EngineError};
+use oxidelake_planner::codec::build_description;
 use oxidelake_planner::{HardwarePlacementRule, OxidePhysicalCodec, physical_optimizer_rules};
 use oxidelake_storage::{
     BoundedReadStore, ParquetScanGuard, default_object_store, with_gpu_batch_size, with_pruning,
+};
+
+use crate::admission::{
+    REFUSED, SameBuildClusterState, failing_without_a_usable_worker, tagged_executor_id,
 };
 
 fn ballista_error(err: impl std::fmt::Display) -> EngineError {
@@ -61,10 +72,102 @@ pub fn ballista_codec() -> BallistaCodec {
 }
 
 /// Session configuration for every process: Ballista defaults, Parquet pruning
-/// on, and the OxideLake codec.
+/// on, the OxideLake codec, and Ballista's static planner.
+///
+/// Ballista 55 plans adaptively by default, and its adaptive planner builds
+/// its own session with Ballista's physical optimizer rules in place of the
+/// session's, so the placement rules never run: a GPU-targeted cluster
+/// executed no `Gpu*Exec` at all while `EXPLAIN`, which plans statically,
+/// still showed them (#134). The adaptive planner has no hook to add a rule
+/// to, so it stays off until it does, and [`build_session_state`] holds the
+/// scheduler to that whatever a client sends.
 pub fn session_config() -> SessionConfig {
     with_pruning(SessionConfig::new_with_ballista())
         .with_ballista_physical_extension_codec(oxide_codec())
+        .with_ballista_adaptive_query_planner(false)
+        .with_option_extension(ClientOptions::default())
+}
+
+/// What an OxideLake cluster client tells the scheduler beside DataFusion's
+/// own settings (#93).
+///
+/// Ballista ships a client's whole configuration to the scheduler as
+/// key/value pairs, and an extension registered at both ends travels with it
+/// ([`session_config`] registers this one everywhere). The scheduler needs a
+/// fact DataFusion's settings cannot carry: whether the batch size was a
+/// choice. A GPU-targeted cluster raises an unchosen size to
+/// [`GPU_BATCH_SIZE`](oxidelake_storage::GPU_BATCH_SIZE), and DataFusion's
+/// default of 8192 is also a size someone can ask for, so the value alone
+/// cannot say which it is.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ClientOptions {
+    /// The client set its batch size (`--batch-size`,
+    /// `SessionOptions::with_batch_size`).
+    pub(crate) explicit_batch_size: bool,
+}
+
+impl ClientOptions {
+    const EXPLICIT_BATCH_SIZE: &'static str = "explicit_batch_size";
+}
+
+impl ExtensionOptions for ClientOptions {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn cloned(&self) -> Box<dyn ExtensionOptions> {
+        Box::new(self.clone())
+    }
+
+    fn set(&mut self, key: &str, value: &str) -> datafusion::error::Result<()> {
+        if key != Self::EXPLICIT_BATCH_SIZE {
+            return Err(DataFusionError::Configuration(format!(
+                "no OxideLake setting `{}.{key}`",
+                Self::PREFIX
+            )));
+        }
+        self.explicit_batch_size = value.parse().map_err(|_| {
+            DataFusionError::Configuration(format!(
+                "`{}.{key}` takes true or false, not `{value}`",
+                Self::PREFIX
+            ))
+        })?;
+        Ok(())
+    }
+
+    // Prefixed, unlike the entries `extensions_options!` generates: Ballista
+    // sends `entries()` to the scheduler as they are, and the scheduler's
+    // `ConfigOptions::set` finds the extension by that prefix. An unprefixed
+    // key arrives without a namespace and is dropped at `debug` level, so the
+    // marker would silently never arrive.
+    fn entries(&self) -> Vec<ConfigEntry> {
+        vec![ConfigEntry {
+            key: format!("{}.{}", Self::PREFIX, Self::EXPLICIT_BATCH_SIZE),
+            value: Some(self.explicit_batch_size.to_string()),
+            description: "The client chose its batch size, so a GPU-targeted \
+                          cluster keeps it instead of raising it to the GPU default",
+        }]
+    }
+}
+
+impl ConfigExtension for ClientOptions {
+    const PREFIX: &'static str = "oxidelake";
+}
+
+/// Whether `config`'s batch size is one the client asked for (#93): said so
+/// explicitly, or set to anything but DataFusion's default (a `SET
+/// datafusion.execution.batch_size`, or a client that predates the marker).
+fn client_chose_batch_size(config: &SessionConfig) -> bool {
+    config
+        .options()
+        .extensions
+        .get::<ClientOptions>()
+        .is_some_and(|client| client.explicit_batch_size)
+        || config.batch_size() != SessionConfig::new().batch_size()
 }
 
 /// Ballista `ConfigProducer` yielding [`session_config`].
@@ -82,13 +185,31 @@ pub fn config_producer() -> ConfigProducer {
 /// into this session's cache, and the local store is bounded like an
 /// embedded session's, so that planning read cannot reserve memory for a
 /// range a corrupt footer declares past the end of the file.
+/// `config` is the client's (Ballista sends it with every query). A GPU
+/// target raises its batch size to the GPU default unless the client chose
+/// one, which it keeps (#93). Adaptive planning is turned off whatever the
+/// client asked for, because it would drop the placement rule (#134; see
+/// [`session_config`]).
 pub fn build_session_state(
     config: SessionConfig,
     target: BackendKind,
 ) -> datafusion::error::Result<SessionState> {
     let mut scalar_functions = ballista_scalar_functions();
     scalar_functions.extend(oxide_udfs());
-    let config = if target.is_gpu() {
+    // The scheduler picks its planner from the state built here, after the
+    // client's settings were applied, so this is the one place a client's
+    // `SET ballista.planner.adaptive.enabled = true` (or a stock Ballista
+    // client, whose default it is) cannot win.
+    let config = if config.ballista_adaptive_query_planner_enabled() {
+        tracing::warn!(
+            "adaptive query planning is not available on an OxideLake cluster: \
+             it would drop the placement rules, so this query is planned statically (#134)"
+        );
+        config.with_ballista_adaptive_query_planner(false)
+    } else {
+        config
+    };
+    let config = if target.is_gpu() && !client_chose_batch_size(&config) {
         with_gpu_batch_size(config)
     } else {
         config
@@ -146,20 +267,49 @@ pub fn scheduler_config(bind_host: &str, port: u16, target: BackendKind) -> Sche
 }
 
 /// Runs a Ballista scheduler until it exits.
+///
+/// The scheduler admits only workers of its own build (#92): one whose plan
+/// fingerprint differs is refused when it registers, and a query sent to a
+/// cluster whose workers were all refused fails at once with the reason,
+/// where Ballista would hold it for a worker that is never coming.
 pub async fn run_scheduler(config: SchedulerConfig) -> Result<(), EngineError> {
     let address: SocketAddr = format!("{}:{}", config.bind_host, config.bind_port)
         .parse()
         .map_err(|e| EngineError::plan(format!("invalid scheduler bind address: {e}")))?;
-    let config = Arc::new(config);
-    let cluster = BallistaCluster::new_from_config(&config)
-        .await
-        .map_err(ballista_error)?;
-    start_server(cluster, address, config)
+    let cluster = same_build_cluster(&config);
+    start_server(cluster, address, Arc::new(config))
         .await
         .map_err(ballista_error)
 }
 
+/// What `BallistaCluster::new_from_config` builds, in-memory cluster and job
+/// state, with the cluster state admitting only workers of this build and
+/// the session builder failing a query that no admitted worker can run.
+fn same_build_cluster(config: &SchedulerConfig) -> BallistaCluster {
+    let state = Arc::new(SameBuildClusterState::default());
+    let session_builder = config
+        .override_session_builder
+        .clone()
+        .unwrap_or_else(|| Arc::new(default_session_builder));
+    let config_producer = config
+        .override_config_producer
+        .clone()
+        .unwrap_or_else(|| Arc::new(default_config_producer));
+    let jobs = InMemoryJobState::new(
+        config.scheduler_id.clone(),
+        share_file_statistics_cache(failing_without_a_usable_worker(
+            session_builder,
+            Arc::clone(&state),
+        )),
+        config_producer,
+    );
+    BallistaCluster::new(state, Arc::new(jobs))
+}
+
 /// Executor configuration with OxideLake's hooks installed.
+///
+/// The executor id carries this build's plan fingerprint, which is what a
+/// scheduler checks when the executor registers (#92).
 pub fn executor_config(
     scheduler_host: &str,
     scheduler_port: u16,
@@ -170,6 +320,7 @@ pub fn executor_config(
 ) -> ExecutorProcessConfig {
     let defaults = ExecutorProcessConfig::default();
     ExecutorProcessConfig {
+        executor_id: tagged_executor_id(&defaults.executor_id),
         scheduler_host: scheduler_host.to_owned(),
         scheduler_port,
         port,
@@ -187,10 +338,24 @@ pub fn executor_config(
 }
 
 /// Runs a Ballista executor until it exits.
+///
+/// A scheduler of another build refuses it when it registers (#92), and this
+/// returns that refusal with the executor's own build added, so the two
+/// builds are named side by side in the worker's log.
 pub async fn run_executor(config: ExecutorProcessConfig) -> Result<(), EngineError> {
     start_executor_process(Arc::new(config))
         .await
-        .map_err(ballista_error)
+        .map_err(|err| {
+            let text = err.to_string();
+            if text.contains(REFUSED) {
+                EngineError::execution(format!(
+                    "ballista: {text}. This worker is {}",
+                    build_description()
+                ))
+            } else {
+                ballista_error(err)
+            }
+        })
 }
 
 /// Starts an in-process scheduler plus `executors` executors on ephemeral
@@ -259,5 +424,95 @@ mod tests {
             store.to_string().starts_with("BoundedReadStore("),
             "{store}"
         );
+    }
+
+    use ballista_core::extension::SessionConfigHelperExt;
+    use oxidelake_storage::GPU_BATCH_SIZE;
+
+    /// The config the scheduler hands its session builder for a client's
+    /// query: its own producer's, updated from the client's settings the way
+    /// Ballista's `create_context` does it.
+    fn as_the_scheduler_sees(client: &SessionConfig) -> SessionConfig {
+        session_config().update_from_key_value_pair(&client.to_key_value_pairs())
+    }
+
+    fn client(explicit: bool, batch_size: usize) -> SessionConfig {
+        session_config()
+            .with_option_extension(ClientOptions {
+                explicit_batch_size: explicit,
+            })
+            .with_batch_size(batch_size)
+    }
+
+    fn planned_batch_size(config: SessionConfig, target: BackendKind) -> usize {
+        build_session_state(config, target)
+            .unwrap()
+            .config()
+            .batch_size()
+    }
+
+    /// The marker survives Ballista's key/value trip to the scheduler. A key
+    /// without its `oxidelake.` prefix would be dropped there at `debug`
+    /// level, and every other assertion about the marker would then be
+    /// testing a value the scheduler never receives.
+    #[test]
+    fn the_explicit_batch_size_marker_reaches_the_scheduler() {
+        let seen = as_the_scheduler_sees(&client(true, 7));
+        let options = seen.options().extensions.get::<ClientOptions>().unwrap();
+        assert!(options.explicit_batch_size);
+        assert_eq!(seen.batch_size(), 7);
+
+        let seen = as_the_scheduler_sees(&client(false, 7));
+        let options = seen.options().extensions.get::<ClientOptions>().unwrap();
+        assert!(!options.explicit_batch_size);
+    }
+
+    /// A GPU cluster raises only a batch size nobody chose (#93).
+    #[test]
+    fn a_gpu_cluster_keeps_a_batch_size_the_client_chose() {
+        let default = SessionConfig::new().batch_size();
+        // Nobody chose: the GPU default.
+        let seen = as_the_scheduler_sees(&client(false, default));
+        assert_eq!(planned_batch_size(seen, BackendKind::Cuda), GPU_BATCH_SIZE);
+        // Chosen, and equal to DataFusion's default: only the marker says so.
+        let seen = as_the_scheduler_sees(&client(true, default));
+        assert_eq!(planned_batch_size(seen, BackendKind::Cuda), default);
+        // Not the default (`SET`, or a client from before the marker).
+        let seen = as_the_scheduler_sees(&client(false, 7));
+        assert_eq!(planned_batch_size(seen, BackendKind::Metal), 7);
+        // A CPU cluster never raises it.
+        let seen = as_the_scheduler_sees(&client(false, default));
+        assert_eq!(planned_batch_size(seen, BackendKind::CpuSimd), default);
+    }
+
+    #[test]
+    fn a_malformed_marker_is_refused_by_name() {
+        let mut options = ClientOptions::default();
+        let err = options.set("explicit_batch_size", "yes").unwrap_err();
+        assert!(
+            err.to_string().contains("oxidelake.explicit_batch_size"),
+            "{err}"
+        );
+        let err = options.set("batch", "true").unwrap_err();
+        assert!(err.to_string().contains("oxidelake.batch"), "{err}");
+    }
+
+    /// The scheduler plans statically whatever a client sends (#134):
+    /// Ballista's adaptive planner would replace the placement rules.
+    #[test]
+    fn a_client_cannot_turn_adaptive_planning_back_on() {
+        assert!(!session_config().ballista_adaptive_query_planner_enabled());
+        // `SET ballista.planner.adaptive.enabled = true`, and a stock Ballista
+        // client, whose default it is: both arrive at the session builder.
+        let asked = session_config().with_ballista_adaptive_query_planner(true);
+        let stock = SessionConfig::new_with_ballista();
+        for client in [asked, stock] {
+            let seen = as_the_scheduler_sees(&client);
+            assert!(seen.ballista_adaptive_query_planner_enabled());
+            for target in [BackendKind::CpuSimd, BackendKind::Cuda] {
+                let state = build_session_state(seen.clone(), target).unwrap();
+                assert!(!state.config().ballista_adaptive_query_planner_enabled());
+            }
+        }
     }
 }

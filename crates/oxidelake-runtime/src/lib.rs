@@ -6,6 +6,7 @@
 //! Dependency direction: depends on every other OxideLake library crate and on
 //! the `ballista*` crates.
 
+mod admission;
 pub mod cluster;
 pub mod dashboard;
 #[cfg(feature = "metrics")]

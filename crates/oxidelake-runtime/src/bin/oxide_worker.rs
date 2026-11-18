@@ -64,7 +64,11 @@ async fn main() -> anyhow::Result<()> {
         Some(kind) => oxidelake_compute::init_local_backend(Some(kind.as_str()))?,
         None => oxidelake_compute::local_backend()?,
     };
-    tracing::info!(backend = %backend.kind(), "worker backend");
+    tracing::info!(
+        backend = %backend.kind(),
+        build = %oxidelake_planner::codec::build_description(),
+        "worker backend"
+    );
     serve_metrics(cli.metrics_port, &cli.metrics_host).await?;
     cluster::run_executor(cluster::executor_config(
         &cli.scheduler_host,

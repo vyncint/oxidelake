@@ -48,6 +48,12 @@ async fn main() -> anyhow::Result<()> {
         None => oxidelake_planner::cluster_target_from_env()?,
     };
     tracing::info!(%target, "placement target for this cluster");
+    // Workers are admitted only if they are this build (#92), so the log
+    // says which build that is.
+    tracing::info!(
+        build = %oxidelake_planner::codec::build_description(),
+        "admitting workers of this build only"
+    );
     serve_metrics(cli.metrics_port, &cli.metrics_host).await?;
     cluster::run_scheduler(cluster::scheduler_config(&cli.bind_host, cli.port, target)).await?;
     Ok(())

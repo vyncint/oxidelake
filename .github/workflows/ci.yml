@@ -187,6 +187,12 @@ jobs:
       - name: predict adds no second CUDA stack
         if: matrix.lane.name == 'predict'
         run: make check-predict-no-second-cuda
+      # Two builds of `oxide-worker` against one scheduler (#92): a `cuda`
+      # worker must join a default-build scheduler and a `predict` one must
+      # be refused. This lane already builds `predict`.
+      - name: a cluster admits only workers of its own build
+        if: matrix.lane.name == 'predict'
+        run: make test-mixed-build
       - name: cuda feature compiles with no CUDA installed
         if: matrix.lane.name == 'default'
         run: make check-cuda

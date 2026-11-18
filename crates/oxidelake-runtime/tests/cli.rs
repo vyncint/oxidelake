@@ -704,3 +704,302 @@ fn a_metrics_port_without_the_feature_is_refused() {
     );
     assert!(stderr.contains("--features metrics"), "{stderr}");
 }
+
+// --- real cluster processes (#92) ------------------------------------------
+
+/// A scheduler and the workers a test starts, every one killed and reaped on
+/// drop so a failing assertion never leaves a process listening behind it.
+/// Everything binds 127.0.0.1 on a free port, and every process writes its
+/// log to `<dir>/<name>.log` for the failure message.
+struct TestCluster {
+    dir: std::path::PathBuf,
+    scheduler_port: u16,
+    processes: Vec<(String, Child)>,
+}
+
+impl TestCluster {
+    /// Starts `oxide-scheduler` planning for `backend`, with `args`.
+    fn start(dir: &Path, backend: &str, args: &[&str]) -> Self {
+        let scheduler_port = free_port();
+        let mut cluster = Self {
+            dir: dir.to_owned(),
+            scheduler_port,
+            processes: Vec::new(),
+        };
+        let scheduler = StdCommand::new(env!("CARGO_BIN_EXE_oxide-scheduler"))
+            .args([
+                "--bind-host",
+                "127.0.0.1",
+                "--port",
+                &scheduler_port.to_string(),
+            ])
+            .args(args)
+            .env("OXIDE_CLUSTER_BACKEND", backend)
+            .env("RUST_LOG", "info")
+            .stdout(Stdio::null())
+            .stderr(cluster.log_file("scheduler"))
+            .spawn()
+            .unwrap();
+        cluster.processes.push(("scheduler".to_owned(), scheduler));
+        wait_for_port(scheduler_port, "oxide-scheduler");
+        cluster
+    }
+
+    fn log_file(&self, name: &str) -> File {
+        File::create(self.dir.join(format!("{name}.log"))).unwrap()
+    }
+
+    fn log(&self, name: &str) -> String {
+        std::fs::read_to_string(self.dir.join(format!("{name}.log"))).unwrap_or_default()
+    }
+
+    fn logs(&self) -> String {
+        self.processes
+            .iter()
+            .map(|(name, _)| format!("--- {name}.log\n{}", self.log(name)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn url(&self) -> String {
+        format!("df://127.0.0.1:{}", self.scheduler_port)
+    }
+
+    /// Starts the `oxide-worker` at `bin` (this build's, or another build's)
+    /// as `name`, and returns its index in `processes`. It is not waited
+    /// for: a refused worker never opens its ports for long.
+    fn spawn_worker(&mut self, name: &str, bin: &Path, args: &[&str]) -> usize {
+        let work_dir = self.dir.join(format!("{name}-shuffle"));
+        let worker = StdCommand::new(bin)
+            .args([
+                "--scheduler-host",
+                "127.0.0.1",
+                "--scheduler-port",
+                &self.scheduler_port.to_string(),
+                "--port",
+                &free_port().to_string(),
+                "--grpc-port",
+                &free_port().to_string(),
+                "--concurrent-tasks",
+                "2",
+                "--work-dir",
+                work_dir.to_str().unwrap(),
+            ])
+            .args(args)
+            .env("RUST_LOG", "info")
+            .stdout(Stdio::null())
+            .stderr(self.log_file(name))
+            .spawn()
+            .unwrap();
+        self.processes.push((name.to_owned(), worker));
+        self.processes.len() - 1
+    }
+
+    /// Waits until the scheduler's `/readyz` (Ballista's probe, on the
+    /// scheduler port) reports `executors` live workers.
+    fn wait_ready(&self, executors: usize) {
+        let want = format!("ready: {executors} executors registered");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let body = http_get(self.scheduler_port, "/readyz").unwrap_or_default();
+            if body.contains(&want) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "never {want:?}; last /readyz: {body:?}\n{}",
+                self.logs()
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    /// `oxide sql --cluster`, bounded so a hang fails the test rather than
+    /// the suite.
+    fn sql(&self, query: &str, table_arg: &str) -> std::process::Output {
+        oxide()
+            .args([
+                "sql",
+                "-q",
+                query,
+                "--table",
+                table_arg,
+                "--cluster",
+                &self.url(),
+            ])
+            .timeout(Duration::from_secs(120))
+            .output()
+            .unwrap()
+    }
+}
+
+impl Drop for TestCluster {
+    fn drop(&mut self) {
+        for (_, process) in &mut self.processes {
+            let _ = process.kill();
+            let _ = process.wait();
+        }
+    }
+}
+
+/// A plain HTTP/1.1 GET on 127.0.0.1, enough to read a probe's body.
+fn http_get(port: u16, path: &str) -> Option<String> {
+    use std::io::{Read, Write};
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+    )
+    .ok()?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).ok()?;
+    Some(response)
+}
+
+/// Waits for `child` to exit, up to `limit`.
+fn wait_exit(child: &mut Child, limit: Duration) -> Option<std::process::ExitStatus> {
+    let deadline = Instant::now() + limit;
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait().unwrap() {
+            return Some(status);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    None
+}
+
+/// A worker from another build is refused when it registers, and a query on
+/// a cluster left with no worker it can use fails at once and says why
+/// (#92).
+///
+/// The worker is this build's own executor with another fingerprint in its
+/// id — what a worker built with other features or from another release
+/// presents. The cluster plans for `cpu`, so no `Gpu*Exec` payload exists
+/// to check: the refusal no longer depends on what a plan contains.
+/// `make test-mixed-build` runs the same refusal with a real
+/// `--features predict` binary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_from_another_build_is_refused_and_the_query_says_why() {
+    let dir = tempfile::tempdir().unwrap();
+    gen_data(dir.path(), 4_096);
+    let table_arg = format!("t={}", dir.path().display());
+    let cluster = TestCluster::start(dir.path(), "cpu", &[]);
+
+    let mut config = oxidelake_runtime::cluster::executor_config(
+        "127.0.0.1",
+        cluster.scheduler_port,
+        free_port(),
+        free_port(),
+        Some(1),
+        Some(dir.path().join("forged").to_string_lossy().into_owned()),
+    );
+    let ours = format!("{:08x}", oxidelake_planner::codec::PLAN_FINGERPRINT);
+    let theirs = format!("{:08x}", !oxidelake_planner::codec::PLAN_FINGERPRINT);
+    assert!(config.executor_id.contains(&ours), "{}", config.executor_id);
+    config.executor_id = config.executor_id.replacen(&ours, &theirs, 1);
+
+    let refused = tokio::time::timeout(
+        Duration::from_secs(60),
+        oxidelake_runtime::cluster::run_executor(config),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "a worker from another build was not refused\n{}",
+            cluster.logs()
+        )
+    })
+    .expect_err("registration is refused")
+    .to_string();
+    assert!(refused.contains("refused"), "{refused}");
+    assert!(refused.contains(&format!("0x{theirs}")), "{refused}");
+    assert!(refused.contains(&format!("0x{ours}")), "{refused}");
+
+    let started = Instant::now();
+    let output = cluster.sql(QUERY, &table_arg);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("no worker it can use") && stderr.contains(&format!("0x{theirs}")),
+        "the query names the refusal: {stderr}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "failed, but only after {:?}",
+        started.elapsed()
+    );
+}
+
+/// `oxide-worker` built another way, for the two-binary tests below. Only
+/// `make test-mixed-build` builds them, so the tests are `#[ignore]`d and a
+/// run without the variable fails loudly instead of passing vacuously.
+fn other_build(var: &str) -> std::path::PathBuf {
+    std::env::var_os(var)
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| panic!("{var} is not set: run `make test-mixed-build`"))
+}
+
+/// A worker built with `--features cuda` runs the GPU-placed plans of a
+/// default-build scheduler (#92): `cuda` changes where an operator runs,
+/// not what a plan says, which is the heterogeneous cluster the README
+/// describes. Until 0.3.0 the feature was in the fingerprint, so the worker
+/// refused every `Gpu*Exec` payload and each such query failed.
+#[test]
+#[ignore = "needs a second build of oxide-worker: make test-mixed-build"]
+fn mixed_build_a_cuda_worker_runs_a_default_schedulers_gpu_plans() {
+    let worker = other_build("OXIDE_TEST_CUDA_WORKER");
+    let dir = tempfile::tempdir().unwrap();
+    gen_data(dir.path(), 20_000);
+    let table_arg = format!("t={}", dir.path().display());
+    let embedded = oxide()
+        .args(["sql", "-q", QUERY, "--table", &table_arg])
+        .assert()
+        .success();
+    let embedded_stdout = String::from_utf8(embedded.get_output().stdout.clone()).unwrap();
+
+    let mut cluster = TestCluster::start(dir.path(), "cuda", &[]);
+    cluster.spawn_worker("cuda-worker", &worker, &[]);
+    cluster.wait_ready(1);
+    let output = cluster.sql(QUERY, &table_arg);
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        cluster.logs()
+    );
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), embedded_stdout);
+}
+
+/// A worker built with `--features predict` is refused by a default-build
+/// scheduler, exits non-zero with both fingerprints named, and a query
+/// then fails within seconds saying why (#42, #92). Before 0.3.0 the worker
+/// joined: a `cpu` cluster never compared fingerprints, and a GPU one only
+/// when a task's plan was decoded, which failed (or, under Ballista 54,
+/// hung) the query with the reason in the worker's log.
+#[test]
+#[ignore = "needs a second build of oxide-worker: make test-mixed-build"]
+fn mixed_build_a_predict_worker_is_refused_by_a_default_scheduler() {
+    let worker = other_build("OXIDE_TEST_PREDICT_WORKER");
+    let dir = tempfile::tempdir().unwrap();
+    gen_data(dir.path(), 4_096);
+    let table_arg = format!("t={}", dir.path().display());
+
+    let mut cluster = TestCluster::start(dir.path(), "cpu", &[]);
+    let index = cluster.spawn_worker("predict-worker", &worker, &[]);
+    let status = wait_exit(&mut cluster.processes[index].1, Duration::from_secs(60))
+        .unwrap_or_else(|| panic!("the predict worker joined\n{}", cluster.logs()));
+    assert!(!status.success(), "{}", cluster.logs());
+    let log = cluster.log("predict-worker");
+    assert!(
+        log.contains("refused") && log.contains("feature mask 0x1"),
+        "{log}"
+    );
+
+    let started = Instant::now();
+    let output = cluster.sql(QUERY, &table_arg);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("no worker it can use"), "{stderr}");
+    assert!(started.elapsed() < Duration::from_secs(30));
+}

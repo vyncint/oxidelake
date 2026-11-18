@@ -17,6 +17,7 @@ aggregates their results under the stable name required by branch protection.
 ```bash
 make fmt-check lint lint-cuda lint-predict
 make test test-predict
+make test-mixed-build                 # builds cuda and predict workers; CI: the predict lane
 make test-io-uring                    # Linux only
 make check-cuda check-predict-no-second-cuda
 make doc coherence deny
@@ -119,7 +120,7 @@ and the Metal backend executes for real.
 | CUDA code compiles and lints | yes | `check` / `clippy -p oxidelake-runtime --features cuda` (no CUDA installed anywhere) |
 | `metal` feature is a no-op on Linux | yes | `cargo check -p oxidelake-runtime --features metal` on Linux |
 | Metal compile, lint, **execution** | yes (macOS) | the Metal lane above; the conformance suite runs on the actual device |
-| Cluster mode (Ballista scheduler + executors, codec, placement) | yes | in-process scheduler + 2 executors; spawned binaries in the Phase 7 E2E — executors take the CPU path |
+| Cluster mode (Ballista scheduler + executors, codec, placement) | yes | in-process scheduler + 2 executors, where every `Gpu*Exec` the cluster's `EXPLAIN` shows must also have run on an executor (the process-wide telemetry hub, #134); spawned binaries in the Phase 7 E2E — executors take the CPU path |
 | Embedded GPU-target ≡ CPU results | yes | `oxidelake-runtime/tests/embedded.rs` over cpu/cuda/metal targets |
 | Parquet pruning | yes | scan metrics + result equality against a pruning-disabled run |
 | CPU ↔ CUDA operator equivalence | **no** | conformance suite is `#[ignore]` for CUDA; run on a CUDA box |
@@ -158,6 +159,7 @@ cargo test -p oxidelake-compute --features cuda -- --ignored
 | TUI saved screens | `oxidelake-tui/tests/termlens_cli.rs` | `termlens-cli` on the committed `.snap` files — `render`, and `diff`'s 0/1/2 exit codes (`#[ignore]`d; `make test-termlens-cli`) |
 | Shipped TUI binary | `oxidelake-runtime/tests/oxide_tui_pty.rs` | `oxide tui` in a PTY: the same frame `oxidelake-tui` snapshots, and no log line on the grid |
 | CLI end-to-end | `oxidelake-runtime/tests/cli.rs` | `assert_cmd` on `oxide` — `gen-data` output verified by an independent `parquet`-crate read; spawned `oxide-scheduler` + `oxide-worker` must print byte-identical `--cluster` results |
+| Mixed builds | `oxidelake-runtime/tests/cli.rs` | a real `oxide-scheduler` refuses a worker whose plan fingerprint is not its own, and a query then fails at once naming it; with `make test-mixed-build`, a `--features cuda` worker runs a default scheduler's GPU plans and a `--features predict` one is refused (`#[ignore]`d otherwise) |
 
 ## Updating STATUS.md
 

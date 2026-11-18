@@ -356,6 +356,59 @@ versions (0.x) may contain breaking changes; they are always listed under a
   the deletes run on a thread and runtime of their own and the drop waits
   for them; after 30 seconds it stops waiting and lets them finish in the
   background. A file that cannot be deleted is logged at `warn`.
+- **Cluster queries keep Ballista's static planner** (#134). Ballista 55
+  plans adaptively by default, and its adaptive planner swaps the session's
+  physical optimizer rules for Ballista's own, so on the 55 chain a
+  GPU-targeted cluster ran no `Gpu*Exec` operator at all while `EXPLAIN`
+  still showed them (never released: 0.2.0 is on Ballista 54, which plans
+  statically). `ballista.planner.adaptive.enabled` is now `false` in every
+  OxideLake cluster session, and the scheduler overrides a client that sets
+  it to `true`, with a warning in its log. Adaptive join selection and
+  partition coalescing are therefore not available on an OxideLake cluster
+  until the placement rule can run inside the adaptive planner.
+
+### Fixed
+
+- **Cluster mode returns the right rows for `NOT IN (subquery)`** (#91).
+  Under Ballista 54 a cluster session (`prefer_hash_join = false`) had
+  DataFusion plan the null-aware anti join as a `SortMergeJoinExec`, which is
+  not null-aware, so rows whose key was NULL came back where embedded mode
+  returns none — no GPU operator involved (0.2.0, a 5000-row table: 4859
+  rows on the cluster, 4759 embedded). The move to the 55 chain fixes it
+  twice over: DataFusion 55 never gives a null-aware anti join to the merge
+  join, and Ballista 55's client rewrites `NOT IN` into a plain anti join
+  and a count. Both NULL cases are now in the cluster equality suite.
+
+- **`oxide sql --cluster --batch-size` reaches a GPU cluster** (#93). The
+  scheduler raised every query's batch size to the GPU default (65536)
+  whenever its target was a GPU, so the flag — and
+  `SessionOptions::with_batch_size` with `connect_with_options` — did
+  nothing there: `--batch-size 7` came back as one batch of every row. A
+  cluster client now tells the scheduler when the size is its own choice
+  (the `oxidelake.explicit_batch_size` session setting), and the GPU
+  default applies only to a size nobody chose. A size set with `SET
+  datafusion.execution.batch_size` is kept as well, unless it is 8192,
+  which the scheduler cannot tell from the default.
+
+- **A worker of another build is refused when it joins, and a CUDA worker
+  is no longer one** (#92). The plan fingerprint (#42) counted the `cuda`
+  and `metal` features, which change where an operator runs but not what a
+  plan says, so a default-build scheduler with `--features cuda` workers
+  failed every GPU-placed query. It now counts only the release and
+  `predict` (`oxidelake_compute::FEATURE_MASK` keeps bits 1 and 2, always
+  zero). It was also checked only inside a task launch, so a real mismatch
+  failed queries with "task could not be prepared or was rejected by
+  executor" and the reason in the worker's log (a hang under Ballista 54),
+  and a `cpu` cluster never checked at all. Now `oxide-worker` carries its
+  build's fingerprint in its executor id (`oxl<8 hex digits>-<uuid>`), and
+  `oxide-scheduler` refuses a worker of another build when it registers: the
+  worker exits non-zero naming both builds, and a query on a cluster whose
+  workers were all refused fails at once with that reason. Run the same
+  release, with or without `predict` alike, on the scheduler and every
+  worker; a plain Ballista executor, or an `oxide-worker` older than 0.3.0,
+  is refused. `oxidelake_planner::codec::PLAN_FINGERPRINT` and
+  `build_description()` are public, and `make test-mixed-build` runs both
+  cases with real binaries.
 
 ### Security
 

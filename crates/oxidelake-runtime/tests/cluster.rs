@@ -1,10 +1,12 @@
 //! Cluster equivalence (docs/SPEC.md §2.6): an in-process Ballista scheduler plus
 //! two executors, planned with `OXIDE_CLUSTER_BACKEND`-style target `cuda` so
 //! `Gpu*Exec` nodes travel through the codec (the executors have no GPU and take
-//! the CPU path), must return exactly what embedded mode returns.
+//! the CPU path), must return exactly what embedded mode returns, and must run
+//! the `Gpu*Exec` nodes the cluster's `EXPLAIN` shows (#134).
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -13,11 +15,13 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 use datafusion::physical_expr::Partitioning;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, displayable};
+
+use ballista_core::extension::SessionConfigExt;
 use datafusion::prelude::SessionContext;
 use oxidelake_core::BackendKind;
 use oxidelake_core::telemetry::TelemetryHub;
 use oxidelake_runtime::cluster::{build_session_state, session_config, start_standalone};
-use oxidelake_runtime::{OxideSession, SessionMode};
+use oxidelake_runtime::{OxideSession, SessionMode, SessionOptions};
 use oxidelake_storage::{Compression, ParquetWriteOptions, write_parquet};
 
 fn write_dataset(dir: &Path) -> (String, String) {
@@ -101,13 +105,85 @@ fn sorted_rows(batches: &[RecordBatch]) -> Vec<String> {
     rows
 }
 
-const QUERIES: [&str; 4] = [
+const QUERIES: [&str; 5] = [
     "SELECT k, sum(v), count(v), min(v), max(v) FROM t GROUP BY k",
     "SELECT t.k, t.s, r.name FROM t JOIN r ON t.k = r.rk",
     "SELECT s, k FROM t WHERE k >= 2 AND v < 4.0",
     "SELECT r.name, count(*) FROM t JOIN r ON t.k = r.rk WHERE t.v > 1.0 GROUP BY r.name",
+    // Every 11th `t.k` is NULL, and a NULL is never `NOT IN` a non-empty
+    // set, so those rows must not come back (#91).
+    NOT_IN_NULL_PROBE,
 ];
 
+/// `NOT IN` over a subquery with no NULLs, probed by a column with NULLs.
+const NOT_IN_NULL_PROBE: &str =
+    "SELECT k, s FROM t WHERE k NOT IN (SELECT rk FROM r WHERE rk IS NOT NULL)";
+/// `NOT IN` over a subquery that contains a NULL: no row can qualify.
+const NOT_IN_NULL_BUILD: &str = "SELECT k, s FROM t WHERE k NOT IN (SELECT rk FROM r)";
+
+/// The `Gpu*Exec` operators the cluster's `EXPLAIN` names for `sql`.
+async fn explained_gpu_operators(session: &OxideSession, sql: &str) -> BTreeSet<String> {
+    let text = rows_of(session, &format!("EXPLAIN {sql}")).await.join("\n");
+    let mut names = BTreeSet::new();
+    for (at, _) in text.match_indices("Gpu") {
+        let name: String = text[at..]
+            .chars()
+            .take_while(char::is_ascii_alphanumeric)
+            .collect();
+        if name.ends_with("Exec") && text[at + name.len()..].starts_with('[') {
+            names.insert(name);
+        }
+    }
+    names
+}
+
+/// The next registration id of the process-wide hub: operators registered
+/// from here on have an id at least this large.
+fn next_operator_id() -> usize {
+    TelemetryHub::global()
+        .snapshot()
+        .operators
+        .iter()
+        .map(|op| op.id + 1)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Asserts that every operator in `names` processed rows after `since`.
+///
+/// The process-wide hub is the witness because nothing but execution writes
+/// to it here: the plan codec attaches it to each `Gpu*Exec` an executor
+/// decodes, an operator registers on its first `execute()`, the scheduler's
+/// plans carry no hub, and embedded sessions own their own (#134).
+fn assert_executed_on_an_executor(since: usize, names: &BTreeSet<String>, sql: &str) {
+    let operators = TelemetryHub::global().snapshot().operators;
+    for name in names {
+        let rows_in: u64 = operators
+            .iter()
+            .filter(|op| op.id >= since && &op.name == name)
+            .map(|op| op.rows_in)
+            .sum();
+        assert!(
+            rows_in > 0,
+            "EXPLAIN shows {name} for `{sql}`, but no executor ran one; \
+             operators since #{since}: {:?}",
+            operators
+                .iter()
+                .filter(|op| op.id >= since)
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+/// The cluster returns embedded mode's rows, and runs the `Gpu*Exec`
+/// operators its `EXPLAIN` shows while doing so (#134).
+///
+/// Rows alone cannot tell a GPU-placed plan from one with no GPU operator in
+/// it, because every `Gpu*Exec` equals the CPU path by construction. Ballista
+/// 55's adaptive planner replaced the placement rules with its own and this
+/// test stayed green, while `EXPLAIN`, planned statically, still showed the
+/// `Gpu*Exec` nodes no executor ran. So each query is also explained on the
+/// cluster, and every operator that names must then have run.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn distributed_results_equal_embedded_results() {
     let dir = tempfile::tempdir().unwrap();
@@ -118,6 +194,13 @@ async fn distributed_results_equal_embedded_results() {
         .await
         .unwrap();
     assert!(matches!(cluster.mode(), SessionMode::Cluster { .. }));
+    // What the client sends agrees with what the scheduler will do.
+    assert!(
+        !cluster
+            .ctx()
+            .copied_config()
+            .ballista_adaptive_query_planner_enabled()
+    );
     cluster.register_parquet("t", &t_path).await.unwrap();
     cluster.register_parquet("r", &r_path).await.unwrap();
 
@@ -125,12 +208,143 @@ async fn distributed_results_equal_embedded_results() {
     embedded.register_parquet("t", &t_path).await.unwrap();
     embedded.register_parquet("r", &r_path).await.unwrap();
 
+    let mut placed = BTreeSet::new();
     for sql in QUERIES {
-        let distributed = sorted_rows(&cluster.sql(sql).await.unwrap().collect().await.unwrap());
-        let local = sorted_rows(&embedded.sql(sql).await.unwrap().collect().await.unwrap());
+        let explained = explained_gpu_operators(&cluster, sql).await;
+        let since = next_operator_id();
+        let distributed = rows_of(&cluster, sql).await;
+        let local = rows_of(&embedded, sql).await;
         assert!(!local.is_empty(), "{sql}");
         assert_eq!(distributed, local, "{sql}");
+        assert_executed_on_an_executor(since, &explained, sql);
+        placed.extend(explained);
     }
+    // The witness is only as good as what `EXPLAIN` claims: a plan that
+    // placed nothing would pass it vacuously too.
+    for name in ["GpuFilterExec", "GpuHashJoinExec", "GpuAggregateExec"] {
+        assert!(placed.contains(name), "no query placed {name}: {placed:?}");
+    }
+}
+
+/// `NOT IN (subquery)` keeps SQL's three-valued semantics on a cluster (#91).
+///
+/// No GPU operator is involved, so the cluster plans for `cpu`. Under
+/// Ballista 54 the cluster session's `prefer_hash_join = false` made
+/// DataFusion plan this as a `SortMergeJoinExec: LeftAnti`, which is not
+/// null-aware: the NULL-key rows of `t` came back, where embedded mode
+/// (stock DataFusion) returns none of them. The second query is the other
+/// half of the semantics: one NULL in the subquery and nothing qualifies.
+///
+/// Two upstream changes each fix it on the 55 chain: DataFusion 55's planner
+/// never gives a null-aware anti join to the merge join, and Ballista 55's
+/// client rewrites `NOT IN` into a plain anti join and a count before one is
+/// needed. This pins the answer, not either mechanism.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn not_in_a_subquery_is_null_aware_on_a_cluster() {
+    let dir = tempfile::tempdir().unwrap();
+    let (t_path, r_path) = write_dataset(dir.path());
+
+    let addr = start_standalone(BackendKind::CpuSimd, 2, 2).await.unwrap();
+    let cluster = OxideSession::connect(&format!("df://{addr}"))
+        .await
+        .unwrap();
+    cluster.register_parquet("t", &t_path).await.unwrap();
+    cluster.register_parquet("r", &r_path).await.unwrap();
+    let embedded = OxideSession::local().unwrap();
+    embedded.register_parquet("t", &t_path).await.unwrap();
+    embedded.register_parquet("r", &r_path).await.unwrap();
+
+    let distributed = rows_of(&cluster, NOT_IN_NULL_PROBE).await;
+    let null_keys = distributed
+        .iter()
+        .filter(|r| r.starts_with("NULL|"))
+        .count();
+    assert_eq!(null_keys, 0, "a NULL key is never NOT IN a non-empty set");
+    let local = rows_of(&embedded, NOT_IN_NULL_PROBE).await;
+    assert!(!local.is_empty());
+    assert_eq!(distributed, local);
+
+    assert_eq!(
+        rows_of(&cluster, NOT_IN_NULL_BUILD).await,
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        rows_of(&embedded, NOT_IN_NULL_BUILD).await,
+        Vec::<String>::new()
+    );
+}
+
+async fn rows_of(session: &OxideSession, sql: &str) -> Vec<String> {
+    sorted_rows(&session.sql(sql).await.unwrap().collect().await.unwrap())
+}
+
+/// One `Int64` column of `rows` values in one row group of one file small
+/// enough to be one scan partition, so the only thing that cuts the scan into
+/// batches is the batch size (the Parquet reader never spans row groups).
+fn write_rows(dir: &Path, rows: i64) -> String {
+    let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from_iter_values(0..rows))],
+    )
+    .unwrap();
+    let path = dir.join("w.parquet");
+    let opts = ParquetWriteOptions {
+        row_group_rows: usize::try_from(rows).unwrap(),
+        compression: Compression::None,
+        ..Default::default()
+    };
+    write_parquet(&path, schema, &[batch], &opts).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+/// The largest batch a cluster session returns for a plain scan of `w`.
+async fn largest_batch(session: &OxideSession, path: &str) -> usize {
+    session.register_parquet("w", path).await.unwrap();
+    let batches = session
+        .sql("SELECT x FROM w")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        20_000
+    );
+    batches.iter().map(RecordBatch::num_rows).max().unwrap()
+}
+
+/// The batch size a client asks for reaches a GPU cluster (#93).
+///
+/// The scheduler's session builder used to put the GPU default (65 536) over
+/// whatever the client sent whenever the cluster's target was a GPU, so
+/// `oxide sql --cluster … --batch-size 7` came back in one batch of every
+/// row. 8192 is DataFusion's own default, which a client asking for exactly
+/// that cannot be told apart from by the value alone — the case a
+/// "default means unset" rule would get wrong.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_batch_size_a_client_asks_for_reaches_a_gpu_cluster() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_rows(dir.path(), 20_000);
+    let addr = start_standalone(BackendKind::Cuda, 2, 2).await.unwrap();
+    let url = format!("df://{addr}");
+
+    for rows in [7, 8_192] {
+        let options = SessionOptions::new().with_batch_size(rows);
+        let session = OxideSession::connect_with_options(&url, &options)
+            .await
+            .unwrap();
+        let largest = largest_batch(&session, &path).await;
+        assert!(
+            largest <= rows,
+            "asked for {rows}-row batches, got {largest}"
+        );
+    }
+
+    // Nobody asked: the GPU default, so all 20 000 rows fit one batch.
+    let session = OxideSession::connect(&url).await.unwrap();
+    assert_eq!(largest_batch(&session, &path).await, 20_000);
 }
 
 /// The plan the scheduler builds for the cluster (its session builder with
@@ -289,17 +503,6 @@ fn binaries_print_help() {
             "{bin}"
         );
     }
-}
-
-/// The next operator id the process-wide hub will hand out.
-fn next_operator_id() -> usize {
-    TelemetryHub::global()
-        .snapshot()
-        .operators
-        .iter()
-        .map(|o| o.id + 1)
-        .max()
-        .unwrap_or(0)
 }
 
 /// How many `name` operators registered on the process-wide hub from id

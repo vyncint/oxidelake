@@ -38,11 +38,15 @@ const VERSION: u8 = 2;
 /// not anybody remembered.
 ///
 /// It folds in the crate version (every release is a new fingerprint, which
-/// is blunt but never wrong) and the compute layer's enabled features (a
-/// planner with `predict` emits plans referencing a UDF an executor without
-/// it cannot resolve — today that fails at execution, which is late and
-/// looks like a query bug rather than a deployment one).
-const FINGERPRINT: u32 = fingerprint();
+/// is blunt but never wrong) and the compute layer's plan-changing features
+/// ([`oxidelake_compute::FEATURE_MASK`]: a planner with `predict` emits plans
+/// referencing a UDF an executor without it cannot resolve).
+///
+/// A cluster compares it twice: a scheduler refuses a worker whose
+/// fingerprint is not its own when the worker registers (#92), so the
+/// mismatch is a deployment error with a name rather than a failed query, and
+/// this codec refuses a payload from another build when it decodes one.
+pub const PLAN_FINGERPRINT: u32 = fingerprint();
 
 const fn fnv1a(mut hash: u32, bytes: &[u8]) -> u32 {
     let mut i = 0;
@@ -63,6 +67,18 @@ const fn fingerprint() -> u32 {
 /// `MAGIC` + version byte + fingerprint.
 const HEADER: usize = MAGIC.len() + 1 + 4;
 
+/// This build in the terms its fingerprint is made of, for a message that
+/// has to say which of two builds is which: `fingerprint 0x… (oxidelake X,
+/// plan codec vN, feature mask 0x…)`.
+pub fn build_description() -> String {
+    format!(
+        "fingerprint {PLAN_FINGERPRINT:#010x} (oxidelake {}, plan codec v{VERSION}, \
+         feature mask {:#x})",
+        env!("CARGO_PKG_VERSION"),
+        oxidelake_compute::FEATURE_MASK
+    )
+}
+
 /// Refuses a plan this build cannot be trusted to read, before `postcard`
 /// turns it into confident nonsense (#42).
 ///
@@ -75,16 +91,15 @@ fn check_fingerprint(tag: &[u8]) -> Result<()> {
     let mut bytes = [0u8; 4];
     bytes.copy_from_slice(tag);
     let theirs = u32::from_le_bytes(bytes);
-    if theirs == FINGERPRINT {
+    if theirs == PLAN_FINGERPRINT {
         return Ok(());
     }
     Err(DataFusionError::Internal(format!(
         "OxidePhysicalCodec: plan was encoded by a build with fingerprint {theirs:#010x}; \
-         this build is {FINGERPRINT:#010x}. The two ends of the cluster are not the same \
-         version, or were built with different features (oxidelake-compute feature mask \
-         {:#x} here). The plan is refused rather than decoded into parameters that would \
-         only look right.",
-        oxidelake_compute::FEATURE_MASK
+         this build is {}. The two ends of the cluster are not the same version, or \
+         disagree on `predict`. The plan is refused rather than decoded into parameters \
+         that would only look right.",
+        build_description()
     )))
 }
 
@@ -343,7 +358,7 @@ impl PhysicalExtensionCodec for OxidePhysicalCodec {
             Some(gpu) => {
                 buf.extend_from_slice(MAGIC);
                 buf.push(VERSION);
-                buf.extend_from_slice(&FINGERPRINT.to_le_bytes());
+                buf.extend_from_slice(&PLAN_FINGERPRINT.to_le_bytes());
                 let payload = postcard::to_allocvec(&gpu).map_err(|e| {
                     DataFusionError::Internal(format!("OxidePhysicalCodec: encode failed: {e}"))
                 })?;
@@ -372,14 +387,17 @@ mod tests {
             let h = fnv1a(h, &[VERSION]);
             fnv1a(h, &oxidelake_compute::FEATURE_MASK.to_le_bytes())
         };
-        assert_eq!(FINGERPRINT, expected);
+        assert_eq!(PLAN_FINGERPRINT, expected);
 
         // A different crate version and a different feature set each move it.
         let other_version = fnv1a(
             fnv1a(fnv1a(0x811c_9dc5, b"0.0.0-not-this-build"), &[VERSION]),
             &oxidelake_compute::FEATURE_MASK.to_le_bytes(),
         );
-        assert_ne!(FINGERPRINT, other_version, "the crate version is in it");
+        assert_ne!(
+            PLAN_FINGERPRINT, other_version,
+            "the crate version is in it"
+        );
 
         let other_features = fnv1a(
             fnv1a(
@@ -389,7 +407,7 @@ mod tests {
             &(oxidelake_compute::FEATURE_MASK ^ 0b1).to_le_bytes(),
         );
         assert_ne!(
-            FINGERPRINT, other_features,
+            PLAN_FINGERPRINT, other_features,
             "flipping the `predict` bit must move it: that is the mismatch \
              this exists to catch"
         );
@@ -399,17 +417,41 @@ mod tests {
     /// the person reading it is looking at a cluster that half works.
     #[test]
     fn a_foreign_fingerprint_is_refused_and_named() {
-        check_fingerprint(&FINGERPRINT.to_le_bytes()).expect("our own plan decodes");
+        check_fingerprint(&PLAN_FINGERPRINT.to_le_bytes()).expect("our own plan decodes");
 
-        let foreign = FINGERPRINT ^ 0xdead_beef;
+        let foreign = PLAN_FINGERPRINT ^ 0xdead_beef;
         let err = check_fingerprint(&foreign.to_le_bytes())
             .expect_err("a plan from another build is refused");
         let text = err.to_string();
         assert!(text.contains(&format!("{foreign:#010x}")), "{text}");
-        assert!(text.contains(&format!("{FINGERPRINT:#010x}")), "{text}");
         assert!(
-            text.contains("not the same version") && text.contains("different features"),
+            text.contains(&format!("{PLAN_FINGERPRINT:#010x}")),
+            "{text}"
+        );
+        assert!(
+            text.contains("not the same version") && text.contains("`predict`"),
             "the message says which two things could differ: {text}"
+        );
+        assert!(text.contains(&build_description()), "{text}");
+    }
+
+    /// The description names every input of the fingerprint, so two builds'
+    /// descriptions side by side say which input differs (#92).
+    #[test]
+    fn the_build_description_names_what_the_fingerprint_is_made_of() {
+        let text = build_description();
+        assert!(
+            text.contains(&format!("{PLAN_FINGERPRINT:#010x}")),
+            "{text}"
+        );
+        assert!(text.contains(env!("CARGO_PKG_VERSION")), "{text}");
+        assert!(text.contains(&format!("plan codec v{VERSION}")), "{text}");
+        assert!(
+            text.contains(&format!(
+                "feature mask {:#x}",
+                oxidelake_compute::FEATURE_MASK
+            )),
+            "{text}"
         );
     }
 
@@ -421,7 +463,7 @@ mod tests {
         let mut buf = Vec::new();
         buf.extend_from_slice(MAGIC);
         buf.push(VERSION);
-        buf.extend_from_slice(&FINGERPRINT.to_le_bytes());
+        buf.extend_from_slice(&PLAN_FINGERPRINT.to_le_bytes());
         assert_eq!(buf.len(), HEADER);
         assert_eq!(&buf[..MAGIC.len()], MAGIC);
         assert_eq!(buf[MAGIC.len()], VERSION);

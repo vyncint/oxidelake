@@ -52,6 +52,7 @@ ballista.workspace = true
 ballista-core.workspace = true
 ballista-scheduler.workspace = true
 ballista-executor.workspace = true
+async-trait.workspace = true
 tokio.workspace = true
 clap.workspace = true
 anyhow.workspace = true

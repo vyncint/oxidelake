@@ -129,6 +129,8 @@ OXIDE_CLUSTER_BACKEND=cuda ./target/release/oxide-scheduler --port 50050 &
 
 The end-to-end test in `crates/oxidelake-runtime/tests/cli.rs` spawns exactly this topology on ephemeral ports and asserts the cluster output is byte-identical to embedded mode.
 
+A scheduler admits only workers of its own build: the same OxideLake release, built with `predict` if and only if the scheduler is. `cuda` and `metal` do not count, so a default-build scheduler with `--features cuda` workers is a supported cluster. A worker of another build is refused when it registers and exits non-zero naming both builds, and a query sent to a cluster whose workers were all refused fails at once with the same reason. The check guards against a mismatched deployment, not against an attacker: a worker declares its own build ([SECURITY.md](SECURITY.md)).
+
 ### DataFrame API
 
 ```rust
@@ -182,7 +184,7 @@ error, never a silent fallback.
 | `--table`, `-t` | `sql`, `explain`, `tui` | — | Registers `NAME=PATH` (a Parquet file or directory) before planning. Repeatable. |
 | `--cluster` | `sql` | — | Runs on a Ballista scheduler (`df://host:port`) instead of in-process. |
 | `--target` | `sql`, `explain`, `tui` | detected | Plans for `cpu`, `cuda` or `metal`. Placement only: execution uses the hardware that is present. Embedded mode only — on a cluster the scheduler decides. |
-| `--batch-size` | `sql`, `explain`, `tui` | 8192, or 65536 on a GPU target | Rows per record batch. Batch boundaries never change results; larger batches amortise the host↔device round trip. `0` is refused. |
+| `--batch-size` | `sql`, `explain`, `tui` | 8192, or 65536 on a GPU target | Rows per record batch. Batch boundaries never change results; larger batches amortise the host↔device round trip. `0` is refused. With `--cluster` the GPU default is the scheduler's call (its target), and a size given here is kept. |
 | `--output` | `sql` | `table` | `table`, `json` (an array of objects) or `csv` (RFC 4180 with a header). An empty result still prints the CSV header and `[]`, so a script can tell "no rows" from "the query failed". |
 | `--rows` | `gen-data` | `1000000` | Rows in the demo table. |
 | `--out` | `gen-data` | — | Output directory; writes `<out>/t.parquet`. |
