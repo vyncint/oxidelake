@@ -429,9 +429,8 @@ fn parse_csv(stdout: &str) -> BTreeMap<Option<i64>, i64> {
         .collect()
 }
 
-/// `k -> n` parsed out of the JSON form. A null `k` is *absent* from the
-/// object rather than `null`, which is arrow-json's encoding and is why this
-/// reads the key rather than expecting it.
+/// `k -> n` parsed out of the JSON form, where a NULL `k` is `null`: every
+/// object carries every column (#124).
 fn parse_json(stdout: &str) -> BTreeMap<Option<i64>, i64> {
     let trimmed = stdout.trim();
     let inner = trimmed
@@ -445,16 +444,24 @@ fn parse_json(stdout: &str) -> BTreeMap<Option<i64>, i64> {
         .split("},{")
         .map(|object| {
             let object = object.trim_matches(['{', '}']);
+            // A missing `k` fails here rather than reading as a NULL: the
+            // demo table's NULL keys group into a row whose key must be there.
             let mut row = (None, None);
             for field in object.split(',') {
                 let (name, value) = field.split_once(':').unwrap();
                 match name.trim_matches('"') {
-                    "k" => row.0 = Some(value.parse::<i64>().unwrap()),
+                    "k" => {
+                        row.0 = Some((value != "null").then(|| value.parse::<i64>().unwrap()));
+                    }
                     "n" => row.1 = Some(value.parse::<i64>().unwrap()),
                     other => panic!("unexpected field {other}"),
                 }
             }
-            (row.0, row.1.expect("every row has a count"))
+            (
+                row.0
+                    .unwrap_or_else(|| panic!("a row without its `k` key: {{{object}}}")),
+                row.1.expect("every row has a count"),
+            )
         })
         .collect()
 }
@@ -522,6 +529,25 @@ fn an_empty_result_keeps_its_csv_header_and_json_array() {
     };
     assert_eq!(run("csv"), "k,n\n");
     assert_eq!(run("json"), "[]\n");
+}
+
+/// The issue's own command (#124): `v` is NULL and keeps its key, and `n` is
+/// NaN, which JSON has no number for and which used to be written as the
+/// `null` that a NULL is written as.
+#[test]
+fn json_output_keeps_null_keys_and_tells_nan_from_null() {
+    let assert = oxide()
+        .args([
+            "sql",
+            "-q",
+            "SELECT 1 AS k, CAST(NULL AS DOUBLE) AS v, CAST('NaN' AS DOUBLE) AS n",
+            "--output",
+            "json",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert_eq!(stdout, "[{\"k\":1,\"v\":null,\"n\":\"NaN\"}]\n");
 }
 
 /// Zero rows per batch would be accepted by DataFusion and then return
@@ -593,6 +619,14 @@ fn the_flags_appear_in_help() {
     let help = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
     for flag in ["--batch-size", "--output", "--target", "--cluster"] {
         assert!(help.contains(flag), "oxide sql --help lacks {flag}\n{help}");
+    }
+    // What `--output json` writes for a NULL and a NaN is a contract a script
+    // depends on, so the flag's help states it (#124).
+    for encoding in ["null", "\"NaN\"", "\"Infinity\"", "\"-Infinity\""] {
+        assert!(
+            help.contains(encoding),
+            "oxide sql --help does not say how json writes {encoding}\n{help}"
+        );
     }
 
     let assert = Command::cargo_bin("oxide-worker")

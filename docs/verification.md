@@ -179,7 +179,7 @@ OXIDE_BACKEND=cuda cargo test -p oxidelake-compute --features cuda -- --ignored
 | Distributed equivalence | `oxidelake-runtime/tests` | in-process Ballista scheduler + 2 executors on ephemeral ports; `Gpu*Exec` nodes through the codec |
 | Embedded GPU-target equivalence | `oxidelake-runtime/tests/embedded.rs` | the same queries under cpu/cuda/metal placement targets return identical rows (multi-partition plans included) |
 | SQL UDFs | `oxidelake-compute/src/udf.rs` | `l2_distance` / `cosine_distance` against the reference kernels, null and coercion cases |
-| DataFrame API | `oxidelake-api/tests/dataframe.rs` | every verb against its SQL equivalent; GPU-target plans show `Gpu*Exec` for fluent pipelines |
+| DataFrame API | `oxidelake-api/tests/dataframe.rs`, `show_closed_pipe.rs` | every verb against its SQL equivalent; GPU-target plans show `Gpu*Exec` for fluent pipelines; `show` run in a child process, whole and into a closed pipe (in a binary of its own, so no other test forks while the pipe is open) |
 | TUI in-process | `oxidelake-tui/tests/tui_render_test.rs` | `ratatui::backend::TestBackend` + `insta` |
 | TUI end-to-end | `oxidelake-tui/tests/tui_pty_test.rs` | `termlens` driving `oxidelake-tui-demo` in a real PTY: three text snapshots, one styled, and the focus/backend colours as cell assertions |
 | TUI emulator invariants | `oxidelake-tui/tests/emulation.rs` | `Screen::unsupported()` pinned exactly, no terminal mode left set, snapshot-text and JSON round trips |

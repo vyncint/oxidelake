@@ -86,6 +86,18 @@ versions (0.x) may contain breaking changes; they are always listed under a
   come back in build order, as the CPU reference returns them. Not yet run
   on a GPU (STATUS.md).
 
+- **`oxide sql --output json` keeps the key of a NULL and tells NaN from
+  NULL** (#124). Every object now carries every column, a NULL as `null`;
+  the key used to be left out, so a script could not tell a NULL from a
+  column that does not exist. NaN, infinity and negative infinity, which
+  JSON has no number for, are the strings `"NaN"`, `"Infinity"` and
+  `"-Infinity"` in every float type, inside lists, structs and
+  dictionaries too; all three used to be written `null`, like a NULL. A
+  script that took a missing key for NULL reads `null` instead, and one
+  that reads a float column accepts the three strings, which Python's
+  `float()` and JavaScript's `Number()` read back. `--help` and the README
+  say so.
+
 ### Fixed
 
 - **A LIMIT over a GPU-placed filter or join returns its row count again**
@@ -504,6 +516,15 @@ versions (0.x) may contain breaking changes; they are always listed under a
   partition; `rows_in` and `rows_out` are unchanged. New public pieces:
   `GpuOperator::aggregate_into` and
   `oxidelake_device::cpu::kernels::GroupedAggregator`.
+
+
+- **`OxideFrame::show()` no longer panics when stdout closes** (#125). It
+  was DataFusion's `DataFrame::show`, whose `println!` panics on a closed
+  pipe, so a program showing a frame into `… | head -1` died with `failed
+  printing to stdout: Broken pipe`: the crash #34 fixed in `oxide sql` and
+  left in the library. `show` now writes the same table itself, and a
+  reader that has gone is a clean stop that returns `Ok`, as `oxide sql`
+  exits 0 there; any other write failure is an `EngineError::Io`.
 
 ### Fixed
 

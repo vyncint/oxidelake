@@ -185,7 +185,7 @@ error, never a silent fallback.
 | `--cluster` | `sql` | — | Runs on a Ballista scheduler (`df://host:port`) instead of in-process. |
 | `--target` | `sql`, `explain`, `tui` | detected | Plans for `cpu`, `cuda` or `metal`. Placement only: execution uses the hardware that is present. Embedded mode only — on a cluster the scheduler decides. |
 | `--batch-size` | `sql`, `explain`, `tui` | 8192, or 65536 on a GPU target | Rows per record batch. Batch boundaries never change results; larger batches amortise the host↔device round trip. `0` is refused. With `--cluster` the GPU default is the scheduler's call (its target), and a size given here is kept. |
-| `--output` | `sql` | `table` | `table`, `json` (an array of objects) or `csv` (RFC 4180 with a header). An empty result still prints the CSV header and `[]`, so a script can tell "no rows" from "the query failed". |
+| `--output` | `sql` | `table` | `table`, `json` (an array of objects, one per row, each carrying every column) or `csv` (RFC 4180 with a header). In `json` a NULL is `null`, and NaN, infinity and negative infinity, which JSON has no number for, are the strings `"NaN"`, `"Infinity"` and `"-Infinity"`, which Python's `float()` and JavaScript's `Number()` read back. An empty result still prints the CSV header and `[]`, so a script can tell "no rows" from "the query failed". |
 | `--rows` | `gen-data` | `1000000` | Rows in the demo table. |
 | `--out` | `gen-data` | — | Output directory; writes `<out>/t.parquet`. |
 | `--seed` | `gen-data` | `42` | PRNG seed. The same seed always writes the same bytes. |
