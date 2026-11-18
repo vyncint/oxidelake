@@ -189,12 +189,36 @@ impl Drop for ClusterGuard {
     }
 }
 
+/// A port on 127.0.0.1 that nothing listens on, for a process this test is
+/// about to start.
+///
+/// Not port 0's choice: the kernel hands out source ports for outgoing
+/// connections from that same range (`ip_local_port_range`, 32768-60999 on
+/// Linux, 49152 and up on macOS), so a port taken from there and released
+/// was at times reused by some connection on a busy machine before the
+/// worker meant to bind it had started, and the worker died with "Address
+/// already in use" (twice under `make test`, 2026-11-18). Below that range
+/// no one hands ports out but this function, which gives each call in this
+/// binary a different one, from an offset in the process id so that two
+/// test binaries running at once seldom meet, and checks it is free.
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    use std::sync::atomic::{AtomicU32, Ordering};
+    const LOW: u32 = 20_000;
+    const SPAN: u32 = 12_000;
+    static NEXT: AtomicU32 = AtomicU32::new(u32::MAX);
+    let _ = NEXT.compare_exchange(
+        u32::MAX,
+        std::process::id() % SPAN,
+        Ordering::SeqCst,
+        Ordering::SeqCst,
+    );
+    for _ in 0..SPAN {
+        let port = u16::try_from(LOW + NEXT.fetch_add(1, Ordering::SeqCst) % SPAN).unwrap();
+        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+    panic!("no free port in {LOW}..{}", LOW + SPAN)
 }
 
 fn wait_for_port(port: u16, what: &str) {
