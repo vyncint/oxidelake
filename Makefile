@@ -120,10 +120,14 @@ test-metal: ## Metal package tests and macOS PTY tests with one dependency graph
 # named with the prefix for exactly this. `--skip mixed_build` likewise: those
 # #[ignore]d cli tests need the other-build workers that only
 # `make test-mixed-build` builds (it runs them in CI), and fail loudly without
-# them. The conformance suite is what this target is for.
+# them. `--skip a_query_that_loses_a_worker_comes_back` too: that #[ignore]d
+# cli test is the reproduction of Ballista 55's lost-worker rollback (#148),
+# kept to show the bug is still there, so it is expected to fail until a
+# Ballista release carries the fix. The conformance suite is what this
+# target is for.
 test-metal-device: ## reuse the Metal test graph for on-device conformance
 	@if swift -e 'import Metal; exit(MTLCreateSystemDefaultDevice() == nil ? 1 : 0)' 2>/dev/null; then \
-	  OXIDE_BACKEND=metal $(CARGO) test $(METAL_TEST_ARGS) -- --ignored --skip termlens_cli --skip mixed_build; \
+	  OXIDE_BACKEND=metal $(CARGO) test $(METAL_TEST_ARGS) -- --ignored --skip termlens_cli --skip mixed_build --skip a_query_that_loses_a_worker_comes_back; \
 	else \
 	  echo "No Metal device on this runner — on-device conformance skipped."; \
 	fi
