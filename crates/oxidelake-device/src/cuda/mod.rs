@@ -3,16 +3,23 @@
 //! Built on cudarc's driver API in **dynamic-loading** mode: `libcuda` and
 //! `libnvrtc` are `dlopen`ed at runtime, so this module compiles on machines
 //! without a CUDA installation. cudarc *panics* if a symbol is requested while
-//! the library is absent, so nothing here touches the driver before
-//! [`CudaBackend::driver_present`] has confirmed it can be loaded; without a
-//! driver every constructor returns a typed error instead.
+//! its library is absent, so nothing here touches the driver before
+//! [`CudaBackend::driver_present`] has confirmed it can be loaded, nor NVRTC
+//! before [`CudaBackend::nvrtc_present`]; without either, every constructor
+//! returns a typed error instead and [`CudaBackend::is_available`] is `false`.
+//! The two are separate on purpose: NVRTC ships with the CUDA toolkit, not
+//! with the driver, so a driver-only host — or a container that has `libcuda`
+//! injected and nothing else — has a working driver and no way to compile a
+//! kernel (#106).
 //!
 //! Kernels are CUDA C sources (`kernels/cuda/*.cu`, embedded with
 //! `include_str!`) compiled with NVRTC on first use and cached per backend
-//! (see [`CudaBackend::function`]). The operator entry points live in [`ops`]
-//! and orchestrate the launches on the caller's stream; anything outside the
-//! bounded v1 coverage returns [`EngineError::Unsupported`] so `Gpu*Exec`
-//! takes the CPU reference path.
+//! (see [`CudaBackend::function`]), for the device's own architecture
+//! ([`CudaBackend::nvrtc_arch`]); a device below compute capability 7.0 is
+//! refused. The operator entry points live in [`ops`] and orchestrate the
+//! launches on the caller's stream; anything outside the bounded v1
+//! coverage returns [`EngineError::Unsupported`] so `Gpu*Exec` takes the CPU
+//! reference path.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -21,8 +28,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 use arrow::array::RecordBatch;
 use arrow::buffer::Buffer;
 use arrow::datatypes::DataType;
+use cudarc::driver::sys::CUdevice_attribute;
 use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DriverError};
-use cudarc::nvrtc::compile_ptx;
+use cudarc::nvrtc::result::NvrtcError;
+use cudarc::nvrtc::{CompileOptions, compile_ptx_with_opts};
 use oxidelake_core::{BackendKind, DeviceId, EngineError};
 use oxidelake_memory::HostAlloc;
 use oxidelake_memory::pinned::CudaPinnedProvider;
@@ -54,6 +63,135 @@ pub(crate) fn foreign(what: &str, backend: BackendKind) -> EngineError {
 
 fn to_u64(n: usize) -> u64 {
     u64::try_from(n).unwrap_or(u64::MAX)
+}
+
+const NO_DRIVER: &str = "libcuda could not be loaded: no NVIDIA driver on this machine";
+
+const NO_NVRTC: &str = "libnvrtc could not be loaded: the NVIDIA driver is installed, but the \
+     CUDA kernels are compiled at run time with NVRTC, which ships with the CUDA toolkit rather \
+     than the driver; install it (the cuda-nvrtc package) or put its directory on LD_LIBRARY_PATH";
+
+/// Lowest architecture the kernels may be compiled for, numbered as NVRTC
+/// numbers them (`70` is `compute_70`). `aggregation.cu`'s slot claim spins
+/// on a word another lane of the same warp may hold, which only makes
+/// progress under independent thread scheduling: Volta (7.0) and later, and
+/// only in code compiled for `compute_70` or later — PTX for an older target
+/// runs in lockstep even on a newer GPU. Below that, CUDA 12.x NVRTC's
+/// default (`compute_52`) also lacks the kernel's `atomicAdd(double*)`, so
+/// every aggregate failed to compile there (#107).
+const MIN_ARCH: i32 = 70;
+
+/// What [`CudaBackend::probe`] found for one device.
+#[derive(Debug, Clone, Copy)]
+struct Target {
+    /// The device's compute capability, `(major, minor)`.
+    capability: (i32, i32),
+    /// The NVRTC version, `(major, minor)`.
+    nvrtc: (i32, i32),
+    /// The architecture the kernels are compiled for (see [`nvrtc_arch`]).
+    arch: i32,
+}
+
+fn nvrtc_error(what: &str, err: NvrtcError) -> EngineError {
+    EngineError::device(BackendKind::Cuda, format!("{what}: {err:?}"))
+}
+
+/// The compute capability of device `ordinal`, read without a context.
+/// Requires `cuInit`, which `CudaContext::device_count` has made.
+fn compute_capability(ordinal: usize) -> Result<(i32, i32), EngineError> {
+    let ordinal = i32::try_from(ordinal)
+        .map_err(|_| EngineError::device(BackendKind::Cuda, "device ordinal out of range"))?;
+    let device = cudarc::driver::result::device::get(ordinal).map_err(driver_error)?;
+    let attribute = |attribute| {
+        // SAFETY: `device` was returned by `cuDeviceGet` just above, which is
+        // all `cuDeviceGetAttribute` requires of it.
+        unsafe { cudarc::driver::result::device::get_attribute(device, attribute) }
+            .map_err(driver_error)
+    };
+    Ok((
+        attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?,
+        attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)?,
+    ))
+}
+
+/// The NVRTC version. Call only after [`CudaBackend::nvrtc_present`].
+fn nvrtc_version() -> Result<(i32, i32), EngineError> {
+    let (mut major, mut minor) = (0, 0);
+    // SAFETY: NVRTC is present (checked by the caller), so cudarc's loader
+    // finds it; `nvrtcVersion` exists in every NVRTC and writes two ints.
+    unsafe { cudarc::nvrtc::sys::nvrtcVersion(&mut major, &mut minor) }
+        .result()
+        .map_err(|e| nvrtc_error("nvrtcVersion failed", e))?;
+    Ok((major, minor))
+}
+
+/// The architectures this NVRTC compiles for, numbered as [`MIN_ARCH`] is.
+fn nvrtc_supported_archs((major, minor): (i32, i32)) -> Result<Vec<i32>, EngineError> {
+    // Both queries arrived in NVRTC 11.2; cudarc resolves symbols lazily and
+    // panics on a missing one, so an older library is refused by version.
+    if (major, minor) < (11, 2) {
+        return Err(EngineError::device(
+            BackendKind::Cuda,
+            format!("NVRTC {major}.{minor} is too old: OxideLake needs NVRTC 11.2 or newer"),
+        ));
+    }
+    let mut count = 0;
+    // SAFETY: NVRTC 11.2+ (checked above) has the function; it writes one int.
+    unsafe { cudarc::nvrtc::sys::nvrtcGetNumSupportedArchs(&mut count) }
+        .result()
+        .map_err(|e| nvrtc_error("nvrtcGetNumSupportedArchs failed", e))?;
+    let mut archs = vec![0; usize::try_from(count).unwrap_or(0)];
+    if !archs.is_empty() {
+        // SAFETY: as above; `archs` has room for exactly the `count` ints
+        // the call writes.
+        unsafe { cudarc::nvrtc::sys::nvrtcGetSupportedArchs(archs.as_mut_ptr()) }
+            .result()
+            .map_err(|e| nvrtc_error("nvrtcGetSupportedArchs failed", e))?;
+    }
+    Ok(archs)
+}
+
+/// The architecture kernels for a device of compute capability `capability`
+/// are compiled for, given what this NVRTC `supported`: the device's own, or
+/// else the newest older one NVRTC knows. PTX for `compute_XY` runs on any
+/// device of capability X.Y or newer (the driver compiles it on load), so a
+/// GPU newer than its NVRTC still runs; one below 7.0 does not (#107).
+fn nvrtc_arch(
+    (major, minor): (i32, i32),
+    (nvrtc_major, nvrtc_minor): (i32, i32),
+    supported: &[i32],
+) -> Result<i32, EngineError> {
+    let device = major * 10 + minor;
+    if device < MIN_ARCH {
+        return Err(EngineError::device(
+            BackendKind::Cuda,
+            format!(
+                "the GPU has compute capability {major}.{minor}; OxideLake's CUDA kernels need \
+                 7.0 (Volta) or newer, because the aggregation kernel relies on independent \
+                 thread scheduling"
+            ),
+        ));
+    }
+    supported
+        .iter()
+        .copied()
+        .filter(|arch| (MIN_ARCH..=device).contains(arch))
+        .max()
+        .ok_or_else(|| {
+            let range = match (supported.iter().min(), supported.iter().max()) {
+                (Some(lo), Some(hi)) => format!("compute_{lo} to compute_{hi}"),
+                _ => "no architecture at all".to_owned(),
+            };
+            EngineError::device(
+                BackendKind::Cuda,
+                format!(
+                    "NVRTC {nvrtc_major}.{nvrtc_minor} cannot compile for this GPU (compute \
+                     capability {major}.{minor}): it targets {range}, and the kernels need one \
+                     between compute_{MIN_ARCH} and compute_{device}; install an NVRTC that \
+                     still supports this GPU"
+                ),
+            )
+        })
 }
 
 /// One column resident in device memory: packed values plus optional validity bitmap.
@@ -114,6 +252,8 @@ pub struct CudaBackend {
     /// Resolved kernel entry points, keyed by `(module, entry)`, so a launch
     /// does not pay a `cuModuleGetFunction` lookup per batch.
     functions: Mutex<HashMap<(String, String), CudaFunction>>,
+    /// `compute_XY`, the `--gpu-architecture` every module is compiled for.
+    nvrtc_arch: String,
 }
 
 impl CudaBackend {
@@ -122,6 +262,16 @@ impl CudaBackend {
         // SAFETY: `is_culib_present` only attempts to `dlopen` the driver
         // library; it issues no CUDA calls and has no preconditions.
         unsafe { cudarc::driver::sys::is_culib_present() }
+    }
+
+    /// `true` when `libnvrtc` can be loaded. Performs no NVRTC call.
+    ///
+    /// The kernels are compiled with NVRTC on first use, so a backend without
+    /// it would fail — inside cudarc, with a panic — on its first query.
+    pub fn nvrtc_present() -> bool {
+        // SAFETY: `is_culib_present` only attempts to `dlopen` the NVRTC
+        // library; it issues no NVRTC calls and has no preconditions.
+        unsafe { cudarc::nvrtc::sys::is_culib_present() }
     }
 
     /// Number of CUDA devices, or zero when the driver is absent or fails.
@@ -135,20 +285,73 @@ impl CudaBackend {
             .unwrap_or(0)
     }
 
-    /// `true` when at least one device can be used.
+    /// Checks, without creating a context, that device `ordinal` has what the
+    /// backend needs: a driver, NVRTC, the device itself, a compute
+    /// capability of at least 7.0 and an NVRTC that can compile for it. The
+    /// error says which is missing; [`Self::new`] runs the same checks first,
+    /// and the detector reports this error when it passes CUDA over.
+    pub fn probe(ordinal: usize) -> Result<(), EngineError> {
+        Self::target(ordinal).map(|_| ())
+    }
+
+    fn target(ordinal: usize) -> Result<Target, EngineError> {
+        if !Self::driver_present() {
+            return Err(EngineError::device(BackendKind::Cuda, NO_DRIVER));
+        }
+        // Before any NVRTC symbol is touched: cudarc resolves them lazily and
+        // panics when the library is missing (#106).
+        if !Self::nvrtc_present() {
+            return Err(EngineError::device(BackendKind::Cuda, NO_NVRTC));
+        }
+        let count = CudaContext::device_count().map_err(|e| {
+            EngineError::device(
+                BackendKind::Cuda,
+                format!("the NVIDIA driver could not be initialised: {e}"),
+            )
+        })?;
+        match usize::try_from(count) {
+            Ok(n) if ordinal < n => {}
+            Ok(0) | Err(_) => {
+                return Err(EngineError::device(
+                    BackendKind::Cuda,
+                    "the NVIDIA driver is installed but reports no CUDA device",
+                ));
+            }
+            Ok(n) => {
+                return Err(EngineError::device(
+                    BackendKind::Cuda,
+                    format!("CUDA device {ordinal} does not exist: the driver reports {n}"),
+                ));
+            }
+        }
+        let capability = compute_capability(ordinal)?;
+        let nvrtc = nvrtc_version()?;
+        let arch = nvrtc_arch(capability, nvrtc, &nvrtc_supported_archs(nvrtc)?)?;
+        Ok(Target {
+            capability,
+            nvrtc,
+            arch,
+        })
+    }
+
+    /// `true` when device 0 can be used: [`Self::probe`] finds everything the
+    /// backend needs, NVRTC included.
     pub fn is_available() -> bool {
-        Self::device_count() > 0
+        Self::probe(0).is_ok()
     }
 
     /// Opens device `ordinal`.
     pub fn new(ordinal: usize) -> Result<Self, EngineError> {
-        if !Self::driver_present() {
-            return Err(EngineError::device(
-                BackendKind::Cuda,
-                "libcuda could not be loaded: no NVIDIA driver on this machine",
-            ));
-        }
+        let target = Self::target(ordinal)?;
         let ctx = CudaContext::new(ordinal).map_err(driver_error)?;
+        let nvrtc_arch = format!("compute_{}", target.arch);
+        tracing::info!(
+            device = ordinal,
+            compute_capability = %format_args!("{}.{}", target.capability.0, target.capability.1),
+            nvrtc = %format_args!("{}.{}", target.nvrtc.0, target.nvrtc.1),
+            arch = %nvrtc_arch,
+            "CUDA backend ready"
+        );
         let ordinal = u32::try_from(ordinal)
             .map_err(|_| EngineError::device(BackendKind::Cuda, "device ordinal out of range"))?;
         Ok(Self {
@@ -157,6 +360,7 @@ impl CudaBackend {
             ctx,
             modules: Mutex::new(HashMap::new()),
             functions: Mutex::new(HashMap::new()),
+            nvrtc_arch,
         })
     }
 
@@ -165,16 +369,31 @@ impl CudaBackend {
         &self.ctx
     }
 
+    /// The architecture every kernel module is compiled for (`compute_75` on
+    /// a T4): the device's own, or the newest older one this NVRTC supports.
+    /// Without it NVRTC picked its own default — `compute_52` for CUDA 12.x —
+    /// where the aggregation kernel does not compile (#107).
+    pub fn nvrtc_arch(&self) -> &str {
+        &self.nvrtc_arch
+    }
+
     /// Compiles `source` with NVRTC (once per `name`) and loads it as a module.
     pub fn module(&self, name: &str, source: &str) -> Result<Arc<CudaModule>, EngineError> {
         let mut cache = self.modules.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(module) = cache.get(name) {
             return Ok(Arc::clone(module));
         }
-        let ptx = compile_ptx(source).map_err(|e| {
+        let options = CompileOptions {
+            options: vec![format!("--gpu-architecture={}", self.nvrtc_arch)],
+            ..CompileOptions::default()
+        };
+        let ptx = compile_ptx_with_opts(source, options).map_err(|e| {
             EngineError::device(
                 BackendKind::Cuda,
-                format!("NVRTC failed to compile kernel module '{name}': {e:?}"),
+                format!(
+                    "NVRTC failed to compile kernel module '{name}' for {}: {e:?}",
+                    self.nvrtc_arch
+                ),
             )
         })?;
         let module = self.ctx.load_module(ptx).map_err(driver_error)?;
@@ -283,6 +502,7 @@ impl fmt::Debug for CudaBackend {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CudaBackend")
             .field("device_id", &self.device_id)
+            .field("nvrtc_arch", &self.nvrtc_arch)
             .field(
                 "modules",
                 &self
@@ -537,6 +757,106 @@ mod tests {
                 ),
                 "{err}"
             );
+        }
+    }
+
+    /// Lists of the shape `nvrtcGetSupportedArchs` returns. The 13.3 one is
+    /// measured (`nvcc --list-gpu-arch` of the CUDA 13.3 toolkit; 13.0
+    /// dropped everything below Turing); the 12.x one is illustrative — a
+    /// 12.x NVRTC spans `compute_50` to the newest it knows.
+    const NVRTC_12_8: [i32; 17] = [
+        50, 52, 53, 60, 61, 62, 70, 72, 75, 80, 86, 87, 89, 90, 100, 101, 120,
+    ];
+    const NVRTC_13_3: [i32; 12] = [75, 80, 86, 87, 88, 89, 90, 100, 103, 110, 120, 121];
+
+    /// #107: NVRTC used to compile for its own default — `compute_52` under
+    /// CUDA 12.x, where `aggregation.cu`'s `atomicAdd(double*)` does not
+    /// exist. Now it compiles for the device.
+    #[test]
+    fn kernels_compile_for_the_devices_own_architecture() {
+        assert_eq!(nvrtc_arch((7, 5), (12, 8), &NVRTC_12_8).unwrap(), 75); // T4
+        assert_eq!(nvrtc_arch((7, 0), (12, 8), &NVRTC_12_8).unwrap(), 70); // V100
+        assert_eq!(nvrtc_arch((8, 6), (13, 3), &NVRTC_13_3).unwrap(), 86);
+        assert_eq!(nvrtc_arch((12, 0), (12, 8), &NVRTC_12_8).unwrap(), 120);
+    }
+
+    /// PTX for an older architecture runs on a newer device, so a GPU newer
+    /// than its NVRTC compiles for the newest architecture NVRTC knows rather
+    /// than being refused — which naming the device's own would have done.
+    #[test]
+    fn a_gpu_newer_than_its_nvrtc_gets_the_newest_architecture_nvrtc_knows() {
+        let nvrtc_12_4 = &NVRTC_12_8[..14]; // up to compute_90
+        assert_eq!(nvrtc_arch((12, 0), (12, 4), nvrtc_12_4).unwrap(), 90);
+        assert_eq!(nvrtc_arch((8, 9), (12, 8), &[70, 75, 80, 86]).unwrap(), 86);
+    }
+
+    #[test]
+    fn a_gpu_below_volta_is_refused() {
+        for (major, minor) in [(6, 1), (6, 0), (5, 2), (0, 0)] {
+            let err = nvrtc_arch((major, minor), (12, 8), &NVRTC_12_8).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    EngineError::Device {
+                        backend: BackendKind::Cuda,
+                        ..
+                    }
+                ),
+                "{err}"
+            );
+            let message = err.to_string();
+            assert!(
+                message.contains(&format!("compute capability {major}.{minor}")),
+                "{message}"
+            );
+            assert!(message.contains("7.0"), "{message}");
+        }
+    }
+
+    /// CUDA 13 cannot target Volta, so a V100 needs an older NVRTC; the
+    /// error says which NVRTC it found and what that one targets.
+    #[test]
+    fn an_nvrtc_that_cannot_target_the_gpu_is_named() {
+        let message = nvrtc_arch((7, 0), (13, 3), &NVRTC_13_3)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("NVRTC 13.3"), "{message}");
+        assert!(message.contains("compute_75 to compute_121"), "{message}");
+        let message = nvrtc_arch((7, 5), (12, 8), &[]).unwrap_err().to_string();
+        assert!(message.contains("no architecture"), "{message}");
+        // Compiling a Turing GPU's kernels for compute_61 would compile, and
+        // run the slot-claim spin-wait in lockstep: a hang, not an error.
+        assert!(nvrtc_arch((7, 5), (11, 0), &[52, 60, 61]).is_err());
+    }
+
+    /// #107 on hardware: every kernel module compiles for the device. Run it
+    /// once with a CUDA 12.x NVRTC first on `LD_LIBRARY_PATH` (whose default
+    /// target, `compute_52`, failed `aggregation.cu` before the fix) and
+    /// once with the 13.x one.
+    #[test]
+    #[ignore = "requires an NVIDIA GPU and driver"]
+    fn every_kernel_module_compiles_for_the_device_architecture() {
+        let backend = CudaBackend::new(0).unwrap();
+        let (major, minor) = backend.context().compute_capability().unwrap();
+        let arch: i32 = backend
+            .nvrtc_arch()
+            .strip_prefix("compute_")
+            .and_then(|n| n.parse().ok())
+            .unwrap();
+        assert!(
+            (MIN_ARCH..=major * 10 + minor).contains(&arch),
+            "{} for a {major}.{minor} device",
+            backend.nvrtc_arch()
+        );
+        for (name, source) in [
+            ("filter_project", ops::FILTER_PROJECT_SRC),
+            ("hash_join", ops::HASH_JOIN_SRC),
+            ("aggregation", ops::AGGREGATION_SRC),
+            ("vector_distance", ops::VECTOR_DISTANCE_SRC),
+        ] {
+            if let Err(e) = backend.module(name, source) {
+                panic!("{name} does not compile for {}: {e}", backend.nvrtc_arch());
+            }
         }
     }
 

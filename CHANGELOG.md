@@ -159,6 +159,42 @@ versions (0.x) may contain breaking changes; they are always listed under a
   `hash_join_gather`, the reference for gathering a range of a probe's
   matches.
 
+- `BufferLayout::padded_len` returns `Option<usize>`: `None` when rounding
+  the length up to the alignment overflows (#104). Where a `usize` was used,
+  handle the `None`; a layout built through `BufferLayout::new` always has
+  `Some`, since `new` now refuses those lengths up front.
+
+### Fixed
+
+- **A machine with the NVIDIA driver but no NVRTC runs on the CPU instead
+  of panicking** (#106). Detection probed only `libcuda`, so a driver-only
+  host — or a container that has `libcuda` injected by the NVIDIA container
+  toolkit and nothing else — selected CUDA, and the first query's kernel
+  compile panicked inside cudarc (`Unable to dynamically load the "nvrtc"
+  shared library`) with no CPU fallback. NVRTC is now probed before CUDA
+  counts as available: auto-detection selects the next backend and, when a
+  driver is installed, logs why at `warn`; `OXIDE_BACKEND=cuda` and
+  `oxide-worker --backend cuda` fail at startup with an error naming
+  `libnvrtc`, and every `cuda` request that fails now says which piece is
+  missing rather than "no device or driver". To use the GPU there, install
+  the toolkit's NVRTC (the `cuda-nvrtc` package) or put its directory on
+  `LD_LIBRARY_PATH`. New: `CudaBackend::nvrtc_present` and
+  `CudaBackend::probe`.
+
+- **CUDA kernels compile for the GPU they run on** (#107). NVRTC was called
+  with no target and compiled for its own default — `compute_52` under CUDA
+  12.x, the version the crate is built against — where `aggregation.cu`'s
+  `atomicAdd(double*)` does not exist, so every GPU-lowered `GROUP BY` failed
+  to compile; a compile error is not a CPU fallback, so the query failed.
+  (The T4 run used CUDA 13.2, whose default is `compute_75`.) Modules are now
+  compiled with `--gpu-architecture=compute_XY` from the device's compute
+  capability, or the newest older target the NVRTC supports. A GPU below
+  compute capability 7.0 is refused, because the aggregation kernel's
+  spin-wait needs Volta's independent thread scheduling, and so is an NVRTC
+  that cannot compile for the GPU (CUDA 13 dropped Volta): auto-detection then
+  selects the CPU and logs why, and `OXIDE_BACKEND=cuda` fails at startup
+  saying which. New: `CudaBackend::nvrtc_arch`.
+
 ### Security
 
 - **thrift is out of the dependency graph** (#4, #54). parquet 59 decodes
@@ -189,6 +225,16 @@ versions (0.x) may contain breaking changes; they are always listed under a
   duration parsing. None is a known vulnerability and none has a maintained
   release to move to inside the pinned chain; each is listed in `deny.toml`,
   `SECURITY.md` and `STATUS.md` and revisited at the next chain bump.
+
+- **`AlignedBuf` can no longer claim more bytes than it allocated** (#104).
+  Rounding a length within `align` bytes of `usize::MAX` up to the
+  alignment wrapped: a debug build panicked, and a release build returned a
+  64-byte allocation whose `len()` was about 2^64, so `as_slice` — and
+  `CpuBackend::alloc_device` followed by `copy_h2d` — read and wrote far
+  past it from safe code. `AlignedBuf::zeroed` and `BufferLayout::new` now
+  refuse any length whose padded size exceeds `isize::MAX` bytes with
+  `EngineError::Allocation`, in every build profile. No query reached it;
+  the public allocation API did.
 
 ## [0.2.0] - 2026-09-21
 
