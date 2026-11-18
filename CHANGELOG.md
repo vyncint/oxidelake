@@ -8,6 +8,33 @@ versions (0.x) may contain breaking changes; they are always listed under a
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-18
+
+The correctness release.
+
+- The dependency chain moves to Ballista 55, DataFusion 55.2 and arrow 59. That move is breaking; see Changed.
+- A review of the whole engine found 47 defects (#86–#132), and fixing them turned up two more (#133, #134). All 49 are fixed here. They include:
+  - places where GPU placement could change a query's result: a LIMIT, `COUNT(*)`, an ORDER BY over a merge join or an aggregate, a `UNION ALL` of aggregates, NaN and `-0.0` in a `Float64` filter, and NULL elements in a vector column;
+  - malformed Parquet, Arrow IPC and model files that could panic or exhaust memory;
+  - the Ballista 55 move itself, which left a cluster running no GPU operator at all. That one was never released.
+- A cluster now fails a query that loses a worker rather than risk Ballista 55's rollback, which can return rows twice (#148).
+
+**CUDA verification.** No `gpu` runner is registered yet (#38), so no device has run the tagged commit. Every CUDA change in this release ran on a Tesla T4 (driver 595.71.05, CUDA 13.2) on 2026-11-18, on the fix branches before they merged:
+
+- the rebuilt hash join, and the aggregate sized by its groups (#45, #95, #108);
+- the streaming aggregate (#29);
+- wrapped `SUM(Int64)` (#46);
+- the float comparison (#28);
+- NULL vector elements (#105);
+- kernels compiled for the device's own architecture (#107).
+
+[STATUS.md](https://github.com/vyncint/oxidelake/blob/main/STATUS.md) lists the suites and timings.
+
+**Known issues.** Both are upstream, and both have a workaround:
+
+- A `Float64` filter over Parquet can drop NaN rows on every target (#142, apache/datafusion#15812). Run `SET datafusion.execution.parquet.pruning = false` for such a query.
+- A lost cluster worker fails its query (#148, above). Run the query again.
+
 ### Added
 
 - **Graceful shutdown, Ballista's retry limits, and what losing a worker
@@ -30,6 +57,7 @@ versions (0.x) may contain breaking changes; they are always listed under a
   that exec instance has reported to its telemetry hub (`None` before it
   first executes, or without a hub). It is how a reader pairs a plan node
   with its own counters: the hub's entries carry only a name (#123).
+
 - **`gpu.yml`: the CUDA suites on a real device, on demand** (#38). A
   `workflow_dispatch` workflow for a self-hosted runner labelled `gpu` runs
   the new `make test-cuda-device` (the device tests with the ignored ones,
@@ -45,6 +73,7 @@ versions (0.x) may contain breaking changes; they are always listed under a
   vectors.** `OxideFrame::vector_distance` propagates this planning error
   instead of passing a zero-dimension fixed-size list to DataFusion and
   panicking.
+
 - **Breaking: the dependency chain moves to Ballista 55, DataFusion 55 and
   arrow / parquet 59** (#40). DataFusion is this project's public
   vocabulary (ADR-0009: `OxideFrame::new`, `into_inner`,
@@ -54,23 +83,27 @@ versions (0.x) may contain breaking changes; they are always listed under a
   changed. `object_store` stays on 0.13 and the minimum Rust stays 1.94.1.
   Resolved: ballista 55.0.0, datafusion and datafusion-proto 55.2.0, arrow,
   parquet and arrow-flight 59.3.2.
+
 - `OxidePhysicalCodec` follows DataFusion 55's `PhysicalExtensionCodec`,
   whose `try_decode` and `try_encode` now take a
   `PhysicalProtoConverterExtension`; the codec hands it on to Ballista's. A
   caller that invokes the codec directly passes one, usually
   `datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {}`.
+
 - **Cluster workers run with a bounded memory pool** (Ballista 55). An
   executor now installs a `FairSpillPool` of 70% of the host's or cgroup's
   detected memory, split across its concurrent tasks, where Ballista 54 left
   DataFusion's pool unbounded: a DataFusion operator on a worker that used to
   grow without limit now spills, or fails with a resources-exhausted error.
   The `Gpu*Exec` operators do not reserve from it.
+
 - `GpuOperator::hash_join` takes the batch size and returns a `JoinProbe`,
   whose output `GpuOperator::next_join_chunk` hands out one batch of at
   most that size at a time, in place of one `RecordBatch` holding every
   match (#95). *Migration:* `let mut probe = op.hash_join(&left, &build,
   key, projection, batch_size)?;` then `while let Some(batch) =
   op.next_join_chunk(&mut probe, &build)? { … }`.
+
 - **`GpuBackend` prepares a hash join's build side once and probes it in
   two steps** (the join half of #45). The CUDA backend used to rebuild its
   join table for every probe batch; `prepare_join_build` now indexes the
@@ -87,6 +120,7 @@ versions (0.x) may contain breaking changes; they are always listed under a
   path, counted in `fallback_batches`, and it is handed the build side once
   rather than once per probe batch. Compiled, not yet run on a GPU:
   STATUS.md has the T4 commands. The aggregate half of #45 is still open.
+
 - **The CUDA hash join keeps one slot per distinct build key** (#108). A
   key repeated D times on the build side took D slots, so building the
   table cost O(D²) `atomicCAS` attempts per probe batch and a probe row
@@ -112,6 +146,85 @@ versions (0.x) may contain breaking changes; they are always listed under a
   that reads a float column accepts the three strings, which Python's
   `float()` and JavaScript's `Number()` read back. `--help` and the README
   say so.
+
+- `BufferLayout::padded_len` returns `Option<usize>`: `None` when rounding
+  the length up to the alignment overflows (#104). Where a `usize` was used,
+  handle the `None`; a layout built through `BufferLayout::new` always has
+  `Some`, since `new` now refuses those lengths up front.
+
+- **CUDA's `SUM(Int64)` wrap is no longer called a divergence** (#46). It is
+  what stock DataFusion does, so `cuda/ops.rs` no longer documents it as a
+  divergence by design and the roadmap line no longer asks for an overflow
+  error: #46 was filed on the premise that DataFusion raises one, and it
+  wraps. The CPU reference was the outlier and now wraps too (#100, under
+  Fixed). The `#[ignore]`d device test
+  `aggregate_wraps_int64_sums_like_the_reference` and the conformance
+  suite's GPU pass pin the kernel to the reference's wrapped answer when
+  they next run on a CUDA machine.
+
+- **`GpuAggregateExec` aggregates each input partition on its own** (#90).
+  `GpuAggregateExec::try_new` still builds a complete aggregate of any
+  input, but merges a multi-partition input with a `CoalescePartitionsExec`
+  that `input()` now returns, where it used to read every partition inside
+  `execute(0)`; the new `GpuAggregateExec::try_new_partitioned` aggregates
+  per partition and declares its input's partitioning, which is what the
+  placement rule and the plan codec build, and what `with_new_children`
+  keeps. Code that builds the exec with `try_new` gets the same rows;
+  code that walked from it to its input sees the merge node first.
+  **`EXPLAIN` shows two `GpuAggregateExec` nodes for a two-phase
+  aggregate**, the final half over DataFusion's `RepartitionExec` or
+  `CoalescePartitionsExec` over the partial half; the final half merges
+  partial results, so a `COUNT` reads there as `SUM(count(t.v)[count])`.
+
+- **The CUDA aggregate reads back its groups, not its group table** (the
+  aggregate half of #45). Every call allocated accumulators of two slots
+  per input row and copied all of them back with the table's keys and
+  states, so a batch's device-to-host traffic followed its rows whatever
+  the number of groups: 16.3 MB for a 65 536-row batch with 101 groups
+  and eight aggregates (the 0.2.0 kernel and host flow, run on the CPU
+  under a shim of the CUDA builtins). A second launch now numbers the
+  groups densely on the device, the accumulators hold one entry per group,
+  and only the groups are read back: 12 KB for the same batch. The index
+  of keys stays two slots per row, on the device, and since #29 a call is
+  one batch. Results are unchanged. Compiled, not yet run on a GPU:
+  STATUS.md has the T4 commands, and `tests/aggregate_timing.rs` times a
+  10-million-row `GROUP BY` before and after.
+
+- **Breaking: `TelemetrySnapshot` gained a public field, `operator_totals`**
+  (#102): the lifetime totals per operator name and backend, as the new
+  `oxidelake_core::telemetry::OperatorTotals`, which is what
+  `to_prometheus` exports now. A struct literal over `TelemetrySnapshot` no
+  longer compiles; add `operator_totals: Vec::new()`, as the TUI's demo
+  model does.
+
+- **Cluster queries keep Ballista's static planner** (#134). Ballista 55
+  plans adaptively by default, and its adaptive planner swaps the session's
+  physical optimizer rules for Ballista's own, so on the 55 chain a
+  GPU-targeted cluster ran no `Gpu*Exec` operator at all while `EXPLAIN`
+  still showed them (never released: 0.2.0 is on Ballista 54, which plans
+  statically). `ballista.planner.adaptive.enabled` is now `false` in every
+  OxideLake cluster session, and the scheduler overrides a client that sets
+  it to `true`, with a warning in its log. Adaptive join selection and
+  partition coalescing are therefore not available on an OxideLake cluster
+  until the placement rule can run inside the adaptive planner.
+
+- **A cluster no longer retries a query that loses a worker** (#148).
+  Ballista 55 recovers such a query by rolling back the stages that read the
+  lost worker's output and running them again, and in 55.0.0 that recovery
+  is not safe: a self-join that lost a worker mid-flight came back with 13
+  or 14 of its 100 groups twice, exit 0, in 12 runs of 15 (fixed upstream by
+  apache/datafusion-ballista#2677, unreleased), and a worker stopped with
+  `SIGTERM` mid-query left it hanging (apache/datafusion-ballista#2539,
+  #2698). `oxide-scheduler` now fails a query that held output on a worker
+  it loses, whether killed, stopped or silent past `--worker-timeout`, with
+  an error naming the worker (one killed in the middle of a transfer shows
+  as a broken shuffle stream instead), and `--stage-max-failures` defaults
+  to 1, so
+  a failed fetch from a lost worker ends the query too; a query whose tasks
+  on that worker had not finished anything still runs them again elsewhere.
+  **Migration:** a query that used to survive losing a worker now fails;
+  run it again. To get Ballista's stage retries back, pass
+  `--stage-max-failures 4`, which brings the bug back with them.
 
 ### Fixed
 
@@ -186,6 +299,7 @@ versions (0.x) may contain breaking changes; they are always listed under a
   (`oxide_operator_bytes_h2d_total`, `oxide_operator_bytes_d2h_total`,
   `oxide_operator_rows_in_total`) and `OperatorSnapshot` change with them;
   a dashboard that charts those series will show a step at the upgrade.
+
 - **A join whose key repeats on both sides no longer aborts the process**
   (#95). `GpuHashJoinExec` gathered every match of a probe batch into one
   output batch, so a key repeated on both sides arrived as the product of
@@ -201,13 +315,6 @@ versions (0.x) may contain breaking changes; they are always listed under a
   `oxidelake_device::cpu::kernels` gains `JoinMatches` and
   `hash_join_gather`, the reference for gathering a range of a probe's
   matches.
-
-- `BufferLayout::padded_len` returns `Option<usize>`: `None` when rounding
-  the length up to the alignment overflows (#104). Where a `usize` was used,
-  handle the `None`; a layout built through `BufferLayout::new` always has
-  `Some`, since `new` now refuses those lengths up front.
-
-### Fixed
 
 - **A machine with the NVIDIA driver but no NVRTC runs on the CPU instead
   of panicking** (#106). Detection probed only `libcuda`, so a driver-only
@@ -237,46 +344,6 @@ versions (0.x) may contain breaking changes; they are always listed under a
   that cannot compile for the GPU (CUDA 13 dropped Volta): auto-detection then
   selects the CPU and logs why, and `OXIDE_BACKEND=cuda` fails at startup
   saying which. New: `CudaBackend::nvrtc_arch`.
-
-- **CUDA's `SUM(Int64)` wrap is no longer called a divergence** (#46). It is
-  what stock DataFusion does, so `cuda/ops.rs` no longer documents it as a
-  divergence by design and the roadmap line no longer asks for an overflow
-  error: #46 was filed on the premise that DataFusion raises one, and it
-  wraps. The CPU reference was the outlier and now wraps too (#100, under
-  Fixed). The `#[ignore]`d device test
-  `aggregate_wraps_int64_sums_like_the_reference` and the conformance
-  suite's GPU pass pin the kernel to the reference's wrapped answer when
-  they next run on a CUDA machine.
-
-- **`GpuAggregateExec` aggregates each input partition on its own** (#90).
-  `GpuAggregateExec::try_new` still builds a complete aggregate of any
-  input, but merges a multi-partition input with a `CoalescePartitionsExec`
-  that `input()` now returns, where it used to read every partition inside
-  `execute(0)`; the new `GpuAggregateExec::try_new_partitioned` aggregates
-  per partition and declares its input's partitioning, which is what the
-  placement rule and the plan codec build, and what `with_new_children`
-  keeps. Code that builds the exec with `try_new` gets the same rows;
-  code that walked from it to its input sees the merge node first.
-  **`EXPLAIN` shows two `GpuAggregateExec` nodes for a two-phase
-  aggregate**, the final half over DataFusion's `RepartitionExec` or
-  `CoalescePartitionsExec` over the partial half; the final half merges
-  partial results, so a `COUNT` reads there as `SUM(count(t.v)[count])`.
-
-- **The CUDA aggregate reads back its groups, not its group table** (the
-  aggregate half of #45). Every call allocated accumulators of two slots
-  per input row and copied all of them back with the table's keys and
-  states, so a batch's device-to-host traffic followed its rows whatever
-  the number of groups: 16.3 MB for a 65 536-row batch with 101 groups
-  and eight aggregates (the 0.2.0 kernel and host flow, run on the CPU
-  under a shim of the CUDA builtins). A second launch now numbers the
-  groups densely on the device, the accumulators hold one entry per group,
-  and only the groups are read back: 12 KB for the same batch. The index
-  of keys stays two slots per row, on the device, and since #29 a call is
-  one batch. Results are unchanged. Compiled, not yet run on a GPU:
-  STATUS.md has the T4 commands, and `tests/aggregate_timing.rs` times a
-  10-million-row `GROUP BY` before and after.
-
-### Fixed
 
 - **`SUM(Int64)` wraps on overflow under a GPU target, as it does in stock
   DataFusion** (#100). The CPU reference — what every operator placed on a
@@ -333,15 +400,6 @@ versions (0.x) may contain breaking changes; they are always listed under a
   DataFusion's exchange between them, and each `GpuAggregateExec` declares
   the partitioning of the node it replaces.
 
-- **Breaking: `TelemetrySnapshot` gained a public field, `operator_totals`**
-  (#102): the lifetime totals per operator name and backend, as the new
-  `oxidelake_core::telemetry::OperatorTotals`, which is what
-  `to_prometheus` exports now. A struct literal over `TelemetrySnapshot` no
-  longer compiles; add `operator_totals: Vec::new()`, as the TUI's demo
-  model does.
-
-### Fixed
-
 - **`predict` scores a feature vector with a NULL element as NULL** (#97).
   Only the vector's own validity was checked, so a NULL element was read
   from the values buffer as whatever lay there, 0.0 from every Arrow
@@ -368,8 +426,6 @@ versions (0.x) may contain breaking changes; they are always listed under a
   the second run of a query logged twice the first's numbers; it now counts
   that query's operators only.
 
-### Fixed
-
 - **A corrupt page found mid-scan is `EngineError::Format`, as
   documented.** `classify_error` now looks inside the `Shared`,
   `Diagnostic` and `Collection` wrappers DataFusion puts around a scan's
@@ -377,8 +433,6 @@ versions (0.x) may contain breaking changes; they are always listed under a
   `EngineError::DataFusion(..)` while the same damage in a footer was
   `Format`; code that matched on `EngineError::DataFusion` for such errors
   now gets `Format` or `Io` (#118).
-
-### Fixed
 
 - **A refused `oxide gen-data` no longer empties the table it would have
   replaced** (#119). `--row-group-rows 0` truncated the existing
@@ -461,36 +515,6 @@ versions (0.x) may contain breaking changes; they are always listed under a
   the deletes run on a thread and runtime of their own and the drop waits
   for them; after 30 seconds it stops waiting and lets them finish in the
   background. A file that cannot be deleted is logged at `warn`.
-- **Cluster queries keep Ballista's static planner** (#134). Ballista 55
-  plans adaptively by default, and its adaptive planner swaps the session's
-  physical optimizer rules for Ballista's own, so on the 55 chain a
-  GPU-targeted cluster ran no `Gpu*Exec` operator at all while `EXPLAIN`
-  still showed them (never released: 0.2.0 is on Ballista 54, which plans
-  statically). `ballista.planner.adaptive.enabled` is now `false` in every
-  OxideLake cluster session, and the scheduler overrides a client that sets
-  it to `true`, with a warning in its log. Adaptive join selection and
-  partition coalescing are therefore not available on an OxideLake cluster
-  until the placement rule can run inside the adaptive planner.
-
-- **A cluster no longer retries a query that loses a worker** (#148).
-  Ballista 55 recovers such a query by rolling back the stages that read the
-  lost worker's output and running them again, and in 55.0.0 that recovery
-  is not safe: a self-join that lost a worker mid-flight came back with 13
-  or 14 of its 100 groups twice, exit 0, in 12 runs of 15 (fixed upstream by
-  apache/datafusion-ballista#2677, unreleased), and a worker stopped with
-  `SIGTERM` mid-query left it hanging (apache/datafusion-ballista#2539,
-  #2698). `oxide-scheduler` now fails a query that held output on a worker
-  it loses, whether killed, stopped or silent past `--worker-timeout`, with
-  an error naming the worker (one killed in the middle of a transfer shows
-  as a broken shuffle stream instead), and `--stage-max-failures` defaults
-  to 1, so
-  a failed fetch from a lost worker ends the query too; a query whose tasks
-  on that worker had not finished anything still runs them again elsewhere.
-  **Migration:** a query that used to survive losing a worker now fails;
-  run it again. To get Ballista's stage retries back, pass
-  `--stage-max-failures 4`, which brings the bug back with them.
-
-### Fixed
 
 - **Cluster mode returns the right rows for `NOT IN (subquery)`** (#91).
   Under Ballista 54 a cluster session (`prefer_hash_join = false`) had
@@ -532,6 +556,7 @@ versions (0.x) may contain breaking changes; they are always listed under a
   is refused. `oxidelake_planner::codec::PLAN_FINGERPRINT` and
   `build_description()` are public, and `make test-mixed-build` runs both
   cases with real binaries.
+
 - **A `GROUP BY` under a GPU target holds its groups, not its input** (#29).
   `GpuAggregateExec` collected each input partition whole before
   aggregating, so every grouped aggregate on a `cuda` or `metal` target, and
@@ -550,7 +575,6 @@ versions (0.x) may contain breaking changes; they are always listed under a
   `GpuOperator::aggregate_into` and
   `oxidelake_device::cpu::kernels::GroupedAggregator`.
 
-
 - **`OxideFrame::show()` no longer panics when stdout closes** (#125). It
   was DataFusion's `DataFrame::show`, whose `println!` panics on a closed
   pipe, so a program showing a frame into `… | head -1` died with `failed
@@ -559,8 +583,6 @@ versions (0.x) may contain breaking changes; they are always listed under a
   reader that has gone is a clean stop that returns `Ok`, as `oxide sql`
   exits 0 there; any other write failure is an `EngineError::Io`.
 
-### Fixed
-
 - **A crates.io error can no longer switch the release's semver check off.**
   `release.yml` read every answer but HTTP 200 — a 429, a 503 — as "first
   release, no baseline" and skipped `cargo-semver-checks` minutes before
@@ -568,6 +590,7 @@ versions (0.x) may contain breaking changes; they are always listed under a
   now fails unless crates.io confirms the baseline, after retrying a 429 or
   a 5xx; a release that hits an outage is re-run rather than published
   unchecked (#130).
+
 - **Re-running `binaries.yml` repairs a partly attached target.** The re-run
   guard looked for a target's archive alone, so a run that uploaded the
   archive and died before its `.sha256` or its unversioned alias left that
@@ -575,12 +598,14 @@ versions (0.x) may contain breaking changes; they are always listed under a
   the missing checksum, without printing which. A target now counts as
   attached only when all four of its files are; the missing ones are
   recovered from the attached archive's own bytes, never rebuilt (#131).
+
 - **`oxide tui --table Trips=…` opens the dashboard.** A table name with an
   upper-case letter is registered as DataFusion folds it, `trips`, but the
   column-profile query asked for `"Trips"`, so the dashboard failed with
   `table 'datafusion.public.Trips' not found` after the query itself had
   run. The profile query now names the table as registration resolved it
   (#120).
+
 - **The Describe panel shows min and max for every column DataFusion can
   order.** It profiled `Int64`, `Float64` and `Utf8` only, and DataFusion
   reads Parquet strings as `Utf8View`, so string columns read from Parquet
@@ -590,12 +615,14 @@ versions (0.x) may contain breaking changes; they are always listed under a
   type they cannot order (a `Map`) is left out instead of failing the
   profile; every numeric type now gets P25/P50/P99 too, not only `Int64`
   and `Float64` (#121).
+
 - **The Inspector shows each operator its own counters.** `oxide tui
   --query` merged the hub's counters by operator name, so two operators of
   one name — a self-join's two filters — each showed the sum of both: a
   filter emitting 129 rows and one emitting 1451 both read `6000 in / 1580
   out`. Each plan node's counters are now read from the node itself
   (#123).
+
 - **A dashboard whose refresh brings the plan can select all of it.**
   `run_terminal` bounded the selection by the plan the model had before
   the first refresh, so with a tick and a `refresh` that supplies the plan
@@ -605,6 +632,7 @@ versions (0.x) may contain breaking changes; they are always listed under a
   the last operator left when the plan shrinks under it. `oxide tui` never
   refreshes and was not affected. A loop of your own around `AppState` and
   `render` gets the same from the new `AppState::set_node_count` (#126).
+
 - **The dashboard no longer cuts numbers at 80x24 or 120x40.** The
   Describe panel asked for 62 columns whatever it held, so in any terminal
   narrower than 128 every cell was clipped without a mark: the README's own
@@ -618,17 +646,20 @@ versions (0.x) may contain breaking changes; they are always listed under a
   columns; it is `-1.2e-5`). At 24 rows the Inspector now keeps its
   `H2D / D2H` and `cpu fallback` lines, which needed 28, and Telemetry the
   line saying whether its gauges can move at all, which needed 26 (#122).
+
 - **CI's `msrv` job compiles with the declared minimum Rust.** It installed
   1.94.1 and then ran a plain `cargo check`, which rustup resolved through
   `rust-toolchain.toml` to 1.98.0, so the job could not fail on code that
   needs a newer compiler; `rust-version` was checked only by a local `make
   msrv`. The job now runs `make msrv` under `RUSTUP_TOOLCHAIN` and first
   asserts which `rustc` is in use (#127).
+
 - **The `metrics` feature is linted and tested in CI.** No CI job and no
   `make gate` target built the Prometheus endpoint; only rustdoc and
   `cargo deny` saw it, through `--all-features`, and rustdoc does not
   type-check function bodies. `make lint-metrics` and `make test-metrics`
   are now in the gate and in CI's clippy and Linux test matrices (#128).
+
 - **Every link on the nine crates.io pages works.** Each crate's README is
   the workspace README, and crates.io resolves a relative link against that
   crate's own directory, so all 28 relative targets in it (`docs/SPEC.md`,
@@ -636,6 +667,7 @@ versions (0.x) may contain breaking changes; they are always listed under a
   README now links with absolute GitHub URLs, and `make crate-metadata` fails
   on a relative link or on a link into this repository that names a path it
   does not have (#129).
+
 - **The documentation describes the code that exists** (#132). The spill
   manager has no watermarks, no background demotion and no throughput
   metric: the call that takes a tier over its byte budget demotes its least
@@ -770,6 +802,7 @@ versions (0.x) may contain breaking changes; they are always listed under a
   scan with DataFusion's own reader. `register_local_store` now puts the store
   behind the new `BoundedReadStore`, which refuses a multi-range read past the
   end of an object before the store underneath reserves memory for it.
+
 - **A corrupt Arrow IPC file is refused instead of panicking or aborting
   the process** (#110). `read_ipc_file` and the spill reader
   (`oxidelake_memory::ipc::decode_batch`) handed the file to arrow-ipc,
@@ -1280,7 +1313,8 @@ Metal executes on Apple silicon (verified on an M4 Pro and on GitHub's macOS
 runners); CUDA compiles and lints without a CUDA installation but has not yet
 run on a CUDA machine.
 
-[Unreleased]: https://github.com/vyncint/oxidelake/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/vyncint/oxidelake/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/vyncint/oxidelake/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/vyncint/oxidelake/compare/v0.1.4...v0.2.0
 [0.1.4]: https://github.com/vyncint/oxidelake/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/vyncint/oxidelake/compare/v0.1.2...v0.1.3
