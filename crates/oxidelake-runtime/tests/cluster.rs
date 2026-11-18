@@ -17,7 +17,6 @@ use datafusion::physical_expr::Partitioning;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, displayable};
 
 use ballista_core::extension::SessionConfigExt;
-use datafusion::physical_plan::displayable;
 use datafusion::prelude::SessionContext;
 use oxidelake_core::BackendKind;
 use oxidelake_core::telemetry::TelemetryHub;
@@ -504,17 +503,6 @@ fn binaries_print_help() {
             "{bin}"
         );
     }
-}
-
-/// The next operator id the process-wide hub will hand out.
-fn next_operator_id() -> usize {
-    TelemetryHub::global()
-        .snapshot()
-        .operators
-        .iter()
-        .map(|o| o.id + 1)
-        .max()
-        .unwrap_or(0)
 }
 
 /// How many `name` operators registered on the process-wide hub from id

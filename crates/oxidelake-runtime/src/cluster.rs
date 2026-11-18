@@ -424,6 +424,8 @@ mod tests {
             store.to_string().starts_with("BoundedReadStore("),
             "{store}"
         );
+    }
+
     use ballista_core::extension::SessionConfigHelperExt;
     use oxidelake_storage::GPU_BATCH_SIZE;
 
