@@ -320,6 +320,18 @@ versions (0.x) may contain breaking changes; they are always listed under a
 
 ### Fixed
 
+- **A refused `oxide gen-data` no longer empties the table it would have
+  replaced** (#119). `--row-group-rows 0` truncated the existing
+  `t.parquet` to zero bytes before refusing the flag. The options are now
+  checked before anything is created, and `ParquetFileWriter` (so
+  `write_parquet`, `write_demo_table` and `gen-data`) writes a temporary
+  `.t.parquet.<pid>.<n>.tmp` beside the destination and renames it into
+  place only once the file is complete: a refused, failed or abandoned
+  write leaves the previous file as it was, a reader sees the old file
+  until the rename, and a symlink at the destination is replaced rather
+  than written through. A process killed mid-write can leave the temporary
+  file behind; delete it.
+
 - **A failed spill-manager insert no longer leaves its batch behind**
   (#115). `SpillManager::insert_host` and `insert_device` registered the
   batch and counted its bytes before evicting to make room, and when the
