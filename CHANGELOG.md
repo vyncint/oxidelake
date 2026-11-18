@@ -344,6 +344,17 @@ versions (0.x) may contain breaking changes; they are always listed under a
   attributes is refused with `NotImplemented`, where they were accepted and
   dropped.
 
+- **The io_uring store reads the file it checked a get's preconditions
+  against** (#113). `UringLocalFileSystem::get_opts` checked `if_match`
+  and `if_modified_since` against a stat of the path, then opened the path
+  again to read it, so an object replaced in between came back as the new
+  bytes under the old object's size and e_tag. The file is now opened once,
+  by `LocalFileSystem::get_opts`, which checks the preconditions against
+  that descriptor, and every byte is read from it; `get_ranges` likewise
+  reads all its ranges from one descriptor rather than opening the path
+  once per range. An invalid range now fails with `LocalFileSystem`'s error
+  for it.
+
 - **A failed spill-manager insert no longer leaves its batch behind**
   (#115). `SpillManager::insert_host` and `insert_device` registered the
   batch and counted its bytes before evicting to make room, and when the

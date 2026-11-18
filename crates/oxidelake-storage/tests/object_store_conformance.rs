@@ -280,6 +280,182 @@ async fn a_put_replaces_a_symlink_rather_than_writing_through_it() {
     }
 }
 
+/// Waits for a file to be opened, by anyone: an inotify `IN_OPEN` watch.
+/// The test below uses it to put its own steps between the store's,
+/// rather than guessing how long the store takes to reach them.
+#[cfg(target_os = "linux")]
+struct OpenWatch(std::os::fd::OwnedFd);
+
+#[cfg(target_os = "linux")]
+impl OpenWatch {
+    fn new(path: &std::path::Path) -> Self {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::ffi::OsStrExt;
+        // SAFETY: inotify_init1 takes flags only and returns a new descriptor
+        // or -1.
+        let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
+        assert!(
+            fd >= 0,
+            "inotify_init1: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: `fd` was just returned by inotify_init1 and nothing else
+        // owns it.
+        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a live inotify descriptor and a NUL-terminated path that
+        // outlives the call.
+        let watch =
+            unsafe { libc::inotify_add_watch(fd.as_raw_fd(), path.as_ptr(), libc::IN_OPEN) };
+        assert!(
+            watch >= 0,
+            "inotify_add_watch: {}",
+            std::io::Error::last_os_error()
+        );
+        Self(fd)
+    }
+
+    /// Returns once the watched file has been opened; fails the test after
+    /// a minute. Waits off the runtime, so the store's tasks keep running.
+    async fn opened(self) {
+        tokio::task::spawn_blocking(move || {
+            use std::os::fd::AsRawFd;
+            let mut poll = libc::pollfd {
+                fd: self.0.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one live pollfd, for the length of the call.
+            let ready = unsafe { libc::poll(&mut poll, 1, 60_000) };
+            assert_eq!(ready, 1, "nothing opened the file within a minute");
+            let mut event = [0u8; 4096];
+            // SAFETY: reading into a buffer of the length given.
+            let n =
+                unsafe { libc::read(self.0.as_raw_fd(), event.as_mut_ptr().cast(), event.len()) };
+            assert!(n >= 16, "inotify read: {}", std::io::Error::last_os_error());
+            // struct inotify_event { int wd; uint32_t mask; ... }
+            let mask = u32::from_ne_bytes(event[4..8].try_into().unwrap());
+            assert!(mask & libc::IN_OPEN != 0, "inotify event {mask:#x}");
+        })
+        .await
+        .unwrap();
+    }
+}
+
+/// A file replaced between a get's precondition check and its read (#113).
+///
+/// The io_uring store checked `if_match` against a stat of the path, then
+/// had its worker open the path again to read it, so a file replaced in
+/// between came back as the new bytes under the old file's size and e_tag.
+/// The window is held open here and the replacement put inside it, with no
+/// sleeps: the store's single worker is parked on a read from an empty
+/// FIFO (every later read queues behind it), and inotify says when the
+/// store has opened the FIFO and then the object, which is when the object
+/// is replaced. Only then is the worker let go.
+///
+/// Two outcomes are correct: the old object's bytes under its e_tag (the
+/// store read the file it checked), or a precondition failure (it checked
+/// the replacement). The old e_tag over the new bytes never is. A store
+/// with no single worker (`LocalFileSystem`) is not parked at all.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_get_reads_the_file_its_preconditions_were_checked_against() {
+    use std::io::Write;
+    use std::os::unix::ffi::OsStrExt;
+    use std::time::Duration;
+
+    for which in store_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let store = store_named(which, root);
+        let p = Path::from("swap/target.bin");
+        let v1 = Bytes::from(vec![b'1'; 1_000]);
+        store
+            .put(&p, PutPayload::from_bytes(v1.clone()))
+            .await
+            .unwrap();
+        let v1_tag = store.head(&p).await.unwrap().e_tag;
+        assert!(v1_tag.is_some(), "{which}");
+
+        // Opened read-write here, so the store's own open of it returns at
+        // once and its read waits for data.
+        let fifo = root.join("swap/fifo");
+        let c_fifo = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+        let mut fifo_end = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fifo)
+            .unwrap();
+        let fifo_opened = OpenWatch::new(&fifo);
+        let target_opened = OpenWatch::new(&root.join("swap/target.bin"));
+
+        let parked = {
+            let store = Arc::clone(&store);
+            tokio::spawn(async move {
+                store
+                    .get_ranges(&Path::from("swap/fifo"), std::slice::from_ref(&(0..4)))
+                    .await
+            })
+        };
+        fifo_opened.opened().await;
+        let get = {
+            let store = Arc::clone(&store);
+            let options = GetOptions {
+                if_match: v1_tag.clone(),
+                ..Default::default()
+            };
+            tokio::spawn(async move {
+                let got = store
+                    .get_opts(&Path::from("swap/target.bin"), options)
+                    .await?;
+                let meta = got.meta.clone();
+                Ok::<_, object_store::Error>((meta, got.bytes().await?))
+            })
+        };
+        target_opened.opened().await;
+
+        // Replaced the way writers replace: a new file renamed over the old.
+        let staged = root.join("swap/staged");
+        std::fs::write(&staged, vec![b'2'; 2_000]).unwrap();
+        std::fs::rename(&staged, root.join("swap/target.bin")).unwrap();
+        fifo_end.write_all(b"open").unwrap();
+
+        let minute = Duration::from_secs(60);
+        // `LocalFileSystem` reads a FIFO with pread, which fails (ESPIPE);
+        // only the parking matters here, not what the read returns.
+        let _ = tokio::time::timeout(minute, parked).await.unwrap();
+        match tokio::time::timeout(minute, get).await.unwrap().unwrap() {
+            Ok((meta, bytes)) => {
+                assert_eq!(meta.e_tag, v1_tag, "{which}");
+                assert_eq!(meta.size, 1_000, "{which}");
+                assert!(
+                    bytes == v1,
+                    "{which}: the e_tag and size are the old object's, the bytes are not \
+                     ({} bytes, the first {:?})",
+                    bytes.len(),
+                    bytes.first().map(|b| char::from(*b))
+                );
+            }
+            Err(object_store::Error::Precondition { .. }) => {}
+            Err(other) => panic!("{which}: {other}"),
+        }
+
+        // With the replacement in place, the old e_tag fails the same way in
+        // both stores.
+        let stale = GetOptions {
+            if_match: v1_tag,
+            ..Default::default()
+        };
+        let stale = store.get_opts(&p, stale).await;
+        assert!(
+            matches!(stale, Err(object_store::Error::Precondition { .. })),
+            "{which}: {stale:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn local_file_system_behaviour() {
     let dir = tempfile::tempdir().unwrap();

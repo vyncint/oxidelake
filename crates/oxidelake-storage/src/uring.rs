@@ -4,10 +4,12 @@
 //! writes are submitted as `IORING_OP_READ` / `IORING_OP_WRITE` and their
 //! completions are bridged back to async callers through `oneshot` channels.
 //! A write goes to a staged file beside the object and is renamed over it,
-//! as `LocalFileSystem` does. Metadata operations (`list`, `head`, `delete`,
-//! `copy`, multipart uploads) delegate to the wrapped [`LocalFileSystem`], so
-//! both stores behave identically — the shared conformance test in `tests/`
-//! runs against both.
+//! as `LocalFileSystem` does. A read is opened, and its preconditions and
+//! range checked, by the wrapped [`LocalFileSystem`]'s `get_opts`; the ring
+//! reads from the descriptor that check was made on. Metadata operations
+//! (`list`, `head`, `delete`, `copy`, multipart uploads) delegate to it
+//! outright, so both stores behave identically — the shared conformance
+//! test in `tests/` runs against both.
 //!
 //! Construction fails with a typed error where io_uring is unavailable
 //! (EPERM/ENOSYS in sandboxes, old kernels); callers fall back to
@@ -31,8 +33,8 @@ use object_store::local::LocalFileSystem;
 use object_store::path::Path;
 use object_store::{
     Attributes, CopyOptions, Error, GetOptions, GetResult, GetResultPayload, ListResult,
-    MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutMultipartOptions,
-    PutOptions, PutPayload, PutResult, RenameOptions, Result,
+    MultipartUpload, ObjectMeta, ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload,
+    PutResult, RenameOptions, Result,
 };
 use oxidelake_core::EngineError;
 use tokio::sync::{mpsc, oneshot};
@@ -47,7 +49,10 @@ const JOB_QUEUE: usize = 256;
 
 enum Job {
     Read {
-        path: PathBuf,
+        /// The descriptor the caller opened and checked (#113). The job
+        /// holds it open until the read completes, whatever the caller does
+        /// meanwhile.
+        file: Arc<File>,
         range: Range<u64>,
         reply: oneshot::Sender<io::Result<Bytes>>,
     },
@@ -147,10 +152,9 @@ fn submit_one(
 fn read_range(
     ring: &mut IoUring,
     seq: &mut u64,
-    path: &PathBuf,
+    file: &File,
     range: Range<u64>,
 ) -> io::Result<Bytes> {
-    let file = File::open(path)?;
     let len = usize::try_from(range.end.saturating_sub(range.start))
         .map_err(|_| io::Error::other("range too large"))?;
     let mut buf = vec![0u8; len];
@@ -301,8 +305,8 @@ fn worker(mut rx: mpsc::Receiver<Job>, mut ring: IoUring) {
     let mut seq = 0u64;
     while let Some(job) = rx.blocking_recv() {
         match job {
-            Job::Read { path, range, reply } => {
-                let _ = reply.send(read_range(&mut ring, &mut seq, &path, range));
+            Job::Read { file, range, reply } => {
+                let _ = reply.send(read_range(&mut ring, &mut seq, &file, range));
             }
             Job::Write {
                 path,
@@ -313,6 +317,15 @@ fn worker(mut rx: mpsc::Receiver<Job>, mut ring: IoUring) {
             }
         }
     }
+}
+
+/// An object `LocalFileSystem::get_opts` opened and checked: the descriptor
+/// and its answer for it (#113).
+struct Opened {
+    file: Arc<File>,
+    meta: ObjectMeta,
+    range: Range<u64>,
+    attributes: Attributes,
 }
 
 /// A local object store whose data-path reads and writes go through io_uring.
@@ -364,11 +377,42 @@ impl UringLocalFileSystem {
         }
     }
 
-    async fn read(&self, location: &Path, range: Range<u64>) -> Result<Bytes> {
-        let path = self.filesystem_path(location)?;
+    /// Opens the object through `LocalFileSystem::get_opts`, which opens the
+    /// file once, checks `options`' preconditions against `fstat` of that
+    /// descriptor and resolves the range against its size, and returns the
+    /// descriptor with its answer (#113).
+    ///
+    /// Everything this store then reads, it reads from that descriptor.
+    /// It used to stat the path for the check and have the worker open the
+    /// path again to read, so an object replaced in between came back as the
+    /// new bytes under the old object's size and e_tag. Taking the check
+    /// from `LocalFileSystem` also keeps its errors and its e_tags, which
+    /// is what callers of either store see.
+    async fn open(&self, location: &Path, options: GetOptions) -> Result<Opened> {
+        let GetResult {
+            payload,
+            meta,
+            range,
+            attributes,
+        } = self.inner.get_opts(location, options).await?;
+        match payload {
+            GetResultPayload::File(file, _) => Ok(Opened {
+                file: Arc::new(file),
+                meta,
+                range,
+                attributes,
+            }),
+            GetResultPayload::Stream(_) => Err(Error::Generic {
+                store: STORE,
+                source: "LocalFileSystem answered a get with a stream rather than a file".into(),
+            }),
+        }
+    }
+
+    async fn read(&self, location: &Path, file: Arc<File>, range: Range<u64>) -> Result<Bytes> {
         let (reply, rx) = oneshot::channel();
         self.tx
-            .send(Job::Read { path, range, reply })
+            .send(Job::Read { file, range, reply })
             .await
             .map_err(|_| Error::Generic {
                 store: STORE,
@@ -456,41 +500,41 @@ impl ObjectStore for UringLocalFileSystem {
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
-        let meta: ObjectMeta = self.inner.head(location).await?;
-        // `LocalFileSystem::get_opts` checks these before reading anything, and
-        // the two stores are documented as behaving identically — so a
-        // conditional request that one store honours and the other ignores is
-        // a difference a caller cannot see until it matters (#44). Checked
-        // against the same `meta` the read below is ranged against.
-        options.check_preconditions(&meta)?;
-        let range = match &options.range {
-            Some(r) => r.as_range(meta.size).map_err(|e| Error::Generic {
-                store: STORE,
-                source: Box::new(e),
-            })?,
-            None => 0..meta.size,
-        };
-        if options.head {
-            return Ok(GetResult {
-                payload: GetResultPayload::Stream(stream::empty().boxed()),
-                meta,
-                range,
-                attributes: Attributes::default(),
-            });
-        }
-        let bytes = self.read(location, range.clone()).await?;
-        Ok(GetResult {
-            payload: GetResultPayload::Stream(stream::once(async move { Ok(bytes) }).boxed()),
+        // Preconditions (#44) and the range are `LocalFileSystem`'s answer
+        // for the descriptor `open` returns, and the read below is from that
+        // descriptor (#113).
+        let head = options.head;
+        let Opened {
+            file,
             meta,
             range,
-            attributes: Attributes::default(),
+            attributes,
+        } = self.open(location, options).await?;
+        let payload = if head {
+            stream::empty().boxed()
+        } else {
+            let bytes = self.read(location, file, range.clone()).await?;
+            stream::once(async move { Ok(bytes) }).boxed()
+        };
+        Ok(GetResult {
+            payload: GetResultPayload::Stream(payload),
+            meta,
+            range,
+            attributes,
         })
     }
 
     async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+        // One descriptor for every range, as `LocalFileSystem` reads them:
+        // an object replaced part way through comes back from one version,
+        // not from two (#113).
+        let Opened { file, .. } = self.open(location, GetOptions::default()).await?;
         let mut out = Vec::with_capacity(ranges.len());
         for range in ranges {
-            out.push(self.read(location, range.clone()).await?);
+            out.push(
+                self.read(location, Arc::clone(&file), range.clone())
+                    .await?,
+            );
         }
         Ok(out)
     }
