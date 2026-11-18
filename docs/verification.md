@@ -4,8 +4,8 @@
 
 Run after every phase; every command must pass before that phase's commit. `make gate` runs the checks below, including MSRV, plus the io_uring lane on Linux and the full Metal lane on macOS. [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) uses the same Make targets. `commit-policy` runs beside it. Keep the Makefile, this page and the workflow in sync.
 
-CI separates default, io_uring and predict tests into three Linux jobs. Clippy
-also has default / CUDA / predict jobs. macOS runs Metal lint, Metal package
+CI separates default, io_uring, predict and metrics tests into four Linux
+jobs. Clippy also has default / CUDA / predict / metrics jobs. macOS runs Metal lint, Metal package
 tests together with the PTY suite, then on-device conformance when a device is
 available. The remaining checks are MSRV, all-feature rustdoc, `cargo deny`,
 release scripts, crate metadata, CI policy tests, the vendored termlens
@@ -15,8 +15,8 @@ suite left behind into the job summary. `required-green`
 aggregates their results under the stable name required by branch protection.
 
 ```bash
-make fmt-check lint lint-cuda lint-predict
-make test test-predict
+make fmt-check lint lint-cuda lint-predict lint-metrics
+make test test-predict test-metrics
 make test-mixed-build                 # builds cuda and predict workers; CI: the predict lane
 make test-io-uring                    # Linux only
 make check-cuda check-predict-no-second-cuda
@@ -93,6 +93,10 @@ invalid classification fails the gate.
 
 `make ci-scripts` covers source deletion/rename handling, malformed results,
 each required job's failures, Metal build-argument reuse, and stress coverage.
+It checks that every `oxidelake-runtime` feature is compiled by a target
+`ci.yml` runs (`--all-features` in `doc` and `deny` does not count: rustdoc
+type-checks no function body), with `metrics` linted and tested and both
+targets in `make gate` (#128).
 It also verifies the metadata checker under the platform's Bash and the MSRV
 target with a standalone Cargo ahead of the Rustup proxy on `PATH`, checks
 that the `msrv` job compiles with the declared `rust-version` rather than

@@ -92,6 +92,7 @@ jobs:
           - { name: default, target: lint }
           - { name: cuda, target: lint-cuda }
           - { name: predict, target: lint-predict }
+          - { name: metrics, target: lint-metrics }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -123,6 +124,7 @@ jobs:
           - { name: default, target: test }
           - { name: io-uring, target: test-io-uring }
           - { name: predict, target: test-predict }
+          - { name: metrics, target: test-metrics }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

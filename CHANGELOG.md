@@ -483,6 +483,11 @@ versions (0.x) may contain breaking changes; they are always listed under a
   needs a newer compiler; `rust-version` was checked only by a local `make
   msrv`. The job now runs `make msrv` under `RUSTUP_TOOLCHAIN` and first
   asserts which `rustc` is in use (#127).
+- **The `metrics` feature is linted and tested in CI.** No CI job and no
+  `make gate` target built the Prometheus endpoint; only rustdoc and
+  `cargo deny` saw it, through `--all-features`, and rustdoc does not
+  type-check function bodies. `make lint-metrics` and `make test-metrics`
+  are now in the gate and in CI's clippy and Linux test matrices (#128).
 
 ### Security
 

@@ -382,6 +382,60 @@ class ToolchainTests(unittest.TestCase):
             self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
 
 
+class FeatureCoverageTests(unittest.TestCase):
+    """Every optional feature of oxidelake-runtime is compiled by CI (#128).
+
+    AGENTS.md: "A feature that no job builds is a feature that is already
+    broken". `metrics` was compiled only by `doc` and `deny`, both with
+    --all-features, and rustdoc does not type-check function bodies.
+    """
+
+    @staticmethod
+    def ci_targets():
+        """The make targets ci.yml runs: matrix `target:` values and `run: make X`."""
+        text = (ROOT / ".github/workflows/ci.yml").read_text()
+        return (set(re.findall(r"\btarget: ([\w-]+)", text))
+                | set(re.findall(r"\brun: make ([\w-]+)\s*$", text, re.M)))
+
+    @staticmethod
+    def compiled_by(target):
+        """{feature: {cargo verb}} for the cargo commands `make <target>` runs.
+
+        `make -n` expands $(CARGO) and the shared argument variables, so a
+        feature named through METAL_TEST_ARGS counts too. --all-features
+        does not: rustdoc and cargo-deny type-check nothing.
+        """
+        out = subprocess.run(["make", "-n", target], cwd=ROOT, capture_output=True, text=True,
+                             check=True).stdout
+        found = {}
+        for verb, args in re.findall(r"\bcargo (clippy|test|check|build)\b([^;\n]*)", out):
+            for spec in re.findall(r"--features[ =]([\w/,-]+)", args):
+                for feature in spec.split(","):
+                    found.setdefault(feature.split("/")[-1], set()).add(verb)
+        return found
+
+    def test_every_runtime_feature_is_compiled_by_a_ci_job(self):
+        manifest = (ROOT / "crates/oxidelake-runtime/Cargo.toml").read_text()
+        section = manifest.split("\n[features]\n", 1)[1].split("\n[", 1)[0]
+        features = set(re.findall(r"^([\w-]+) = \[", section, re.M)) - {"default"}
+        coverage = {}
+        for target in self.ci_targets():
+            for feature, verbs in self.compiled_by(target).items():
+                coverage.setdefault(feature, set()).update(verbs)
+        self.assertIn("metrics", features, "the manifest parse found the features")
+        for feature in sorted(features):
+            self.assertIn(feature, coverage, f"no CI job compiles oxidelake-runtime's `{feature}` feature")
+        self.assertLessEqual({"clippy", "test"}, coverage["metrics"],
+                             "`metrics` is linted and its tests run, not merely compiled")
+
+    def test_the_metrics_targets_ci_runs_are_part_of_make_gate(self):
+        gate = re.search(r"^gate: (.*?) ##", (ROOT / "Makefile").read_text(), re.M).group(1).split()
+        metrics = [t for t in sorted(self.ci_targets()) if "metrics" in self.compiled_by(t)]
+        self.assertTrue(metrics)
+        for target in metrics:
+            self.assertIn(target, gate, f"ci.yml runs `make {target}` and `make gate` does not")
+
+
 class MsrvJobTests(unittest.TestCase):
     """The CI msrv job compiles with the declared rust-version (#127).
 

@@ -15,7 +15,7 @@ UNAME := $(shell uname -s)
 # selecting compute alone rebuilt Arrow/DataFusion for the second pass in CI.
 METAL_TEST_ARGS := -p oxidelake-memory -p oxidelake-device -p oxidelake-compute -p oxidelake-runtime -p oxidelake-tui --features oxidelake-runtime/metal --locked --timings
 
-.PHONY: help fmt fmt-check lint lint-cuda lint-metal lint-predict test test-predict test-io-uring test-mixed-build test-termlens-cli test-metal test-metal-device check-cuda check-predict-no-second-cuda doc coherence deny gate metal msrv quickstart clean-data release-scripts crate-metadata skill-version zizmor ci-scripts stress-tui
+.PHONY: help fmt fmt-check lint lint-cuda lint-metal lint-predict lint-metrics test test-predict test-metrics test-io-uring test-mixed-build test-termlens-cli test-metal test-metal-device check-cuda check-predict-no-second-cuda doc coherence deny gate metal msrv quickstart clean-data release-scripts crate-metadata skill-version zizmor ci-scripts stress-tui
 
 help: ## list targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-14s %s\n", $$1, $$2}'
@@ -40,6 +40,17 @@ lint-predict: ## clippy with the predict feature (in-database inference)
 
 test-predict: ## the `predict` UDF against the model it loaded
 	$(CARGO) test -p oxidelake-compute --features predict --test predict --locked --timings
+
+# `metrics` was compiled only by `doc` and `deny`, both --all-features, and
+# rustdoc does not type-check function bodies: a gated function that failed
+# `cargo check` passed the whole gate (#128).
+lint-metrics: ## clippy with the metrics feature (the Prometheus endpoint)
+	$(CARGO) clippy -p oxidelake-runtime --all-targets --features metrics --locked -- -D warnings
+
+# --bins builds `oxide-worker` and `oxide-scheduler`, whose `--metrics-port`
+# is the feature's whole surface; the endpoint's tests are in the library.
+test-metrics: ## the Prometheus endpoint's tests, with the binaries that serve it
+	$(CARGO) test -p oxidelake-runtime --features metrics --lib --bins --locked --timings
 
 # `cargo tree` prints an already-shown node again as `name ver (*)`, so a
 # bare `grep -c` counts tree references rather than crates and reports two
@@ -148,7 +159,7 @@ zizmor: ## workflow security audit at the level CI enforces (cargo install --loc
 deny: ## advisories, licenses, bans and sources (cargo-deny)
 	$(CARGO) deny --all-features check
 
-gate: fmt-check lint lint-cuda lint-predict test test-predict test-mixed-build check-cuda check-predict-no-second-cuda doc coherence deny release-scripts crate-metadata ci-scripts skill-version zizmor msrv ## the whole quality gate — the same list CI runs
+gate: fmt-check lint lint-cuda lint-predict lint-metrics test test-predict test-metrics test-mixed-build check-cuda check-predict-no-second-cuda doc coherence deny release-scripts crate-metadata ci-scripts skill-version zizmor msrv ## the whole quality gate — the same list CI runs
 ifeq ($(UNAME),Linux)
 	$(MAKE) test-io-uring
 endif
