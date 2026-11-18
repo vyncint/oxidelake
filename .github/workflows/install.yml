@@ -45,7 +45,11 @@ jobs:
           - toolchain: msrv
             locked: "--locked"
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    # `cargo install` compiles the whole chain from source. On 0.2.0's
+    # release the macOS legs took 22 and 26 minutes; on 0.3.0's (Ballista
+    # 55) the locked one took 43.6 and the fresh one ran into 45 and was
+    # cancelled, while Linux stayed near 15. macOS gets twice the room.
+    timeout-minutes: ${{ matrix.os == 'macos-latest' && 90 || 45 }}
     steps:
       - name: Ask the registry what was published
         id: crate
