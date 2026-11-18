@@ -27,7 +27,7 @@ Acceptance
 
 Deliverables
 - [x] `oxidelake-core`: `EngineError` (Io, Allocation, Device, Execution, Plan, Format, Unsupported…), `DeviceId`, `BackendKind`, `BufferLayout`, `BatchStream`, `TelemetryHub`
-- [x] `oxidelake-memory`: `AlignedBuf` (64/128 B), pinned host allocation via cudarc with observable `MemoryClass::{Pinned, Pageable}` fallback, Metal shared buffers (macOS), `SpillManager` (3 tiers, watermarks, LRU/clock, async demote/promote to Arrow IPC spill files, metrics)
+- [x] `oxidelake-memory`: `AlignedBuf` (64/128 B), pinned host allocation via cudarc with observable `MemoryClass::{Pinned, Pageable}` fallback, Metal shared buffers (macOS), `SpillManager` (3 tiers, byte budgets, least-recently-touched demotion inline when a tier goes over budget, promotion from disk on read, Arrow IPC spill files, tier and spill counters; no watermarks, background demotion or throughput metric)
 - [x] `oxidelake-device`: object-safe sync `GpuBackend`; `CpuBackend` fully functional; `CudaBackend` with the NVRTC pipeline wired; `MetalBackend` with runtime MSL compile; `HardwareDetector` with `OXIDE_BACKEND` override
 
 Acceptance
@@ -150,7 +150,10 @@ read it as "a running deployment can now tell whether its GPU is being used".
       stock DataFusion on a CUDA device.
 - [ ] `GpuAggregateExec` streams and partitions instead of collecting the
       whole input (#29, audit P4) — *Acceptance:* a input larger than device
-      memory completes.
+      memory completes. Both halves are in 0.3.0: each input partition is
+      aggregated on its own (#90), and a device is handed one batch at a
+      time while the operator keeps one accumulator per group (#29). Not yet
+      run on a GPU.
 - [ ] `SUM(Int64)` wraps on overflow on every backend, as stock DataFusion's
       does (#46) — *Acceptance:* the conformance overflow fixture equals
       DataFusion's wrapped answer on a CUDA device. The line first asked for
@@ -173,8 +176,10 @@ read it as "a running deployment can now tell whether its GPU is being used".
 - [ ] CUDA join table persists across probe batches (#45) — *Acceptance:*
       the build side is uploaded once per join, not once per batch. The
       join half is in 0.3.0 (`GpuBackend::prepare_join_build`, compiled and
-      not yet run on a GPU); the aggregate half, sizing the group table by
-      distinct keys, is open.
+      not yet run on a GPU), and so is the aggregate half: a batch's groups
+      are numbered on the device, so its accumulators and what is read back
+      hold one entry per group rather than two per row (compiled, and checked
+      on the CPU under a shim of the CUDA builtins; not yet run on a GPU).
 - [x] io_uring store wired into sessions, or the claim stays demoted (#24,
       audit P12) — *the claim stays demoted*: no session constructs it, and
       every document says so. **0.1.4**

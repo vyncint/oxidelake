@@ -1,21 +1,101 @@
 """Regression tests for selective gates, feature reuse, and stress coverage."""
 
 from collections import Counter
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 from copy import deepcopy
+import http.server
 import importlib.util
 import io
 import json
 import os
 from pathlib import Path
+import hashlib
+import re
+import socket
 import subprocess
 import tempfile
+import textwrap
+import threading
 import unittest
 from unittest.mock import patch
 
 
 SCRIPTS = Path(__file__).resolve().parent
 ROOT = SCRIPTS.parent.parent
+
+
+def workflow_job(workflow, job):
+    """The lines of `job` in .github/workflows/`workflow`, its key line included.
+
+    Indentation-based rather than a YAML parse: the standard library has no
+    YAML reader, and these files keep every job at two spaces.
+    """
+    lines = (ROOT / ".github/workflows" / workflow).read_text().splitlines()
+    start = lines.index(f"  {job}:")
+    end = next((i for i in range(start + 1, len(lines))
+                if lines[i].startswith("  ") and not lines[i].startswith("   ") and lines[i].strip()
+                and not lines[i].lstrip().startswith("#")), len(lines))
+    return lines[start:end]
+
+
+def workflow_step(workflow, name):
+    """The lines of the step called `name` in .github/workflows/`workflow`."""
+    lines = (ROOT / ".github/workflows" / workflow).read_text().splitlines()
+    start = lines.index(next(line for line in lines if line.strip() == f"- name: {name}"))
+    indent = len(lines[start]) - len(lines[start].lstrip())
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].strip()
+                and len(lines[i]) - len(lines[i].lstrip()) <= indent), len(lines))
+    return lines[start:end]
+
+
+def step_condition(workflow, name):
+    """The step's `if:` expression, or None."""
+    return next((line.strip()[len("if: "):] for line in workflow_step(workflow, name)
+                 if line.strip().startswith("if: ")), None)
+
+
+def step_script(workflow, name):
+    """The step's `run: |` block, dedented: the script the runner executes."""
+    lines = workflow_step(workflow, name)
+    start = next(i for i, line in enumerate(lines) if line.strip() == "run: |")
+    key = len(lines[start]) - len(lines[start].lstrip())
+    body = []
+    for line in lines[start + 1:]:
+        if line.strip() and len(line) - len(line.lstrip()) <= key:
+            break
+        body.append(line)
+    return textwrap.dedent("\n".join(body)) + "\n"
+
+
+@contextmanager
+def stand_in(statuses):
+    """A local HTTP server answering with `statuses` in turn, then the last one.
+
+    Yields its base URL and the list of paths it was asked for.
+    """
+    asked = []
+    remaining = list(statuses)
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            asked.append(self.path)
+            status = remaining.pop(0) if len(remaining) > 1 else remaining[0]
+            self.send_response(status)
+            self.end_headers()
+            self.wfile.write(b'{"errors":[{"detail":"stand-in"}]}')
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}", asked
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
 
 
 def load_script(name):
@@ -188,7 +268,8 @@ class MetalBuildTests(unittest.TestCase):
 
 
 class MetadataTests(unittest.TestCase):
-    def run_metadata(self, overrides=None, packaged=True):
+    def run_metadata(self, overrides=None, packaged=True,
+                     readme="[repo](https://github.com/vyncint/oxidelake)\n"):
         metadata = {"name": "oxidelake-core", "publish": None, "readme": "README.md",
                     "repository": "https://github.com/vyncint/oxidelake", "homepage": "https://github.com/vyncint/oxidelake",
                     "documentation": "https://docs.rs/oxidelake-core", "keywords": ["gpu"],
@@ -200,6 +281,10 @@ class MetadataTests(unittest.TestCase):
             scripts.mkdir(parents=True)
             script = scripts / "check-crate-metadata.sh"
             script.write_text((SCRIPTS / script.name).read_text())
+            links = scripts / "check-readme-links.sh"
+            links.write_text((SCRIPTS / links.name).read_text())
+            links.chmod(0o755)
+            (root / "README.md").write_text(readme)
             (root / "metadata.json").write_text(json.dumps({"packages": [metadata]}))
             cargo = root / "cargo"
             cargo.write_text('#!/bin/sh\ncase "$1" in\nmetadata) cat metadata.json ;;\npackage) printf "%s\\n" "$PACKAGED_FILE" ;;\n*) exit 2 ;;\nesac\n')
@@ -219,6 +304,64 @@ class MetadataTests(unittest.TestCase):
             with self.subTest(overrides=overrides):
                 self.assertNotEqual(self.run_metadata(overrides).returncode, 0)
         self.assertNotEqual(self.run_metadata(packaged=False).returncode, 0)
+
+    def test_a_relative_readme_link_fails_the_metadata_gate(self):
+        run = self.run_metadata(readme="see [the spec](docs/SPEC.md)\n")
+        self.assertNotEqual(run.returncode, 0, run.stdout)
+        self.assertIn("relative link 'docs/SPEC.md'", run.stdout)
+
+
+class ReadmeLinkTests(unittest.TestCase):
+    """README.md's links work on crates.io, which renders it from each crate's directory (#129)."""
+
+    REPO = "https://github.com/vyncint/oxidelake"
+
+    def check(self, readme, files=()):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scripts = root / ".github/scripts"
+            scripts.mkdir(parents=True)
+            script = scripts / "check-readme-links.sh"
+            script.write_text((SCRIPTS / script.name).read_text())
+            (root / "README.md").write_text(readme)
+            for name in files:
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).write_text("")
+            return subprocess.run(["/bin/bash", str(script)], text=True, capture_output=True)
+
+    def test_the_committed_readme_passes(self):
+        run = subprocess.run(["/bin/bash", str(SCRIPTS / "check-readme-links.sh")],
+                             text=True, capture_output=True, cwd=ROOT)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+
+    def test_absolute_links_to_paths_that_are_here_pass(self):
+        run = self.check(
+            f"[spec]({self.REPO}/blob/main/docs/SPEC.md#phases) [crates]({self.REPO}/tree/main/crates)\n"
+            f"[ci]({self.REPO}/actions) [top](#top) [mail](mailto:a@example.invalid)\n"
+            '<img src="https://img.shields.io/badge/x-y-blue">\n\n'
+            f"[ref]: {self.REPO}/blob/main/LICENSE\n",
+            files=("docs/SPEC.md", "crates/oxidelake-core/Cargo.toml", "LICENSE"))
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+
+    def test_every_form_of_relative_link_fails_and_names_it(self):
+        for readme, link in (("see [spec](docs/SPEC.md)\n", "docs/SPEC.md"),
+                             ('see [spec](<docs/SPEC.md> "the spec")\n', "docs/SPEC.md"),
+                             ("see [spec][s]\n\n[s]: docs/SPEC.md\n", "docs/SPEC.md"),
+                             ("<img src='docs/logo.png'>\n", "docs/logo.png"),
+                             ('<a href="CHANGELOG.md">changes</a>\n', "CHANGELOG.md"),
+                             ("[license](./LICENSE)\n", "./LICENSE")):
+            with self.subTest(readme=readme):
+                run = self.check(readme, files=(link,))
+                self.assertNotEqual(run.returncode, 0, run.stdout)
+                self.assertIn(f"relative link '{link}'", run.stdout)
+
+    def test_a_link_into_this_repository_must_name_a_path_that_is_here(self):
+        run = self.check(f"[gone]({self.REPO}/blob/main/docs/GONE.md#top)\n", files=("docs/SPEC.md",))
+        self.assertNotEqual(run.returncode, 0, run.stdout)
+        self.assertIn("names docs/GONE.md, which is not in this repository", run.stdout)
+
+    def test_finding_no_links_is_a_failure_not_a_pass(self):
+        self.assertNotEqual(self.check("A README with no links.\n").returncode, 0)
 
 
 class SkillVersionTests(unittest.TestCase):
@@ -275,6 +418,11 @@ class SkillVersionTests(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
 
 
+def declared(path, key):
+    """The quoted value of `key = "…"` in a TOML file at the repository root."""
+    return re.search(rf'^{key} = "(.*)"$', (ROOT / path).read_text(), re.M).group(1)
+
+
 class ToolchainTests(unittest.TestCase):
     def test_msrv_uses_rustup_even_when_path_cargo_is_not_a_proxy(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -285,11 +433,428 @@ class ToolchainTests(unittest.TestCase):
             cargo.write_text('#!/bin/sh\necho "PATH Cargo does not support +toolchain" >&2\nexit 9\n')
             cargo.chmod(0o755)
             rustup = root / "rustup"
-            rustup.write_text('#!/bin/sh\ncase "$1" in\ntoolchain) exit 0 ;;\nrun) test "$3" = cargo && test "$4" = check ;;\n*) exit 2 ;;\nesac\n')
+            rustup.write_text(
+                '#!/bin/sh\ncase "$1" in\ntoolchain) exit 0 ;;\n'
+                'run) test "$2" = "$WANT" || exit 3\n'
+                '     case "$3" in cargo) test "$4" = check ;; rustc) test "$4" = --version ;; *) exit 4 ;; esac ;;\n'
+                '*) exit 2 ;;\nesac\n')
             rustup.chmod(0o755)
             run = subprocess.run(["make", "msrv"], cwd=root, text=True, capture_output=True,
-                                 env={**os.environ, "PATH": directory + os.pathsep + os.environ["PATH"]})
+                                 env={**os.environ, "PATH": directory + os.pathsep + os.environ["PATH"],
+                                      "WANT": declared("Cargo.toml", "rust-version")})
             self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+
+
+class FeatureCoverageTests(unittest.TestCase):
+    """Every optional feature of oxidelake-runtime is compiled by CI (#128).
+
+    AGENTS.md: "A feature that no job builds is a feature that is already
+    broken". `metrics` was compiled only by `doc` and `deny`, both with
+    --all-features, and rustdoc does not type-check function bodies.
+    """
+
+    @staticmethod
+    def ci_targets():
+        """The make targets ci.yml runs: matrix `target:` values and `run: make X`."""
+        text = (ROOT / ".github/workflows/ci.yml").read_text()
+        return (set(re.findall(r"\btarget: ([\w-]+)", text))
+                | set(re.findall(r"\brun: make ([\w-]+)\s*$", text, re.M)))
+
+    @staticmethod
+    def compiled_by(target):
+        """{feature: {cargo verb}} for the cargo commands `make <target>` runs.
+
+        `make -n` expands $(CARGO) and the shared argument variables, so a
+        feature named through METAL_TEST_ARGS counts too. --all-features
+        does not: rustdoc and cargo-deny type-check nothing.
+        """
+        out = subprocess.run(["make", "-n", target], cwd=ROOT, capture_output=True, text=True,
+                             check=True).stdout
+        found = {}
+        for verb, args in re.findall(r"\bcargo (clippy|test|check|build)\b([^;\n]*)", out):
+            for spec in re.findall(r"--features[ =]([\w/,-]+)", args):
+                for feature in spec.split(","):
+                    found.setdefault(feature.split("/")[-1], set()).add(verb)
+        return found
+
+    def test_every_runtime_feature_is_compiled_by_a_ci_job(self):
+        manifest = (ROOT / "crates/oxidelake-runtime/Cargo.toml").read_text()
+        section = manifest.split("\n[features]\n", 1)[1].split("\n[", 1)[0]
+        features = set(re.findall(r"^([\w-]+) = \[", section, re.M)) - {"default"}
+        coverage = {}
+        for target in self.ci_targets():
+            for feature, verbs in self.compiled_by(target).items():
+                coverage.setdefault(feature, set()).update(verbs)
+        self.assertIn("metrics", features, "the manifest parse found the features")
+        for feature in sorted(features):
+            self.assertIn(feature, coverage, f"no CI job compiles oxidelake-runtime's `{feature}` feature")
+        self.assertLessEqual({"clippy", "test"}, coverage["metrics"],
+                             "`metrics` is linted and its tests run, not merely compiled")
+
+    def test_the_metrics_targets_ci_runs_are_part_of_make_gate(self):
+        gate = re.search(r"^gate: (.*?) ##", (ROOT / "Makefile").read_text(), re.M).group(1).split()
+        metrics = [t for t in sorted(self.ci_targets()) if "metrics" in self.compiled_by(t)]
+        self.assertTrue(metrics)
+        for target in metrics:
+            self.assertIn(target, gate, f"ci.yml runs `make {target}` and `make gate` does not")
+
+
+class CudaDeviceTests(unittest.TestCase):
+    """gpu.yml executes the CUDA suites on a device, by hand only (#38).
+
+    No self-hosted runner exists yet, so the workflow has never run; these
+    pin what it will do when one does.
+    """
+
+    def make_cuda(self, nvidia_smi):
+        """`make test-cuda-device` with a fake nvidia-smi script and a cargo that records its calls."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("Makefile", "Cargo.toml"):
+                (root / name).write_text((ROOT / name).read_text())
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            calls = root / "cargo.log"
+            for name, body in (("cargo", f'echo "OXIDE_BACKEND=${{OXIDE_BACKEND:-}} $*" >> "{calls}"'),
+                               ("nvidia-smi", nvidia_smi)):
+                (bin_dir / name).write_text(f"#!/bin/sh\n{body}\n")
+                (bin_dir / name).chmod(0o755)
+            env = {k: v for k, v in os.environ.items() if k not in ("CARGO", "OXIDE_BACKEND")}
+            env["PATH"] = str(bin_dir) + os.pathsep + os.environ["PATH"]
+            run = subprocess.run(["make", "test-cuda-device"], cwd=root, env=env, text=True, capture_output=True)
+            return run, calls.read_text().splitlines() if calls.exists() else []
+
+    def test_without_a_gpu_it_fails_before_building_anything(self):
+        run, calls = self.make_cuda(
+            "echo 'NVIDIA-SMI has failed because it could not communicate with the NVIDIA driver.'\nexit 9")
+        self.assertNotEqual(run.returncode, 0, run.stdout)
+        self.assertIn("no NVIDIA GPU visible", run.stdout + run.stderr)
+        self.assertEqual(calls, [], "a run that executes nothing must not look like one that passed")
+
+    def test_with_a_gpu_it_runs_the_suites_the_t4_session_ran(self):
+        run, calls = self.make_cuda("echo 'GPU 0: Tesla T4 (UUID: GPU-00000000-0000-0000-0000-000000000000)'")
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertEqual(calls, [
+            "OXIDE_BACKEND= test -p oxidelake-device --features cuda --locked -- --include-ignored",
+            "OXIDE_BACKEND=cuda test -p oxidelake-compute --features cuda --locked -- --ignored",
+            "OXIDE_BACKEND=cuda test -p oxidelake-runtime --features cuda --locked --test embedded",
+        ])
+
+    def test_it_runs_only_when_dispatched_on_the_gpu_label(self):
+        lines = (ROOT / ".github/workflows/gpu.yml").read_text().splitlines()
+        start = lines.index("on:")
+        triggers = []
+        for line in lines[start + 1:]:
+            if line.strip() and not line.startswith(" "):
+                break
+            if line.startswith("  ") and not line.startswith("   ") and not line.lstrip().startswith("#"):
+                triggers.append(line.strip().rstrip(":"))
+        self.assertEqual(triggers, ["workflow_dispatch"],
+                         "a self-hosted runner on a public repository must never run pull_request code")
+        self.assertIn("    runs-on: [self-hosted, linux, gpu]", lines)
+
+    def test_a_failing_suite_fails_the_step_whose_output_is_teed(self):
+        script = step_script("gpu.yml", "CUDA suites on the device")
+        self.assertIn("make test-cuda-device", script)
+        with tempfile.TemporaryDirectory() as directory:
+            fake = Path(directory) / "make"
+            fake.write_text("#!/bin/sh\necho 'test result: FAILED. 1 failed'\nexit 2\n")
+            fake.chmod(0o755)
+            run = subprocess.run(["bash", "--noprofile", "--norc", "-e", "-c", script], cwd=directory,
+                                 env={**os.environ, "PATH": directory + os.pathsep + os.environ["PATH"]},
+                                 capture_output=True, text=True)
+            self.assertNotEqual(run.returncode, 0, "tee's success hid the suite's failure")
+            self.assertIn("FAILED", (Path(directory) / "cuda-device.log").read_text())
+
+
+class MsrvJobTests(unittest.TestCase):
+    """The CI msrv job compiles with the declared rust-version (#127).
+
+    It installed 1.94.1 and then ran a plain `cargo check`, which rustup
+    resolved through rust-toolchain.toml to 1.98.0: a gate that could not
+    fail on an MSRV break.
+    """
+
+    PIN = "RUSTUP_TOOLCHAIN: ${{ steps.msrv.outputs.msrv }}"
+
+    @staticmethod
+    def steps():
+        job = workflow_job("ci.yml", "msrv")
+        starts = [i for i, line in enumerate(job) if line.startswith("      - ")]
+        return [job[a:b] for a, b in zip(starts, starts[1:] + [len(job)])]
+
+    @staticmethod
+    def run_text(step):
+        """What the step's `run:` executes, or "" for a `uses:` step."""
+        for i, line in enumerate(step):
+            key_text = line.strip().removeprefix("- ")
+            if key_text.startswith("run:"):
+                inline = key_text[len("run:"):].strip()
+                if inline != "|":
+                    return inline
+                key = len(line) - len(line.lstrip())
+                body = []
+                for later in step[i + 1:]:
+                    if later.strip() and len(later) - len(later.lstrip()) <= key:
+                        break
+                    body.append(later)
+                return "\n".join(body)
+        return ""
+
+    def test_every_step_that_compiles_names_the_declared_toolchain(self):
+        compiling = [step for step in self.steps()
+                     if re.search(r"\b(cargo|make|rustc)\b", self.run_text(step))]
+        self.assertTrue(compiling, "the msrv job compiles nothing")
+        for step in compiling:
+            self.assertIn(self.PIN, [line.strip() for line in step],
+                          "a step that compiles without RUSTUP_TOOLCHAIN gets rust-toolchain.toml's "
+                          "compiler, not the MSRV:\n" + "\n".join(step))
+        self.assertIn("make msrv", [self.run_text(step).strip() for step in compiling],
+                      "the job runs the check a contributor runs, `make msrv`")
+
+    def test_the_assertion_fails_when_rust_toolchain_toml_wins(self):
+        script = step_script("ci.yml", "Assert the MSRV toolchain is the one in use")
+        msrv = declared("Cargo.toml", "rust-version")
+        pinned = declared("rust-toolchain.toml", "channel")
+        self.assertNotEqual(msrv, pinned, "with no gap between the two this test proves nothing")
+        with tempfile.TemporaryDirectory() as directory:
+            rustc = Path(directory) / "rustc"
+            # rustup's precedence as this step meets it: RUSTUP_TOOLCHAIN,
+            # then rust-toolchain.toml (the runner's default comes last).
+            rustc.write_text(f'#!/bin/sh\necho "release: ${{RUSTUP_TOOLCHAIN:-{pinned}}}"\n')
+            rustc.chmod(0o755)
+
+            def step(**env):
+                base = {k: v for k, v in os.environ.items() if k != "RUSTUP_TOOLCHAIN"}
+                base.update(PATH=directory + os.pathsep + os.environ["PATH"], MSRV=msrv, **env)
+                # What a `run:` step with no `shell:` is on a Linux runner.
+                return subprocess.run(["bash", "--noprofile", "--norc", "-e", "-c", script],
+                                      env=base, capture_output=True, text=True)
+
+            pinned_run = step(RUSTUP_TOOLCHAIN=msrv)
+            self.assertEqual(pinned_run.returncode, 0, pinned_run.stdout + pinned_run.stderr)
+            unpinned = step()
+            self.assertNotEqual(unpinned.returncode, 0, unpinned.stdout)
+            self.assertIn(f"::error::the msrv job is not running rustc {msrv}", unpinned.stdout)
+
+
+class SemverBaselineTests(unittest.TestCase):
+    """release.yml never skips cargo-semver-checks on a crates.io error (#130).
+
+    The step this replaced read every answer but a 200 as "first release" and
+    skipped the check, so a 429 or a 503 switched the gate off before publish.
+    """
+
+    def lookup(self, url, attempts=3):
+        return subprocess.run(
+            ["bash", str(SCRIPTS / "crates-io-baseline.sh"), "oxidelake-core"],
+            env={**os.environ, "CRATES_IO_API": url, "BASELINE_ATTEMPTS": str(attempts),
+                 "BASELINE_PAUSE": "0"},
+            capture_output=True, text=True,
+        )
+
+    def test_a_published_baseline_passes(self):
+        with stand_in([200]) as (url, asked):
+            run = self.lookup(url)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertEqual(asked, ["/crates/oxidelake-core"])
+
+    def test_an_unavailable_registry_fails_after_retrying(self):
+        for status in (503, 429, 500):
+            with self.subTest(status=status), stand_in([status]) as (url, asked):
+                run = self.lookup(url, attempts=3)
+                self.assertNotEqual(run.returncode, 0, run.stdout)
+                self.assertIn("::error::", run.stdout)
+                self.assertIn(f"HTTP {status}", run.stdout)
+                self.assertEqual(len(asked), 3, "a 429 or a 5xx is retried before failing")
+
+    def test_a_blip_is_retried_and_then_passes(self):
+        with stand_in([503, 429, 200]) as (url, asked):
+            run = self.lookup(url, attempts=4)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertEqual(len(asked), 3)
+
+    def test_a_missing_crate_is_an_error_not_a_first_release(self):
+        for status in (404, 301, 403):
+            with self.subTest(status=status), stand_in([status]) as (url, asked):
+                run = self.lookup(url)
+                self.assertNotEqual(run.returncode, 0, run.stdout)
+                self.assertIn("::error::", run.stdout)
+                self.assertEqual(len(asked), 1, "only an overloaded registry is worth asking again")
+
+    def test_no_answer_at_all_fails(self):
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        run = self.lookup(f"http://127.0.0.1:{port}", attempts=2)
+        self.assertNotEqual(run.returncode, 0, run.stdout)
+        self.assertIn("HTTP 000", run.stdout)
+
+    def test_the_release_workflow_runs_the_check_unconditionally(self):
+        job = workflow_job("release.yml", "semver")
+        self.assertIn("        run: .github/scripts/crates-io-baseline.sh oxidelake-core", job)
+        self.assertTrue(any("obi1kenobi/cargo-semver-checks-action@" in line for line in job))
+        conditions = [line.strip() for line in job if line.strip().startswith("if:")]
+        self.assertEqual(conditions, [], "no step of the semver job may be skipped")
+
+
+FAKE_GH = r'''#!/usr/bin/env python3
+"""The three `gh release` calls binaries.yml makes, against a directory."""
+import os, shutil, sys
+from pathlib import Path
+
+release = Path(os.environ["FAKE_RELEASE"])
+args = sys.argv[1:]
+with open(os.environ["FAKE_GH_LOG"], "a") as log:
+    log.write(" ".join(args) + "\n")
+
+
+def option(name, default=None):
+    return args[args.index(name) + 1] if name in args else default
+
+
+if args[:2] == ["release", "view"]:
+    for asset in sorted(release.iterdir()):
+        print(asset.name)
+elif args[:2] == ["release", "upload"]:
+    upload = Path(args[3])
+    if (release / upload.name).exists():
+        sys.exit(f"asset under the same name already exists: {upload.name}")
+    shutil.copy(upload, release / upload.name)
+elif args[:2] == ["release", "download"]:
+    name = option("--pattern")
+    if not (release / name).exists():
+        sys.exit(f"no assets match the file pattern {name}")
+    shutil.copy(release / name, Path(option("--dir", ".")) / name)
+else:
+    sys.exit(f"fake gh: unexpected call {args}")
+'''
+
+
+class BinariesRepairTests(unittest.TestCase):
+    """binaries.yml completes a partly attached target from what is attached (#131).
+
+    The steps run verbatim out of the workflow, against a fake `gh` whose
+    release is a directory. The job's `if:` conditions are mirrored in
+    `run_job`, and `test_the_build_runs_only_when_nothing_is_attached`
+    holds the workflow to that mirror.
+    """
+
+    TAG = "v0.3.0"
+    TARGET = "x86_64-unknown-linux-musl"
+    ARCHIVE = "oxidelake-0.3.0-x86_64-unknown-linux-musl.tar.gz"
+    ALIAS = "oxidelake-x86_64-unknown-linux-musl.tar.gz"
+    STATUS = "Already on the release?"
+    RECOVER = "Recover the missing files from the attached archive"
+    ATTACH = "Attach to the release"
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        for name in ("bin", "release", "work"):
+            (self.root / name).mkdir()
+        gh = self.root / "bin" / "gh"
+        gh.write_text(FAKE_GH)
+        gh.chmod(0o755)
+        self.release = self.root / "release"
+        self.log = self.root / "gh.log"
+        self.log.touch()
+
+    def attach(self, name, data):
+        (self.release / name).write_bytes(data)
+
+    def step(self, name):
+        output = self.root / "github_output"
+        output.write_text("")
+        run = subprocess.run(
+            ["bash", "-e", "-c", step_script("binaries.yml", name)], cwd=self.root / "work",
+            text=True, capture_output=True,
+            env={**os.environ, "PATH": str(self.root / "bin") + os.pathsep + os.environ["PATH"],
+                 "TAG": self.TAG, "TARGET": self.TARGET, "GITHUB_REPOSITORY": "vyncint/oxidelake",
+                 "GITHUB_OUTPUT": str(output), "GH_TOKEN": "unused", "FAKE_RELEASE": str(self.release),
+                 "FAKE_GH_LOG": str(self.log)},
+        )
+        outputs = dict(line.split("=", 1) for line in output.read_text().splitlines() if "=" in line)
+        return run, outputs
+
+    def run_job(self):
+        """The matrix job for one target, with nothing to build."""
+        run, outputs = self.step(self.STATUS)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        state = outputs.get("state")
+        self.assertIn(state, {"complete", "repair", "build"}, run.stdout)
+        if state == "build":
+            self.fail("this target needs a build, which a test cannot run")
+        for name in ((self.RECOVER, self.ATTACH) if state == "repair" else ()):
+            run, _ = self.step(name)
+            self.assertEqual(run.returncode, 0, f"{name}:\n{run.stdout}{run.stderr}")
+        return state
+
+    def sha256_line(self, name):
+        digest = hashlib.sha256((self.release / name).read_bytes()).hexdigest()
+        return f"{digest}  {name}\n"
+
+    def test_an_archive_without_its_checksum_and_alias_is_completed(self):
+        # The run the issue describes: the archive uploaded, then the step died.
+        self.attach(self.ARCHIVE, b"the archive that was published")
+        self.assertEqual(self.run_job(), "repair")
+        names = sorted(p.name for p in self.release.iterdir())
+        self.assertEqual(names, sorted([self.ARCHIVE, self.ARCHIVE + ".sha256",
+                                        self.ALIAS, self.ALIAS + ".sha256"]))
+        self.assertEqual((self.release / self.ARCHIVE).read_bytes(), b"the archive that was published")
+        self.assertEqual((self.release / self.ALIAS).read_bytes(), b"the archive that was published",
+                         "the alias is the published archive, not a rebuild")
+        self.assertEqual((self.release / f"{self.ARCHIVE}.sha256").read_text(), self.sha256_line(self.ARCHIVE))
+        self.assertEqual((self.release / f"{self.ALIAS}.sha256").read_text(), self.sha256_line(self.ALIAS))
+        # And a second re-run finds nothing left to do.
+        self.assertEqual(self.run_job(), "complete")
+
+    def test_each_missing_file_alone_is_restored_without_touching_the_rest(self):
+        published = b"published bytes"
+        everything = {self.ARCHIVE: published, self.ALIAS: published,
+                      f"{self.ARCHIVE}.sha256": None, f"{self.ALIAS}.sha256": None}
+        for missing in everything:
+            with self.subTest(missing=missing):
+                for asset in self.release.iterdir():
+                    asset.unlink()
+                for name, data in everything.items():
+                    if name != missing:
+                        self.attach(name, data if data is not None else
+                                    f"{hashlib.sha256(published).hexdigest()}  {name[:-len('.sha256')]}\n".encode())
+                before = {p.name: p.read_bytes() for p in self.release.iterdir()}
+                self.assertEqual(self.run_job(), "repair")
+                after = {p.name: p.read_bytes() for p in self.release.iterdir()}
+                self.assertEqual(set(after), set(everything))
+                for name, data in before.items():
+                    self.assertEqual(after[name], data, f"{name} was attached already and must not change")
+
+    def test_a_complete_target_is_left_alone(self):
+        for name in (self.ARCHIVE, self.ALIAS):
+            self.attach(name, b"bytes")
+            self.attach(f"{name}.sha256", self.sha256_line(name).encode())
+        self.assertEqual(self.run_job(), "complete")
+        self.assertNotIn("release upload", self.log.read_text())
+
+    def test_an_empty_release_is_built(self):
+        _, outputs = self.step(self.STATUS)
+        self.assertEqual(outputs.get("state"), "build")
+
+    def test_a_checksum_without_any_archive_is_refused(self):
+        # A rebuilt archive cannot match a checksum somebody already downloaded.
+        self.attach(f"{self.ARCHIVE}.sha256", b"0" * 64 + b"  " + self.ARCHIVE.encode() + b"\n")
+        run, outputs = self.step(self.STATUS)
+        self.assertNotEqual(run.returncode, 0, run.stdout)
+        self.assertIn("::error::", run.stdout)
+        self.assertNotIn("state", outputs)
+
+    def test_the_build_runs_only_when_nothing_is_attached(self):
+        for name in ("Add the target's standard library", "Build", "Package"):
+            self.assertEqual(step_condition("binaries.yml", name), "steps.published.outputs.state == 'build'", name)
+        self.assertEqual(step_condition("binaries.yml", "musl linker (Linux)"),
+                         "steps.published.outputs.state == 'build' && contains(matrix.target, 'musl')")
+        self.assertEqual(step_condition("binaries.yml", self.RECOVER), "steps.published.outputs.state == 'repair'")
+        self.assertEqual(step_condition("binaries.yml", self.ATTACH), "steps.published.outputs.state != 'complete'")
 
 
 if __name__ == "__main__":

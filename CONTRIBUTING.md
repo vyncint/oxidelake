@@ -150,7 +150,8 @@ allowlist is a list on purpose, so that widening it is a visible decision.
 - PRs are **squash-merged** — keep the PR title in Conventional Commit form,
   since it becomes the commit subject on `main`. Branches are deleted on merge.
 - Required checks: `required-green` (CI policy, fmt, clippy on
-  default/cuda/predict, Linux tests on default/io-uring/predict, Metal and PTY
+  default/cuda/predict/metrics, Linux tests on
+  default/io-uring/predict/metrics, Metal and PTY
   tests, MSRV, docs, deny, release scripts, zizmor), plus `commit-policy`
   (DCO + attribution). Both must pass before merge; direct pushes to `main`
   are blocked by a ruleset. Only known documentation-only changes may skip
@@ -182,8 +183,8 @@ publish in dependency order through crates.io Trusted Publishing.
 1. **The gate is the definition of done.** `make gate` must be green before a
    change is pushed; CI runs the same list (see
    [docs/verification.md](docs/verification.md)). Formatting, clippy with
-   `-D warnings` on the default, `cuda`, `predict` and (on macOS) `metal`
-   features, the full test suite, rustdoc with warnings denied, the
+   `-D warnings` on the default, `cuda`, `predict`, `metrics` and (on
+   macOS) `metal` features, the full test suite, rustdoc with warnings denied, the
    dependency-coherence check and `cargo deny` are all part of it.
 2. **Honesty rule.** Nothing is reported as working unless it ran. GPU code that
    only compiled is recorded as exactly that in [STATUS.md](STATUS.md)'s
@@ -198,7 +199,8 @@ publish in dependency order through crates.io Trusted Publishing.
    DataFusion fixes arrow/parquet/object_store. Bump the whole chain or
    nothing; never add a `datafusion-*` sub-crate ([docs/dependencies.md](docs/dependencies.md)).
 6. **An optional capability is a feature, and a feature needs a job.** `cuda`,
-   `metal`, `io-uring` and `predict` are all off by default (ADR-0006). A
+   `metal`, `io-uring`, `predict` and `metrics` are all off by default
+   (ADR-0006). A
    feature that no CI job builds is a feature that is already broken — add it
    to `make gate` and to `ci.yml` in the same change that adds it.
 

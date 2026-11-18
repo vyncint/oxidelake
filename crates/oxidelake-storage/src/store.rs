@@ -170,6 +170,14 @@ mod tests {
     /// The read the review measured at 2 GB of RSS: one range declared far
     /// past the object. Refused before the inner store reserves anything;
     /// ranges inside the object read as before.
+    ///
+    /// Far, not huge. This runs in the library's test binary with no memory
+    /// cap, and `LocalFileSystem` zero-fills a range before it reads into
+    /// it: were the bound to regress, a range of 2^40 bytes would grow the
+    /// binary until something outside the test killed it (where overcommit
+    /// is on, the reservation succeeds and every page is then touched; 54 GB
+    /// before the OOM killer, measured). At 64 MiB a regression costs 64 MiB
+    /// and still fails the assertion below.
     #[tokio::test]
     async fn a_range_past_the_end_is_refused_before_it_is_read() {
         let dir = tempfile::tempdir().unwrap();
@@ -187,7 +195,7 @@ mod tests {
         );
         #[allow(clippy::reversed_empty_ranges)]
         let inverted = 5..3;
-        for bad in [0..(1u64 << 40), 9..11, inverted] {
+        for bad in [0..(64u64 << 20), 9..11, inverted] {
             let err = store
                 .get_ranges(&p, &[0..1, bad.clone()])
                 .await

@@ -48,5 +48,9 @@ for pkg in $(printf '%s' "$meta" | jq -r '.packages[] | select(.publish == null)
     say "FAIL $pkg: ${missing[*]}"; fail=1
   fi
 done
+# The README every crate carries has to work where crates.io renders it,
+# from each crate's own directory, so its links are part of the metadata
+# (#129). Run whatever the loop above found, so one run reports both.
+.github/scripts/check-readme-links.sh || fail=1
 [ "$fail" -eq 0 ] || { echo "crate metadata: at least one published crate is missing what crates.io shows (see above)"; exit 1; }
-echo "crate metadata: every published crate carries README, repository, homepage, docs.rs link, keywords, categories"
+echo "crate metadata: every published crate carries README, repository, homepage, docs.rs link, keywords, categories; README links are absolute"

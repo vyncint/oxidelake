@@ -314,12 +314,20 @@ fn moving_the_selection_leaves_the_right_half_alone() -> termlens::Result<()> {
         after.rect_text(40.., ..),
         "the right half of the dashboard changed when the selection moved"
     );
-    // The rows it did touch are the two panels that show a selection.
+    // The rows it did touch are the two panels that show a selection: the
+    // plan's first two rows, and the Inspector from the row under its title
+    // to the one above its bottom border, which sits on the footer. Read off
+    // the screen rather than written down, because the Inspector's height is
+    // set by what it must show (#122), not by this test.
+    let (title, _) = before
+        .find("Inspector")
+        .unwrap_or_else(|| panic!("no Inspector panel:\n{before}"));
+    let bottom_border = before.size().1 - 2;
     let mut rows: Vec<u16> = diff.cells().map(|(row, ..)| row).collect();
     rows.dedup();
     assert!(
         rows.iter()
-            .all(|row| (2..=3).contains(row) || (14..=21).contains(row)),
+            .all(|row| (2..=3).contains(row) || (title + 1..bottom_border).contains(row)),
         "↓ should repaint the plan rows and the Inspector body, got {rows:?}:\n{diff}"
     );
     quit(&mut t)

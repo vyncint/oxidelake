@@ -8,6 +8,22 @@ versions (0.x) may contain breaking changes; they are always listed under a
 
 ## [Unreleased]
 
+### Added
+
+- **`operator_stats()` on `GpuFilterExec`, `GpuHashJoinExec`,
+  `GpuAggregateExec` and `GpuVectorDistanceExec`** returns the counters
+  that exec instance has reported to its telemetry hub (`None` before it
+  first executes, or without a hub). It is how a reader pairs a plan node
+  with its own counters: the hub's entries carry only a name (#123).
+- **`gpu.yml`: the CUDA suites on a real device, on demand** (#38). A
+  `workflow_dispatch` workflow for a self-hosted runner labelled `gpu` runs
+  the new `make test-cuda-device` (the device tests with the ignored ones,
+  the conformance suite under `OXIDE_BACKEND=cuda`, and `embedded.rs`) and
+  uploads its log; the target fails rather than skips without a GPU.
+  `docs/RELEASING.md` step 0 now requires a green run on the release
+  candidate. No such runner is registered yet, so it has never run: until
+  one is, a release says its CUDA paths are compiled-only.
+
 ### Changed
 
 - **Breaking: `query_literal` now returns a result and rejects empty query
@@ -219,6 +235,20 @@ versions (0.x) may contain breaking changes; they are always listed under a
   `CoalescePartitionsExec` over the partial half; the final half merges
   partial results, so a `COUNT` reads there as `SUM(count(t.v)[count])`.
 
+- **The CUDA aggregate reads back its groups, not its group table** (the
+  aggregate half of #45). Every call allocated accumulators of two slots
+  per input row and copied all of them back with the table's keys and
+  states, so a batch's device-to-host traffic followed its rows whatever
+  the number of groups: 16.3 MB for a 65 536-row batch with 101 groups
+  and eight aggregates (the 0.2.0 kernel and host flow, run on the CPU
+  under a shim of the CUDA builtins). A second launch now numbers the
+  groups densely on the device, the accumulators hold one entry per group,
+  and only the groups are read back: 12 KB for the same batch. The index
+  of keys stays two slots per row, on the device, and since #29 a call is
+  one batch. Results are unchanged. Compiled, not yet run on a GPU:
+  STATUS.md has the T4 commands, and `tests/aggregate_timing.rs` times a
+  10-million-row `GROUP BY` before and after.
+
 ### Fixed
 
 - **`SUM(Int64)` wraps on overflow under a GPU target, as it does in stock
@@ -239,11 +269,14 @@ versions (0.x) may contain breaking changes; they are always listed under a
   skip `NaN`: an all-`NaN` group reported `MIN = inf`, `MAX = -inf`, values
   that are not in the data, and the sign of a zero result was unspecified.
   The CUDA kernel now reduces the same order on integer keys. **Visible
-  change:** for a group containing `NaN` or a signed zero, a GPU target's
-  answer can differ from `--target cpu`, because stock DataFusion's grouped
-  float `MIN`/`MAX` depends on row order (`MIN` of {1.0, NaN, 3.0} is 3.0
-  there) and lets its starting values through (`MAX` of {-inf} is
-  `f64::MIN`); the GPU target's answer is the order-independent one.
+  change:** for a group containing `NaN`, or both `-0.0` and `0.0`, a GPU
+  target's answer can differ from `--target cpu`, because stock
+  DataFusion's grouped float `MIN`/`MAX` depends on row order (`MIN` of
+  {1.0, NaN, 3.0} is 3.0 there, and of {0.0, -0.0} whichever zero it reads
+  first) and lets its starting values through (`MAX` of {-inf} is
+  `f64::MIN`); the GPU target's answer is the order-independent one, and the
+  one DataFusion's own ungrouped `MIN`/`MAX` gives. A group with one sign of
+  zero gets DataFusion's answer on every target.
 
 - **An `ORDER BY` over an aggregate of sorted input comes back in order
   under a GPU target** (#89). DataFusion aggregates input that is sorted on
@@ -319,6 +352,51 @@ versions (0.x) may contain breaking changes; they are always listed under a
   now gets `Format` or `Io` (#118).
 
 ### Fixed
+
+- **A refused `oxide gen-data` no longer empties the table it would have
+  replaced** (#119). `--row-group-rows 0` truncated the existing
+  `t.parquet` to zero bytes before refusing the flag. The options are now
+  checked before anything is created, and `ParquetFileWriter` (so
+  `write_parquet`, `write_demo_table` and `gen-data`) writes a temporary
+  `.t.parquet.<pid>.<n>.tmp` beside the destination and renames it into
+  place only once the file is complete: a refused, failed or abandoned
+  write leaves the previous file as it was, a reader sees the old file
+  until the rename, and a symlink at the destination is replaced rather
+  than written through. A process killed mid-write can leave the temporary
+  file behind; delete it.
+
+- **The io_uring store's `put` is atomic and answers like
+  `LocalFileSystem`** (#111). `UringLocalFileSystem` truncated the object
+  and rewrote it in place, so a put that failed part way (a full disk, a
+  file size limit) destroyed the object it was replacing, and a put to a
+  path that was a symlink wrote through it to a file outside the store's
+  root. It now writes a staged `<name>#<n>` file beside the object and
+  renames it into place, as `LocalFileSystem` does: the old object stays
+  whole until the new one is, and a symlink is replaced. A put now returns
+  the e_tag `head` reports, where it returned none, and a put with
+  attributes is refused with `NotImplemented`, where they were accepted and
+  dropped.
+
+- **The io_uring store reads the file it checked a get's preconditions
+  against** (#113). `UringLocalFileSystem::get_opts` checked `if_match`
+  and `if_modified_since` against a stat of the path, then opened the path
+  again to read it, so an object replaced in between came back as the new
+  bytes under the old object's size and e_tag. The file is now opened once,
+  by `LocalFileSystem::get_opts`, which checks the preconditions against
+  that descriptor, and every byte is read from it; `get_ranges` likewise
+  reads all its ranges from one descriptor rather than opening the path
+  once per range. An invalid range now fails with `LocalFileSystem`'s error
+  for it.
+
+- **The io_uring store streams a get instead of buffering all of it**
+  (#112). `UringLocalFileSystem::get_opts` read the whole requested range
+  into one buffer before returning its stream, so streaming a 1 GiB object
+  cost 1 GiB of memory, and an object larger than the address space left
+  aborted the process on the allocation. The stream now reads chunks of at
+  most 8 MiB on the ring as the consumer pulls them: a 3 GiB object streams
+  in 384 chunks with a peak RSS of 12 MiB. `GetResult::bytes()`, and so
+  `get_range`, still returns one buffer the size of the range; a range
+  over 8 MiB is now assembled from chunks, at the cost of one copy.
 
 - **A failed spill-manager insert no longer leaves its batch behind**
   (#115). `SpillManager::insert_host` and `insert_device` registered the
@@ -409,6 +487,112 @@ versions (0.x) may contain breaking changes; they are always listed under a
   is refused. `oxidelake_planner::codec::PLAN_FINGERPRINT` and
   `build_description()` are public, and `make test-mixed-build` runs both
   cases with real binaries.
+- **A `GROUP BY` under a GPU target holds its groups, not its input** (#29).
+  `GpuAggregateExec` collected each input partition whole before
+  aggregating, so every grouped aggregate on a `cuda` or `metal` target, and
+  on a cluster with `OXIDE_CLUSTER_BACKEND=cuda`, held its input in memory
+  at once, and a CUDA device was handed the whole partition in one call,
+  which fails above 2^30 rows (the group table, two slots per row rounded up
+  to a power of two, must be addressable with a `u32`). It now hands the
+  backend one input batch at a time and folds each batch's groups into one
+  accumulator per group on the host. Measured with `/usr/bin/time -v` on a
+  machine without a GPU, a `GROUP BY k` over 20 million rows under
+  `--target cuda` peaked at 1,039 MiB and now peaks at 158 MiB, which no
+  longer grows with the input (stock DataFusion: 138 MiB). **Visible change:**
+  the operator's `batches` counter in telemetry and the TUI now counts input
+  batches, as every other operator's does, where it counted one per
+  partition; `rows_in` and `rows_out` are unchanged. New public pieces:
+  `GpuOperator::aggregate_into` and
+  `oxidelake_device::cpu::kernels::GroupedAggregator`.
+
+### Fixed
+
+- **A crates.io error can no longer switch the release's semver check off.**
+  `release.yml` read every answer but HTTP 200 — a 429, a 503 — as "first
+  release, no baseline" and skipped `cargo-semver-checks` minutes before
+  `cargo publish`. Every crate has been published since 0.1.0, so the job
+  now fails unless crates.io confirms the baseline, after retrying a 429 or
+  a 5xx; a release that hits an outage is re-run rather than published
+  unchecked (#130).
+- **Re-running `binaries.yml` repairs a partly attached target.** The re-run
+  guard looked for a target's archive alone, so a run that uploaded the
+  archive and died before its `.sha256` or its unversioned alias left that
+  target skipped on every re-run — and the Homebrew formula job failing on
+  the missing checksum, without printing which. A target now counts as
+  attached only when all four of its files are; the missing ones are
+  recovered from the attached archive's own bytes, never rebuilt (#131).
+- **`oxide tui --table Trips=…` opens the dashboard.** A table name with an
+  upper-case letter is registered as DataFusion folds it, `trips`, but the
+  column-profile query asked for `"Trips"`, so the dashboard failed with
+  `table 'datafusion.public.Trips' not found` after the query itself had
+  run. The profile query now names the table as registration resolved it
+  (#120).
+- **The Describe panel shows min and max for every column DataFusion can
+  order.** It profiled `Int64`, `Float64` and `Utf8` only, and DataFusion
+  reads Parquet strings as `Utf8View`, so string columns read from Parquet
+  (the demo table's `s` among them), other integer widths, decimals, dates,
+  timestamps, booleans and lists showed blank min and max. Whether a type
+  applies is now asked of DataFusion's own `min`/`max` accumulators, so a
+  type they cannot order (a `Map`) is left out instead of failing the
+  profile; every numeric type now gets P25/P50/P99 too, not only `Int64`
+  and `Float64` (#121).
+- **The Inspector shows each operator its own counters.** `oxide tui
+  --query` merged the hub's counters by operator name, so two operators of
+  one name — a self-join's two filters — each showed the sum of both: a
+  filter emitting 129 rows and one emitting 1451 both read `6000 in / 1580
+  out`. Each plan node's counters are now read from the node itself
+  (#123).
+- **A dashboard whose refresh brings the plan can select all of it.**
+  `run_terminal` bounded the selection by the plan the model had before
+  the first refresh, so with a tick and a `refresh` that supplies the plan
+  or grows it, as its documentation invites, `↓` stopped at the old
+  length — on the first operator when the model started empty. The
+  selection now follows the plan's length after every refresh, and moves to
+  the last operator left when the plan shrinks under it. `oxide tui` never
+  refreshes and was not affected. A loop of your own around `AppState` and
+  `render` gets the same from the new `AppState::set_node_count` (#126).
+- **The dashboard no longer cuts numbers at 80x24 or 120x40.** The
+  Describe panel asked for 62 columns whatever it held, so in any terminal
+  narrower than 128 every cell was clipped without a mark: the README's own
+  `oxide tui` at 80x24 showed `id`'s largest value, 999999, as `9999` and
+  `k`'s 19880 nulls as `198`, and at 120x40 `Float64` read `Float6`. Each
+  column is now as wide as its widest value, and a column there is no room
+  for is left out whole and named in the title — at 80x24 the panel reads
+  `Describe (hidden: p99)` for the demo and `Describe (hidden: type p25
+  p99)` for the README table; widen the terminal to see them. A tiny value
+  no longer rounds to zero (`-0.000012345678` printed `-0` in seven
+  columns; it is `-1.2e-5`). At 24 rows the Inspector now keeps its
+  `H2D / D2H` and `cpu fallback` lines, which needed 28, and Telemetry the
+  line saying whether its gauges can move at all, which needed 26 (#122).
+- **CI's `msrv` job compiles with the declared minimum Rust.** It installed
+  1.94.1 and then ran a plain `cargo check`, which rustup resolved through
+  `rust-toolchain.toml` to 1.98.0, so the job could not fail on code that
+  needs a newer compiler; `rust-version` was checked only by a local `make
+  msrv`. The job now runs `make msrv` under `RUSTUP_TOOLCHAIN` and first
+  asserts which `rustc` is in use (#127).
+- **The `metrics` feature is linted and tested in CI.** No CI job and no
+  `make gate` target built the Prometheus endpoint; only rustdoc and
+  `cargo deny` saw it, through `--all-features`, and rustdoc does not
+  type-check function bodies. `make lint-metrics` and `make test-metrics`
+  are now in the gate and in CI's clippy and Linux test matrices (#128).
+- **Every link on the nine crates.io pages works.** Each crate's README is
+  the workspace README, and crates.io resolves a relative link against that
+  crate's own directory, so all 28 relative targets in it (`docs/SPEC.md`,
+  `CHANGELOG.md`, `crates/oxidelake-core`, …) were 404s on every page. The
+  README now links with absolute GitHub URLs, and `make crate-metadata` fails
+  on a relative link or on a link into this repository that names a path it
+  does not have (#129).
+- **The documentation describes the code that exists** (#132). The spill
+  manager has no watermarks, no background demotion and no throughput
+  metric: the call that takes a tier over its byte budget demotes its least
+  recently touched batches before it returns, and the counters are running
+  totals (`docs/SPEC.md`, `docs/architecture.md`, `docs/roadmap.md`; the
+  dashboard's PCIe/NVMe figures are totals too, not the rates SPEC
+  promised). `docs/verification.md` records the 2026-09-06 T4 session
+  instead of saying no CUDA machine had run anything. `oxidelake-api`'s
+  crates.io description no longer offers PyO3 bindings, which were
+  deferred and do not exist. An io_uring comment named a test file that does
+  not exist; it names the test that does.
 
 - **NULL elements inside a vector column survive a GPU filter or join**
   (#105). The device transfer format carries one validity bit per row, so a

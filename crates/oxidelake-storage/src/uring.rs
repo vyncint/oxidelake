@@ -3,9 +3,13 @@
 //! A dedicated storage thread owns the ring: ranged reads and whole-object
 //! writes are submitted as `IORING_OP_READ` / `IORING_OP_WRITE` and their
 //! completions are bridged back to async callers through `oneshot` channels.
-//! Metadata operations (`list`, `head`, `delete`, `copy`, multipart uploads)
-//! delegate to the wrapped [`LocalFileSystem`], so both stores behave
-//! identically — the shared conformance test in `tests/` runs against both.
+//! A write goes to a staged file beside the object and is renamed over it,
+//! as `LocalFileSystem` does. A read is opened, and its preconditions and
+//! range checked, by the wrapped [`LocalFileSystem`]'s `get_opts`; the ring
+//! reads from the descriptor that check was made on. Metadata operations
+//! (`list`, `head`, `delete`, `copy`, multipart uploads) delegate to it
+//! outright, so both stores behave identically — the shared conformance
+//! test in `tests/` runs against both.
 //!
 //! Construction fails with a typed error where io_uring is unavailable
 //! (EPERM/ENOSYS in sandboxes, old kernels); callers fall back to
@@ -16,8 +20,10 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::ops::Range;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::UNIX_EPOCH;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -27,8 +33,8 @@ use object_store::local::LocalFileSystem;
 use object_store::path::Path;
 use object_store::{
     Attributes, CopyOptions, Error, GetOptions, GetResult, GetResultPayload, ListResult,
-    MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutMultipartOptions,
-    PutOptions, PutPayload, PutResult, RenameOptions, Result,
+    MultipartUpload, ObjectMeta, ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload,
+    PutResult, RenameOptions, Result,
 };
 use oxidelake_core::EngineError;
 use tokio::sync::{mpsc, oneshot};
@@ -41,16 +47,29 @@ const STORE: &str = "UringLocalFileSystem";
 /// visible nor bounded (#44).
 const JOB_QUEUE: usize = 256;
 
+/// The most of an object a streamed get reads at once (#112). `get_opts`
+/// used to read its whole range into one buffer before returning the
+/// stream, so streaming a 1 GiB object cost 1 GiB, and one larger than the
+/// address space left aborted on the allocation. Each chunk is now read on
+/// the ring when the consumer asks for it. 8 MiB keeps a Parquet column
+/// chunk read through `get_range` to one chunk (and no copy) in the common
+/// case; `LocalFileSystem`'s streams use 8 KiB.
+const STREAM_CHUNK: u64 = 8 << 20;
+
 enum Job {
     Read {
-        path: PathBuf,
+        /// The descriptor the caller opened and checked (#113). The job
+        /// holds it open until the read completes, whatever the caller does
+        /// meanwhile.
+        file: Arc<File>,
         range: Range<u64>,
         reply: oneshot::Sender<io::Result<Bytes>>,
     },
     Write {
         path: PathBuf,
-        data: Bytes,
-        reply: oneshot::Sender<io::Result<()>>,
+        payload: PutPayload,
+        /// The new object's e_tag.
+        reply: oneshot::Sender<io::Result<String>>,
     },
 }
 
@@ -96,8 +115,9 @@ fn submit_one(
         if let Err(e) = ring.submit_and_wait(1) {
             if e.kind() == io::ErrorKind::Interrupted {
                 // A signal, not a failure: the SQE is still in flight and the
-                // completion is still coming. This is the path the test in
-                // `tests/uring_signals.rs` drives.
+                // completion is still coming. This is the path
+                // `tests::a_signal_during_the_wait_does_not_abandon_the_completion`
+                // below drives (`make test-io-uring`).
                 continue;
             }
             if failure.is_none() {
@@ -142,10 +162,9 @@ fn submit_one(
 fn read_range(
     ring: &mut IoUring,
     seq: &mut u64,
-    path: &PathBuf,
+    file: &File,
     range: Range<u64>,
 ) -> io::Result<Bytes> {
-    let file = File::open(path)?;
     let len = usize::try_from(range.end.saturating_sub(range.start))
         .map_err(|_| io::Error::other("range too large"))?;
     let mut buf = vec![0u8; len];
@@ -170,20 +189,18 @@ fn read_range(
     Ok(Bytes::from(buf))
 }
 
-fn write_all(ring: &mut IoUring, seq: &mut u64, path: &PathBuf, data: &Bytes) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(path)?;
+fn write_at(
+    ring: &mut IoUring,
+    seq: &mut u64,
+    file: &File,
+    data: &[u8],
+    offset: u64,
+) -> io::Result<()> {
     let mut done = 0usize;
     while done < data.len() {
         let chunk = u32::try_from(data.len() - done).unwrap_or(u32::MAX);
         let entry = opcode::Write::new(types::Fd(file.as_raw_fd()), data[done..].as_ptr(), chunk)
-            .offset(done as u64)
+            .offset(offset + done as u64)
             .build();
         let n = submit_one(ring, &entry, seq)?;
         if n == 0 {
@@ -197,6 +214,100 @@ fn write_all(ring: &mut IoUring, seq: &mut u64, path: &PathBuf, data: &Bytes) ->
     Ok(())
 }
 
+/// The e_tag `LocalFileSystem` reports for a file with this metadata: inode,
+/// modification time in microseconds and size, in hex (object_store 0.13's
+/// private `get_etag`). `head` and `get_opts` answer through
+/// `LocalFileSystem`, so a put must return this exact string for a caller's
+/// `if_match` to work; `a_put_returns_the_e_tag_head_reports` holds the two
+/// together.
+fn e_tag(metadata: &std::fs::Metadata) -> String {
+    let mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
+        .unwrap_or_default()
+        .as_micros();
+    format!("{:x}-{mtime:x}-{:x}", metadata.ino(), metadata.len())
+}
+
+/// Creates `<path>#<n>` for the first free `n`: the name `LocalFileSystem`
+/// stages an upload under, which its listing skips, so a half-written
+/// object never shows up in `list` whichever store is writing it.
+fn new_staged_upload(path: &std::path::Path) -> io::Result<(File, PathBuf)> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut n = 1u64;
+    loop {
+        let mut staged = path.as_os_str().to_owned();
+        staged.push(format!("#{n}"));
+        let staged = PathBuf::from(staged);
+        // `create_new` (O_EXCL) neither follows a symlink planted under the
+        // name nor opens a file another upload is still writing.
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&staged)
+        {
+            Ok(file) => return Ok((file, staged)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => n += 1,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Writes `payload` to a staged file beside `path` and renames it over
+/// `path`, as `LocalFileSystem` does, returning the new object's e_tag
+/// (#111).
+///
+/// The store used to truncate `path` and write it in place. A write that
+/// failed part way (a full disk, a file size limit) then left the first part
+/// of the new object where the old one had been, a reader could see a
+/// half-written object, and a symlink at `path` was written through, to
+/// wherever it pointed, outside the store's root. The rename replaces the
+/// directory entry instead: the old object stays whole until the new one
+/// is, and a link is replaced rather than followed.
+fn write_staged(
+    ring: &mut IoUring,
+    seq: &mut u64,
+    path: &std::path::Path,
+    payload: &PutPayload,
+) -> io::Result<String> {
+    let (file, staged) = new_staged_upload(path)?;
+    let written = publish_staged(ring, seq, file, &staged, path, payload);
+    if written.is_err() {
+        // Best effort, as `LocalFileSystem` does: the object at `path` is
+        // untouched either way.
+        let _ = std::fs::remove_file(&staged);
+    }
+    written
+}
+
+fn publish_staged(
+    ring: &mut IoUring,
+    seq: &mut u64,
+    file: File,
+    staged: &std::path::Path,
+    path: &std::path::Path,
+    payload: &PutPayload,
+) -> io::Result<String> {
+    let mut offset = 0u64;
+    for part in payload.iter() {
+        write_at(ring, seq, &file, part, offset)?;
+        offset += part.len() as u64;
+    }
+    // Taken from the descriptor before the rename, as `LocalFileSystem` does,
+    // so it is this write's e_tag even if another put replaces the object
+    // the moment it lands. The rename keeps inode, mtime and size.
+    let tag = e_tag(&file.metadata()?);
+    // Closed first, as `LocalFileSystem` does: some FUSE filesystems only
+    // publish a file's contents when it is closed.
+    drop(file);
+    std::fs::rename(staged, path)?;
+    Ok(tag)
+}
+
 fn worker(mut rx: mpsc::Receiver<Job>, mut ring: IoUring) {
     // Submission counter for the ring this thread owns. Every SQE is tagged
     // with the next value so its completion can be recognised rather than
@@ -204,14 +315,48 @@ fn worker(mut rx: mpsc::Receiver<Job>, mut ring: IoUring) {
     let mut seq = 0u64;
     while let Some(job) = rx.blocking_recv() {
         match job {
-            Job::Read { path, range, reply } => {
-                let _ = reply.send(read_range(&mut ring, &mut seq, &path, range));
+            Job::Read { file, range, reply } => {
+                let _ = reply.send(read_range(&mut ring, &mut seq, &file, range));
             }
-            Job::Write { path, data, reply } => {
-                let _ = reply.send(write_all(&mut ring, &mut seq, &path, &data));
+            Job::Write {
+                path,
+                payload,
+                reply,
+            } => {
+                let _ = reply.send(write_staged(&mut ring, &mut seq, &path, &payload));
             }
         }
     }
+}
+
+/// Reads `range` of `file` on the ring thread behind `tx`.
+async fn ring_read(
+    tx: &mpsc::Sender<Job>,
+    location: &Path,
+    file: Arc<File>,
+    range: Range<u64>,
+) -> Result<Bytes> {
+    let (reply, rx) = oneshot::channel();
+    tx.send(Job::Read { file, range, reply })
+        .await
+        .map_err(|_| Error::Generic {
+            store: STORE,
+            source: "io_uring worker thread has exited".into(),
+        })?;
+    let result = rx.await.map_err(|_| Error::Generic {
+        store: STORE,
+        source: "io_uring worker dropped the reply".into(),
+    })?;
+    result.map_err(|e| UringLocalFileSystem::io_error(location, e))
+}
+
+/// An object `LocalFileSystem::get_opts` opened and checked: the descriptor
+/// and its answer for it (#113).
+struct Opened {
+    file: Arc<File>,
+    meta: ObjectMeta,
+    range: Range<u64>,
+    attributes: Attributes,
 }
 
 /// A local object store whose data-path reads and writes go through io_uring.
@@ -263,28 +408,78 @@ impl UringLocalFileSystem {
         }
     }
 
-    async fn read(&self, location: &Path, range: Range<u64>) -> Result<Bytes> {
-        let path = self.filesystem_path(location)?;
-        let (reply, rx) = oneshot::channel();
-        self.tx
-            .send(Job::Read { path, range, reply })
-            .await
-            .map_err(|_| Error::Generic {
+    /// Opens the object through `LocalFileSystem::get_opts`, which opens the
+    /// file once, checks `options`' preconditions against `fstat` of that
+    /// descriptor and resolves the range against its size, and returns the
+    /// descriptor with its answer (#113).
+    ///
+    /// Everything this store then reads, it reads from that descriptor.
+    /// It used to stat the path for the check and have the worker open the
+    /// path again to read, so an object replaced in between came back as the
+    /// new bytes under the old object's size and e_tag. Taking the check
+    /// from `LocalFileSystem` also keeps its errors and its e_tags, which
+    /// is what callers of either store see.
+    async fn open(&self, location: &Path, options: GetOptions) -> Result<Opened> {
+        let GetResult {
+            payload,
+            meta,
+            range,
+            attributes,
+        } = self.inner.get_opts(location, options).await?;
+        match payload {
+            GetResultPayload::File(file, _) => Ok(Opened {
+                file: Arc::new(file),
+                meta,
+                range,
+                attributes,
+            }),
+            GetResultPayload::Stream(_) => Err(Error::Generic {
                 store: STORE,
-                source: "io_uring worker thread has exited".into(),
-            })?;
-        let result = rx.await.map_err(|_| Error::Generic {
-            store: STORE,
-            source: "io_uring worker dropped the reply".into(),
-        })?;
-        result.map_err(|e| Self::io_error(location, e))
+                source: "LocalFileSystem answered a get with a stream rather than a file".into(),
+            }),
+        }
     }
 
-    async fn write(&self, location: &Path, data: Bytes) -> Result<()> {
+    async fn read(&self, location: &Path, file: Arc<File>, range: Range<u64>) -> Result<Bytes> {
+        ring_read(&self.tx, location, file, range).await
+    }
+
+    /// `range` of `file` as a stream of chunks of at most [`STREAM_CHUNK`]
+    /// bytes, each read on the ring only when the consumer pulls it (#112):
+    /// the stream holds one chunk at a time, whatever the object's size.
+    fn chunks(
+        &self,
+        location: &Path,
+        file: Arc<File>,
+        range: Range<u64>,
+    ) -> BoxStream<'static, Result<Bytes>> {
+        let tx = self.tx.clone();
+        let location = location.clone();
+        let end = range.end;
+        stream::try_unfold(range.start, move |offset| {
+            let (tx, location, file) = (tx.clone(), location.clone(), Arc::clone(&file));
+            async move {
+                if offset >= end {
+                    return Ok(None);
+                }
+                let next = end.min(offset.saturating_add(STREAM_CHUNK));
+                let chunk = ring_read(&tx, &location, file, offset..next).await?;
+                Ok(Some((chunk, next)))
+            }
+        })
+        .boxed()
+    }
+
+    /// Writes `payload` as the object at `location` and returns its e_tag.
+    async fn write(&self, location: &Path, payload: PutPayload) -> Result<String> {
         let path = self.filesystem_path(location)?;
         let (reply, rx) = oneshot::channel();
         self.tx
-            .send(Job::Write { path, data, reply })
+            .send(Job::Write {
+                path,
+                payload,
+                reply,
+            })
             .await
             .map_err(|_| Error::Generic {
                 store: STORE,
@@ -320,12 +515,23 @@ impl ObjectStore for UringLocalFileSystem {
     ) -> Result<PutResult> {
         match opts.mode {
             PutMode::Overwrite => {
-                self.write(location, Bytes::from(payload)).await?;
+                // Refused the way `LocalFileSystem` refuses them: accepting
+                // attributes and then dropping them told the caller they
+                // were stored (#111).
+                if !opts.attributes.is_empty() {
+                    return Err(Error::NotImplemented {
+                        operation: "`put_opts` with `opts.attributes` specified".into(),
+                        implementer: self.to_string(),
+                    });
+                }
+                let e_tag = self.write(location, payload).await?;
                 Ok(PutResult {
-                    e_tag: None,
+                    e_tag: Some(e_tag),
                     version: None,
                 })
             }
+            // `Create` and `Update` stay `LocalFileSystem`'s, refusals and
+            // the order it checks mode and attributes in included.
             _ => self.inner.put_opts(location, payload, opts).await,
         }
     }
@@ -339,41 +545,40 @@ impl ObjectStore for UringLocalFileSystem {
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
-        let meta: ObjectMeta = self.inner.head(location).await?;
-        // `LocalFileSystem::get_opts` checks these before reading anything, and
-        // the two stores are documented as behaving identically — so a
-        // conditional request that one store honours and the other ignores is
-        // a difference a caller cannot see until it matters (#44). Checked
-        // against the same `meta` the read below is ranged against.
-        options.check_preconditions(&meta)?;
-        let range = match &options.range {
-            Some(r) => r.as_range(meta.size).map_err(|e| Error::Generic {
-                store: STORE,
-                source: Box::new(e),
-            })?,
-            None => 0..meta.size,
-        };
-        if options.head {
-            return Ok(GetResult {
-                payload: GetResultPayload::Stream(stream::empty().boxed()),
-                meta,
-                range,
-                attributes: Attributes::default(),
-            });
-        }
-        let bytes = self.read(location, range.clone()).await?;
-        Ok(GetResult {
-            payload: GetResultPayload::Stream(stream::once(async move { Ok(bytes) }).boxed()),
+        // Preconditions (#44) and the range are `LocalFileSystem`'s answer
+        // for the descriptor `open` returns, and the stream below reads from
+        // that descriptor (#113), a bounded chunk at a time (#112).
+        let head = options.head;
+        let Opened {
+            file,
             meta,
             range,
-            attributes: Attributes::default(),
+            attributes,
+        } = self.open(location, options).await?;
+        let payload = if head {
+            stream::empty().boxed()
+        } else {
+            self.chunks(location, file, range.clone())
+        };
+        Ok(GetResult {
+            payload: GetResultPayload::Stream(payload),
+            meta,
+            range,
+            attributes,
         })
     }
 
     async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+        // One descriptor for every range, as `LocalFileSystem` reads them:
+        // an object replaced part way through comes back from one version,
+        // not from two (#113).
+        let Opened { file, .. } = self.open(location, GetOptions::default()).await?;
         let mut out = Vec::with_capacity(ranges.len());
         for range in ranges {
-            out.push(self.read(location, range.clone()).await?);
+            out.push(
+                self.read(location, Arc::clone(&file), range.clone())
+                    .await?,
+            );
         }
         Ok(out)
     }

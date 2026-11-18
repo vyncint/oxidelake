@@ -8,6 +8,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow::array::{
@@ -17,6 +18,7 @@ use arrow::array::{
 use arrow::buffer::NullBuffer;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::util::display::{ArrayFormatter, FormatOptions};
+use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::physical_plan::{ExecutionPlan, collect, displayable};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use oxidelake_compute::{
@@ -228,6 +230,20 @@ async fn check_join_chunked(backend: Arc<dyn GpuBackend>, seed: u64) {
     assert_eq!(sorted_rows(&batches), expected, "chunked join seed={seed}");
 }
 
+/// `batch` as one partition of `piece`-row batches, the way a scan hands
+/// them over (one empty batch when `batch` has no rows).
+fn in_pieces(batch: &RecordBatch, piece: usize) -> Arc<dyn ExecutionPlan> {
+    let rows = batch.num_rows();
+    let mut pieces: Vec<RecordBatch> = (0..rows)
+        .step_by(piece)
+        .map(|offset| batch.slice(offset, piece.min(rows - offset)))
+        .collect();
+    if pieces.is_empty() {
+        pieces.push(batch.clone());
+    }
+    MemorySourceConfig::try_new_exec(&[pieces], batch.schema(), None).unwrap()
+}
+
 async fn check_aggregate(backend: Arc<dyn GpuBackend>, seed: u64, rows: usize) {
     let ctx = SessionContext::new();
     let batch = gen_left(seed, rows);
@@ -246,11 +262,34 @@ async fn check_aggregate(backend: Arc<dyn GpuBackend>, seed: u64, rows: usize) {
             (AggregateFunction::Max, 0),
         ],
     };
-    let exec = GpuAggregateExec::try_new(physical_plan(&ctx, batch).await, spec, backend.kind())
-        .unwrap()
-        .with_backend(backend);
-    let actual = exec_rows(&ctx, Arc::new(exec)).await;
-    assert_eq!(actual, expected, "aggregate seed={seed} rows={rows}");
+    // The rows as one batch, then as 7-row batches. The operator folds each
+    // batch's groups into its accumulators as the batches arrive (#29), so on
+    // a device every piece is a launch of its own whose groups are merged on
+    // the host — the path one batch never takes.
+    for piece in [rows.max(1), 7] {
+        let hub = TelemetryHub::new();
+        let exec =
+            GpuAggregateExec::try_new(in_pieces(&batch, piece), spec.clone(), backend.kind())
+                .unwrap()
+                .with_backend(Arc::clone(&backend))
+                .with_telemetry(Arc::clone(&hub));
+        let actual = exec_rows(&ctx, Arc::new(exec)).await;
+        assert_eq!(
+            actual, expected,
+            "aggregate seed={seed} rows={rows} piece={piece}"
+        );
+        // Equal rows would also come from the CPU fallback: on a backend that
+        // aggregates on its device, every batch must have run there.
+        if backend.kind().is_gpu() && backend.supports_aggregate() && rows > 0 {
+            let snapshot = &hub.snapshot().operators[0];
+            assert_eq!(
+                (snapshot.batches, snapshot.fallback_batches),
+                (rows.div_ceil(piece) as u64, 0),
+                "seed={seed} rows={rows} piece={piece}: {snapshot:?}"
+            );
+            assert!(snapshot.bytes_h2d > 0, "{snapshot:?}");
+        }
+    }
 }
 
 // --- aggregate edge cases (#100, #46) ----------------------------------------
@@ -349,6 +388,7 @@ async fn gpu_aggregate_edges_match_the_reference_when_available() {
     );
     check_sum_overflow(Arc::clone(&backend)).await;
     check_float_min_max(Arc::clone(&backend)).await;
+    check_signed_zeros(Arc::clone(&backend)).await;
     if backend.supports_aggregate() {
         let hub = TelemetryHub::new();
         let stats = hub.register_operator("GpuAggregateExec", backend.kind());
@@ -408,36 +448,55 @@ fn special_float_groups() -> Vec<FloatGroup> {
     ]
 }
 
-/// The groups as two batches, the first value of every group in one and the
-/// rest in the other; `reversed` swaps the batches. A result that depends on
-/// which batch comes first is the bug this section exists for.
-fn special_float_batches(reversed: bool) -> Vec<RecordBatch> {
+/// `k Int64?`, `v Float64` from `rows`.
+fn float_batch(rows: &[FloatRow]) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
         Field::new("k", DataType::Int64, true),
         Field::new("v", DataType::Float64, false),
     ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(
+                rows.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+            )),
+            Arc::new(Float64Array::from(
+                rows.iter().map(|(_, v)| *v).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap()
+}
+
+/// The groups as two batches, the first value of every group in one and the
+/// rest in the other; `reversed` swaps the batches. A result that depends on
+/// which batch comes first is the bug this section exists for.
+fn special_float_batches(reversed: bool) -> Vec<RecordBatch> {
     let (mut first, mut rest): (Vec<FloatRow>, Vec<FloatRow>) = (Vec::new(), Vec::new());
     for (k, values, _) in special_float_groups() {
         for (i, v) in values.into_iter().enumerate() {
             if i == 0 { &mut first } else { &mut rest }.push((k, v));
         }
     }
-    let batch = |rows: Vec<FloatRow>| {
-        RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(Int64Array::from(
-                    rows.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
-                )),
-                Arc::new(Float64Array::from(
-                    rows.iter().map(|(_, v)| *v).collect::<Vec<_>>(),
-                )),
-            ],
-        )
-        .unwrap()
-    };
-    let (a, b) = (batch(first), batch(rest));
+    let (a, b) = (float_batch(&first), float_batch(&rest));
     if reversed { vec![b, a] } else { vec![a, b] }
+}
+
+/// `(MIN, MAX)` per key from batches laid out as `k, MIN(v), MAX(v)`, as bit
+/// patterns, so `-0.0` is not `0.0` and a NaN's sign counts.
+fn min_max_bits(batches: &[RecordBatch]) -> BTreeMap<Option<i64>, (u64, u64)> {
+    let mut groups = BTreeMap::new();
+    for b in batches {
+        let keys = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let col = |i: usize| b.column(i).as_any().downcast_ref::<Float64Array>().unwrap();
+        let (mins, maxs) = (col(1), col(2));
+        for row in 0..b.num_rows() {
+            let key = keys.is_valid(row).then(|| keys.value(row));
+            let pair = (mins.value(row).to_bits(), maxs.value(row).to_bits());
+            assert!(groups.insert(key, pair).is_none(), "group {key:?} twice");
+        }
+    }
+    groups
 }
 
 /// MIN/MAX(Float64) per group, compared bit for bit, so `-0.0` is not `0.0`
@@ -460,22 +519,12 @@ async fn check_float_min_max(backend: Arc<dyn GpuBackend>) {
             .unwrap()
             .with_backend(Arc::clone(&backend));
         let out = collect(Arc::new(exec), ctx.task_ctx()).await.unwrap();
-        let mut actual = std::collections::BTreeMap::new();
-        for b in &out {
-            let keys = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-            let col = |i: usize| b.column(i).as_any().downcast_ref::<Float64Array>().unwrap();
-            let (mins, maxs) = (col(1), col(2));
-            for row in 0..b.num_rows() {
-                let key = keys.is_valid(row).then(|| keys.value(row));
-                let pair = (mins.value(row).to_bits(), maxs.value(row).to_bits());
-                assert!(actual.insert(key, pair).is_none(), "group {key:?} twice");
-            }
-        }
-        let expected: std::collections::BTreeMap<_, _> = special_float_groups()
+        let actual = min_max_bits(&out);
+        let expected: BTreeMap<_, _> = special_float_groups()
             .into_iter()
             .map(|(k, _, (min, max))| (k, (min.to_bits(), max.to_bits())))
             .collect();
-        let show = |m: &std::collections::BTreeMap<Option<i64>, (u64, u64)>| {
+        let show = |m: &BTreeMap<Option<i64>, (u64, u64)>| {
             m.iter()
                 .map(|(k, (lo, hi))| {
                     format!("{k:?}: {}/{}", f64::from_bits(*lo), f64::from_bits(*hi))
@@ -495,6 +544,110 @@ async fn check_float_min_max(backend: Arc<dyn GpuBackend>) {
 #[tokio::test]
 async fn cpu_float_min_max_follow_total_order() {
     check_float_min_max(cpu()).await;
+}
+
+// --- signed zeros against DataFusion 55 ---------------------------------------
+//
+// DataFusion 55 treats -0.0 and 0.0 as one value in comparisons and in GROUP
+// BY keys, but its grouped MIN/MAX keeps whichever zero it reads first: for a
+// group holding both, its answer follows row order, as with NaN above. Its
+// ungrouped MIN/MAX follows totalOrder, as the operator does. Where the
+// grouped answer does not depend on order, the operator must equal it.
+
+/// For `rows`: stock DataFusion's grouped `(MIN, MAX)` per key, the
+/// operator's on `backend`, and stock DataFusion's ungrouped pair.
+async fn signed_zero_answers(
+    backend: &Arc<dyn GpuBackend>,
+    rows: &[FloatRow],
+) -> (
+    BTreeMap<Option<i64>, (u64, u64)>,
+    BTreeMap<Option<i64>, (u64, u64)>,
+    (u64, u64),
+) {
+    let ctx = SessionContext::new();
+    let batch = float_batch(rows);
+    ctx.register_batch("z", batch.clone()).unwrap();
+    let grouped = ctx
+        .sql("SELECT k, MIN(v), MAX(v) FROM z GROUP BY k")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let whole = ctx
+        .sql("SELECT MIN(v), MAX(v) FROM z")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let bits = |i: usize| {
+        let col = whole[0].column(i);
+        col.as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .value(0)
+            .to_bits()
+    };
+    let spec = AggregateSpec {
+        group_by: 0,
+        aggregates: vec![(AggregateFunction::Min, 1), (AggregateFunction::Max, 1)],
+    };
+    let exec = GpuAggregateExec::try_new(in_pieces(&batch, rows.len()), spec, backend.kind())
+        .unwrap()
+        .with_backend(Arc::clone(backend));
+    let ours = collect(Arc::new(exec), ctx.task_ctx()).await.unwrap();
+    (
+        min_max_bits(&grouped),
+        min_max_bits(&ours),
+        (bits(0), bits(1)),
+    )
+}
+
+async fn check_signed_zeros(backend: Arc<dyn GpuBackend>) {
+    let (pos, neg) = (0.0f64, -0.0f64);
+    // One sign of zero per group: stock DataFusion's answer does not depend
+    // on row order, so the operator must give the same one, bit for bit.
+    let one_sign: Vec<FloatRow> = vec![
+        (Some(1), neg),
+        (Some(1), neg),
+        (Some(2), pos),
+        (Some(2), pos),
+        (Some(3), neg),
+        (Some(3), 1.0),
+        (Some(4), -1.0),
+        (Some(4), pos),
+        (None, neg),
+    ];
+    let (stock, ours, _) = signed_zero_answers(&backend, &one_sign).await;
+    assert_eq!(ours, stock, "one sign of zero per group");
+    // Both zeros in one group, in either order.
+    for (first, second) in [(pos, neg), (neg, pos)] {
+        let rows = [(Some(1), first), (Some(1), second)];
+        let (stock, ours, ungrouped) = signed_zero_answers(&backend, &rows).await;
+        // Pin the oracle too: if DataFusion stops keeping the zero it reads
+        // first, the difference this section documents is gone.
+        assert_eq!(
+            stock[&Some(1)],
+            (first.to_bits(), first.to_bits()),
+            "stock DataFusion's grouped MIN/MAX over {first:?}, {second:?}"
+        );
+        assert_eq!(
+            ungrouped,
+            (neg.to_bits(), pos.to_bits()),
+            "stock DataFusion's ungrouped MIN/MAX over {first:?}, {second:?}"
+        );
+        assert_eq!(
+            ours[&Some(1)],
+            (neg.to_bits(), pos.to_bits()),
+            "the operator over {first:?}, {second:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cpu_signed_zeros_equal_datafusion_where_its_answer_is_order_free() {
+    check_signed_zeros(cpu()).await;
 }
 
 fn reference_distances(

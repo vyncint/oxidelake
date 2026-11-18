@@ -57,7 +57,7 @@ dbg_macro = "deny"
 - `AlignedBuf`: RAII 64/128-byte-aligned host allocation (`std::alloc` with an explicit `Layout`).
 - Pinned host memory: with `cuda` active and a driver present, allocate page-locked memory through cudarc (the `cuMemHostAlloc` path) for true DMA without staging copies; otherwise fall back transparently to `AlignedBuf`. The path taken is observable (`MemoryClass::{Pinned, Pageable}`) so tests and the TUI can report it. In 0.x this is an available allocation, not the operator path: `Gpu*Exec` uploads from pageable Arrow buffers and downloads into pageable `Vec`s, so the staging copy is still paid. Pinned staging for operator transfers is P6 (#26).
 - Metal (macOS + `metal`): `MTLResourceStorageModeShared` buffers so CPU and GPU share one physical allocation (UMA, zero-copy).
-- **3-tier spill manager** (`SpillManager`): budgets for device VRAM, pinned/host RAM, and a local spill directory. Tracks registered batches (tier, bytes, last touch); at a high-watermark it asynchronously demotes cold batches device → host → disk and promotes on access (LRU/clock). Disk tier = Arrow IPC spill files written through the storage layer's object store (§2.4). Exposes atomic metrics (bytes per tier, demotions, promotions, spill throughput) for the TUI. On a GPU-less box the device tier is simply empty — the host ↔ disk machinery is fully testable with kilobyte budgets and `tempfile`.
+- **3-tier spill manager** (`SpillManager`): byte budgets for device VRAM and host RAM, and an unbounded local spill directory. Tracks registered batches (tier, bytes, last touch on a logical clock). Demotion is inline, not watermark-driven: the call that puts a tier over its budget (registering a batch, or reading one back from disk) demotes that tier's least recently touched batch one tier down, device → host → disk, until the tier fits, and only then returns. Reading a batch that is on disk promotes it back into host RAM; a device batch is read as a host copy and stays on the device. Disk tier = Arrow IPC spill files written through the storage layer's object store (§2.4). Exposes atomic metrics for the TUI: bytes per tier, and demotion and promotion counts with the bytes each moved (running totals; there is no throughput metric). In 0.x it is a library, not part of the query path: no operator registers a batch with it (#25). On a GPU-less box the device tier is simply empty — the host ↔ disk machinery is fully testable with kilobyte budgets and `tempfile`.
 
 ### 2.2 Hardware abstraction — `oxidelake-device`
 
@@ -111,7 +111,7 @@ DataFusion `ExecutionPlan` implementations: `GpuFilterExec` (fused filter + proj
 
 - filter + project: predicates `=, <, <=, >, >=` combined with `AND` over `Int64`/`Float64` columns against literals; projection = column selection; output is stream-compacted (block-scan prefix sums). `Float64` compares as DataFusion's own filter does: IEEE totalOrder with `-0.0` read as `+0.0`, so a NaN sorts above `+inf` (#28).
 - hash join: inner join on a single `Int64` key; an open-addressing linear-probing table in device memory with one slot per distinct key, holding that key's run in a row-index array — built once per operator on the host from the CPU reference's index and uploaded, then probed in parallel; a probe batch's matches stay on the device and its output is gathered in pieces of at most the session's batch size.
-- aggregate: `SUM/COUNT/MIN/MAX` over `Int64`/`Float64` grouped by one `Int64` key of low cardinality (atomic/radix reduction).
+- aggregate: `SUM/COUNT/MIN/MAX` over `Int64`/`Float64` grouped by one `Int64` key of low cardinality, one batch at a time with the groups merged on the host; on the device, an open-addressing index of the batch's keys, its groups numbered densely, and atomic reductions into one entry per group, so only the groups are read back.
 - vector distance: L2 and cosine between a query vector and a `FixedSizeList<Float32>` column (shared memory + warp shuffles on CUDA; threadgroup memory + simdgroup reductions on Metal).
 
 CUDA sources: `filter_project.cu`, `hash_join.cu`, `aggregation.cu`, `vector_distance.cu`. Metal sources: `filter_project.metal`, `vector_distance.metal` (joins and aggregates stay on CPU under Metal in v1 — say so in the docs). Kernels are plain `extern "C"` entry points with explicit grid-size math and bounds checks on every global access.
@@ -144,9 +144,9 @@ There is no private file format (ADR-0014). `oxidelake-storage` owns configurati
 
 ### 2.7 Telemetry & TUI — `oxidelake-tui`
 
-- `TelemetryHub` (in `oxidelake-core`): atomic counters/gauges written by the engine — per-operator rows and latency, bytes per memory tier, transfer and spill rates, plan summary — with cheap consistent snapshot reads. It is the *only* coupling between engine and TUI, which makes the TUI testable with synthetic snapshots. In v1 the TUI observes the local process only; cluster-wide telemetry is out of scope.
+- `TelemetryHub` (in `oxidelake-core`): atomic counters/gauges written by the engine — per-operator rows, latency and bytes transferred, bytes per memory tier, spill counts and bytes, plan summary — with cheap consistent snapshot reads. Every one is a running total or a gauge; nothing computes a rate. It is the *only* coupling between engine and TUI, which makes the TUI testable with synthetic snapshots. In v1 the TUI observes the local process only; cluster-wide telemetry is out of scope.
 - The app is a state machine decoupled from rendering: `fn render(state: &AppState, frame: &mut Frame)` is pure; `fn on_event(state: &mut AppState, ev: Event) -> Transition` handles input. Bracket every repaint in DEC 2026 synchronized updates (crossterm `BeginSynchronizedUpdate`/`EndSynchronizedUpdate`) so PTY tests observe complete frames only.
-- Panels: (1) **Plan DAG** — tree of physical operators with a hardware tag per node `[CUDA]`/`[Metal]`/`[CPU]`; (2) **Inspector** — selected operator's rows in/out, batch latency (ms), memory allocated; (3) **Telemetry** — gauges for VRAM / pinned RAM / disk spill and PCIe/NVMe transfer rates; (4) **Describe** — per-column min, max, null count, quantiles P25/P50/P99. Keys: `↑`/`↓` select DAG node, `Tab` cycles panels, `q` quits.
+- Panels: (1) **Plan DAG** — tree of physical operators with a hardware tag per node `[CUDA]`/`[Metal]`/`[CPU]`; (2) **Inspector** — selected operator's rows in/out, batch latency (ms), memory allocated; (3) **Telemetry** — gauges for VRAM / host RAM / disk spill and the PCIe/NVMe bytes moved so far (totals, not rates); (4) **Describe** — per-column min, max, null count, quantiles P25/P50/P99. Keys: `↑`/`↓` select DAG node, `Tab` cycles panels, `q` quits.
 - A deterministic demo binary `oxidelake-tui-demo` (`[[bin]]` inside `oxidelake-tui`) renders the dashboard from a fixed synthetic telemetry snapshot — no clock, no animation — so PTY tests can spawn it via `env!("CARGO_BIN_EXE_oxidelake-tui-demo")` (`termlens::bin!`).
 - **Headless tests, two layers:**
   1. `crates/oxidelake-tui/tests/tui_render_test.rs` — in-process: `ratatui::backend::TestBackend` + `insta::assert_snapshot!` of the rendered buffer at 80×24 and 120×40; state transitions (`↓`/`↑` selection, `Tab`, `q` → quit) asserted on `AppState`.
@@ -187,7 +187,7 @@ oxidelake/
     ├── oxidelake-planner/         # HardwarePlacementRule, OxidePhysicalCodec
     ├── oxidelake-runtime/         # OxideSession, Ballista scheduler/executor wrappers, `oxide` CLI (+ binaries)
     ├── oxidelake-tui/             # dashboard lib, oxidelake-tui-demo bin, TestBackend + termlens tests
-    └── oxidelake-api/             # DataFrame/SQL API, optional PyO3 bindings
+    └── oxidelake-api/             # DataFrame/SQL API (PyO3 bindings deferred, STATUS.md)
 ```
 
 Internal dependency direction (must stay acyclic):
@@ -286,7 +286,7 @@ Feature wiring:
 - `oxidelake-memory`, `oxidelake-device`, `oxidelake-compute`: `cuda = ["dep:cudarc"]`; `metal = [...]` activating the macOS target-gated optional deps.
 - `oxidelake-storage`: `io-uring = ["dep:io-uring"]` (Linux target-gated). `async-trait` is a plain dependency since 0.3.0: `BoundedReadStore` implements `ObjectStore` in every build.
 - `oxidelake-runtime` and `oxidelake-api` forward: `cuda = ["oxidelake-device/cuda", "oxidelake-memory/cuda", "oxidelake-compute/cuda"]`, `metal = [...]`, `io-uring = ["oxidelake-storage/io-uring"]`. This is what makes `cargo check -p oxidelake-runtime --features cuda` the single GPU compile gate (a virtual workspace root rejects `--features`).
-- `oxidelake-api`: `python = ["dep:pyo3", "arrow/ffi"]` — add `pyo3` (latest, `abi3-py310`) only when Phase 7 reaches it.
+- `oxidelake-api`: `python = ["dep:pyo3", "arrow/ffi"]` — add `pyo3` (latest, `abi3-py310`) only when Phase 7 reaches it. Phase 7 deferred it, so no `python` feature exists (the reasons are in `STATUS.md`).
 
 ## 5. Phase plan with acceptance gates
 

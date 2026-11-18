@@ -1152,6 +1152,111 @@ mod tests {
         );
     }
 
+    /// The groups of a batch are numbered densely on the device and read back
+    /// one entry per group, not one per slot of the index (#45). Equal to the
+    /// CPU reference at the edges of that numbering: no rows, no key but
+    /// `NULL`, a group per row (the most groups `group_keys` holds), the
+    /// extreme keys, and a GPU-sized batch of 100 keys. Values are multiples
+    /// of 0.25, so a float sum is exact in any order of atomic additions.
+    #[test]
+    #[ignore = "requires an NVIDIA GPU and driver"]
+    fn aggregate_numbers_groups_like_the_reference() {
+        use AggregateFunction::{Count, Max, Min, Sum};
+        fn splitmix64(state: &mut u64) -> u64 {
+            *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = *state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        let backend = CudaBackend::new(0).unwrap();
+        let stream = backend.create_stream().unwrap();
+        let mut state = 29u64;
+        let mut hundred = Vec::with_capacity(65_536);
+        for _ in 0..65_536 {
+            let r = splitmix64(&mut state);
+            hundred.push((!r.is_multiple_of(50)).then_some((r >> 8) as i64 % 100));
+        }
+        let cases: Vec<(&str, Vec<Option<i64>>)> = vec![
+            ("no rows", vec![]),
+            ("only NULL keys", vec![None; 1_000]),
+            (
+                "a group per row",
+                (0..10_000).map(|i| Some(i - 5_000)).collect(),
+            ),
+            (
+                "extreme keys",
+                (0..4_096)
+                    .map(|i| match i % 5 {
+                        0 => Some(i64::MIN),
+                        1 => Some(i64::MAX),
+                        2 => None,
+                        3 => Some(0),
+                        _ => Some(-1),
+                    })
+                    .collect(),
+            ),
+            ("100 keys in one GPU batch", hundred),
+        ];
+        let spec = AggregateSpec {
+            group_by: 0,
+            aggregates: vec![
+                (Sum, 1),
+                (Count, 1),
+                (Min, 1),
+                (Max, 1),
+                (Sum, 2),
+                (Count, 2),
+                (Min, 2),
+                (Max, 2),
+            ],
+        };
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("x", DataType::Int64, true),
+            Field::new("v", DataType::Float64, true),
+        ]));
+        for (name, keys) in cases {
+            let rows = keys.len();
+            let mut x: Vec<Option<i64>> = Vec::with_capacity(rows);
+            let mut v: Vec<Option<f64>> = Vec::with_capacity(rows);
+            for _ in 0..rows {
+                // Full-range Int64 values, so the sums wrap.
+                let r = splitmix64(&mut state);
+                x.push((!r.is_multiple_of(40)).then_some(r as i64));
+                let r = splitmix64(&mut state);
+                v.push(
+                    (!r.is_multiple_of(40)).then(|| f64::from((r >> 8) as u32 % 400) / 4.0 - 50.0),
+                );
+            }
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(keys)),
+                    Arc::new(Int64Array::from(x)),
+                    Arc::new(Float64Array::from(v)),
+                ],
+            )
+            .unwrap();
+            let resident = backend.upload(&stream, &batch).unwrap();
+            let out = backend
+                .aggregate(
+                    &stream,
+                    AggregateArgs {
+                        input: &resident,
+                        spec: &spec,
+                    },
+                )
+                .unwrap();
+            let device = backend.download(&stream, &out).unwrap();
+            assert_eq!(
+                device,
+                crate::cpu::kernels::aggregate(&batch, &spec).unwrap(),
+                "{name}"
+            );
+        }
+    }
+
     #[test]
     #[ignore = "requires an NVIDIA GPU and driver"]
     fn nvrtc_pipeline_compiles_and_launches_a_kernel() {

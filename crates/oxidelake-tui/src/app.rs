@@ -55,6 +55,8 @@ pub fn draw_frame(
 /// With `tick = None` the loop blocks on input and only repaints on key or
 /// resize events (fully deterministic — what the demo binary uses). With a
 /// tick, `refresh` is called before every repaint to pull live telemetry.
+/// It may bring a plan or change its length: the selection follows, and stays
+/// on its row for as long as that row exists.
 pub fn run_terminal(
     mut model: DashboardModel,
     tick: Option<Duration>,
@@ -67,36 +69,55 @@ pub fn run_terminal(
         ));
     }
     let mut terminal = ratatui::try_init()?;
-    let mut state = AppState::new(model.plan().len());
-    let result = (|| -> io::Result<()> {
-        loop {
-            refresh(&mut model);
-            draw_frame(&mut terminal, &state, &model)?;
-            let ready = match tick {
-                Some(timeout) => event::poll(timeout)?,
-                None => true,
-            };
-            if !ready {
-                continue;
-            }
-            match event::read()? {
-                Event::Key(key) => {
-                    if let Some(input) = key_input_from_crossterm(&key)
-                        && state.on_key(input) == Transition::Quit
-                    {
-                        return Ok(());
-                    }
-                }
-                Event::Resize(_, _) => {}
-                _ => {}
-            }
-        }
-    })();
+    let result = event_loop(
+        &mut model,
+        &mut refresh,
+        |state, model| draw_frame(&mut terminal, state, model),
+        || next_event(tick),
+    );
     ratatui::restore();
     result
 }
 
+/// The next input event from the terminal, or `None` when `tick` passed
+/// without one. With no tick it waits for as long as it takes.
+fn next_event(tick: Option<Duration>) -> io::Result<Option<Event>> {
+    match tick {
+        Some(timeout) if !event::poll(timeout)? => Ok(None),
+        _ => event::read().map(Some),
+    }
+}
+
+/// [`run_terminal`]'s loop with the terminal at arm's length, so that a test
+/// can drive it too: `draw` paints one frame and `next_event` waits for one
+/// input — `None` when the tick passed first. A resize, like any event that
+/// is not a key, only leads to the next repaint.
+fn event_loop(
+    model: &mut DashboardModel,
+    refresh: &mut impl FnMut(&mut DashboardModel),
+    mut draw: impl FnMut(&AppState, &DashboardModel) -> io::Result<()>,
+    mut next_event: impl FnMut() -> io::Result<Option<Event>>,
+) -> io::Result<()> {
+    let mut state = AppState::new(model.plan().len());
+    loop {
+        refresh(model);
+        // The refresh may have brought a plan, or changed its length (#126).
+        state.set_node_count(model.plan().len());
+        draw(&state, model)?;
+        let Some(event) = next_event()? else {
+            continue;
+        };
+        if let Event::Key(key) = event
+            && let Some(input) = key_input_from_crossterm(&key)
+            && state.on_key(input) == Transition::Quit
+        {
+            return Ok(());
+        }
+    }
+}
+
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -137,5 +158,82 @@ mod tests {
         let mut release = press(KeyCode::Char('q'));
         release.kind = KeyEventKind::Release;
         assert_eq!(key_input_from_crossterm(&release), None);
+    }
+
+    /// Drives `event_loop` with `inputs` — a key, or `None` for a tick that
+    /// passed with none — and a `q` after them, and returns the selection
+    /// each frame was drawn with.
+    fn selections(
+        mut model: DashboardModel,
+        mut refresh: impl FnMut(&mut DashboardModel),
+        inputs: &[Option<KeyCode>],
+    ) -> Vec<usize> {
+        let mut inputs = inputs
+            .iter()
+            .copied()
+            .chain([Some(KeyCode::Char('q'))])
+            .map(|input| input.map(|code| Event::Key(press(code))));
+        let mut drawn = Vec::new();
+        event_loop(
+            &mut model,
+            &mut refresh,
+            |state, model| {
+                assert!(
+                    model.plan().is_empty() || state.selected() < model.plan().len(),
+                    "drew a selection outside the plan: {} of {}",
+                    state.selected(),
+                    model.plan().len()
+                );
+                drawn.push(state.selected());
+                Ok(())
+            },
+            // Asked for an input past the `q`, the loop ignored it: end it
+            // with an error so the test fails rather than spins.
+            || {
+                inputs
+                    .next()
+                    .ok_or_else(|| io::Error::other("the loop did not quit on q"))
+            },
+        )
+        .unwrap();
+        drawn
+    }
+
+    /// `run_terminal`'s rustdoc invites a refresh that supplies the plan, and
+    /// the selection was sized once, before the first refresh: a plan the
+    /// refresh brought could not be walked past its old length, which for an
+    /// empty start means not at all (#126).
+    #[test]
+    fn a_plan_the_refresh_brings_can_be_walked_to_its_last_operator() {
+        let refresh = |model: &mut DashboardModel| {
+            if model.plan().is_empty() {
+                *model = crate::demo_model();
+            }
+        };
+        let down = Some(KeyCode::Down);
+        assert_eq!(
+            selections(DashboardModel::default(), refresh, &[down, down, down]),
+            [0, 1, 2, 2],
+            "↓ walks the three operators the refresh brought, and stops at the last"
+        );
+    }
+
+    /// The other direction: a plan that shrinks under the selection takes it
+    /// to the last operator left, not to a row that no longer exists.
+    #[test]
+    fn a_plan_that_shrinks_keeps_the_selection_on_it() {
+        let mut refreshes = 0;
+        let refresh = |model: &mut DashboardModel| {
+            refreshes += 1;
+            if refreshes == 4 {
+                model.telemetry.plan.truncate(1);
+                model.telemetry.operators.truncate(1);
+            }
+        };
+        let down = Some(KeyCode::Down);
+        assert_eq!(
+            selections(crate::demo_model(), refresh, &[down, down, None]),
+            [0, 1, 2, 0]
+        );
     }
 }

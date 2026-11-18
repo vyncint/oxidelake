@@ -225,6 +225,43 @@ fn cluster_sql_matches_embedded_sql() {
         .success();
     let embedded_stdout = String::from_utf8(embedded.get_output().stdout.clone()).unwrap();
 
+    // Planned for a GPU, the aggregate is fed by every one of those
+    // partitions (#29, #90): its partial half reads the split scan with no
+    // merge in between, and its final half reads the hash exchange over the
+    // same partitions. It used to sit alone over a `CoalescePartitionsExec`.
+    let explain = oxide()
+        .args([
+            "explain", "-q", QUERY, "--table", &table_arg, "--target", "cuda",
+        ])
+        .assert()
+        .success();
+    let plan = String::from_utf8(explain.get_output().stdout.clone()).unwrap();
+    let lines: Vec<&str> = plan.lines().map(str::trim_start).collect();
+    let partial = lines
+        .iter()
+        .position(|l| l.starts_with("GpuAggregateExec[cuda]") && l.contains("aggr=[SUM(v)]"))
+        .unwrap_or_else(|| panic!("no partial GPU aggregate in\n{plan}"));
+    let scan_partitions: usize = lines
+        .get(partial + 1)
+        .and_then(|l| l.strip_prefix("DataSourceExec: file_groups={"))
+        .and_then(|l| l.split_once(' '))
+        .and_then(|(n, _)| n.parse().ok())
+        .unwrap_or_else(|| panic!("the partial aggregate does not read the scan:\n{plan}"));
+    // DataFusion splits the scan into one partition per core.
+    if std::thread::available_parallelism().map_or(1, usize::from) > 1 {
+        assert!(scan_partitions > 1, "{plan}");
+        let exchange = lines[partial - 1];
+        assert!(
+            exchange.starts_with("RepartitionExec: partitioning=Hash([k@0]")
+                && exchange.ends_with(&format!("input_partitions={scan_partitions}")),
+            "{plan}"
+        );
+        assert!(
+            lines[partial - 2].starts_with("GpuAggregateExec[cuda]"),
+            "{plan}"
+        );
+    }
+
     // A real cluster: `oxide-scheduler` (placement target cuda, so `Gpu*Exec`
     // nodes travel through the plan codec) plus one `oxide-worker`.
     let scheduler_port = free_port();
@@ -497,6 +534,45 @@ fn a_zero_batch_size_is_refused_rather_than_returning_nothing() {
         .failure();
     let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
     assert!(stderr.contains("at least 1 row"), "{stderr}");
+}
+
+/// The reproduction from #119: `gen-data` over an existing table with a
+/// flag it refuses used to empty `t.parquet` first (211,115 bytes to 0).
+#[test]
+fn a_refused_gen_data_leaves_the_existing_table_intact() {
+    let dir = tempfile::tempdir().unwrap();
+    gen_data(dir.path(), 1_000);
+    let table = dir.path().join("t.parquet");
+    let before = std::fs::read(&table).unwrap();
+    let assert = oxide()
+        .args([
+            "gen-data",
+            "--rows",
+            "2000",
+            "--out",
+            dir.path().to_str().unwrap(),
+            "--row-group-rows",
+            "0",
+        ])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("row_group_rows must be positive"),
+        "{stderr}"
+    );
+    let after = std::fs::read(&table).unwrap();
+    assert!(
+        after == before,
+        "t.parquet is {} bytes after the refused run, was {}",
+        after.len(),
+        before.len()
+    );
+    let names: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names, ["t.parquet"], "nothing is left beside the table");
 }
 
 #[test]
