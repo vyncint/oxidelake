@@ -562,6 +562,8 @@ mod tests {
                 "{name} of the second run:\n{first}\n{second}"
             );
         }
+    }
+
     /// An embedded session scans through the Parquet guard and a bounded
     /// local store (#109). Lose either and a corrupt footer's lengths reach
     /// the reader unchecked again, while every query on a valid file still
