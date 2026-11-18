@@ -225,6 +225,43 @@ fn cluster_sql_matches_embedded_sql() {
         .success();
     let embedded_stdout = String::from_utf8(embedded.get_output().stdout.clone()).unwrap();
 
+    // Planned for a GPU, the aggregate is fed by every one of those
+    // partitions (#29, #90): its partial half reads the split scan with no
+    // merge in between, and its final half reads the hash exchange over the
+    // same partitions. It used to sit alone over a `CoalescePartitionsExec`.
+    let explain = oxide()
+        .args([
+            "explain", "-q", QUERY, "--table", &table_arg, "--target", "cuda",
+        ])
+        .assert()
+        .success();
+    let plan = String::from_utf8(explain.get_output().stdout.clone()).unwrap();
+    let lines: Vec<&str> = plan.lines().map(str::trim_start).collect();
+    let partial = lines
+        .iter()
+        .position(|l| l.starts_with("GpuAggregateExec[cuda]") && l.contains("aggr=[SUM(v)]"))
+        .unwrap_or_else(|| panic!("no partial GPU aggregate in\n{plan}"));
+    let scan_partitions: usize = lines
+        .get(partial + 1)
+        .and_then(|l| l.strip_prefix("DataSourceExec: file_groups={"))
+        .and_then(|l| l.split_once(' '))
+        .and_then(|(n, _)| n.parse().ok())
+        .unwrap_or_else(|| panic!("the partial aggregate does not read the scan:\n{plan}"));
+    // DataFusion splits the scan into one partition per core.
+    if std::thread::available_parallelism().map_or(1, usize::from) > 1 {
+        assert!(scan_partitions > 1, "{plan}");
+        let exchange = lines[partial - 1];
+        assert!(
+            exchange.starts_with("RepartitionExec: partitioning=Hash([k@0]")
+                && exchange.ends_with(&format!("input_partitions={scan_partitions}")),
+            "{plan}"
+        );
+        assert!(
+            lines[partial - 2].starts_with("GpuAggregateExec[cuda]"),
+            "{plan}"
+        );
+    }
+
     // A real cluster: `oxide-scheduler` (placement target cuda, so `Gpu*Exec`
     // nodes travel through the plan codec) plus one `oxide-worker`.
     let scheduler_port = free_port();

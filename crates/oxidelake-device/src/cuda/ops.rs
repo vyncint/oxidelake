@@ -21,7 +21,8 @@ use cudarc::driver::{
     CudaSlice, CudaStream, DeviceRepr, LaunchConfig, PushKernelArg, ValidAsZeroBits,
 };
 use oxidelake_core::params::{
-    AggregateFunction, Comparison, DistanceMetric, Literal, Predicate, vector_dimension,
+    AggregateFunction, AggregateSpec, Comparison, DistanceMetric, Literal, Predicate,
+    vector_dimension,
 };
 use oxidelake_core::{BackendKind, EngineError};
 
@@ -658,12 +659,19 @@ enum HostAgg {
     },
 }
 
+/// The device-side hash index of one batch's keys, which never leaves the
+/// device, and the dense numbering of its groups.
 struct GroupTable<'a> {
     keys: &'a CudaColumn,
     n: u32,
     capacity: u32,
     g_keys: CudaSlice<i64>,
     g_state: CudaSlice<u32>,
+    /// Each published slot's group number (`oxide_agg_number_groups`).
+    g_index: CudaSlice<u32>,
+    /// Distinct non-`NULL` keys: the entries of every per-group buffer, and
+    /// of every read-back but the `NULL` group's scalars (#45).
+    groups: usize,
 }
 
 fn first<T: Copy>(v: &[T], what: &str) -> Result<T, EngineError> {
@@ -680,7 +688,10 @@ fn run_aggregate(
     func: AggregateFunction,
     col: &CudaColumn,
 ) -> Result<HostAgg, EngineError> {
-    let cap = table.capacity as usize;
+    // Every per-group buffer holds one entry per distinct key, so what is
+    // allocated, initialised and read back follows the groups, not the
+    // batch's rows or the index's capacity (#45).
+    let groups = table.groups;
     let n = table.n;
     let is_i64 = match col.data_type {
         DataType::Int64 => true,
@@ -694,12 +705,12 @@ fn run_aggregate(
     };
     let dtoh_u32 = |s: &CudaSlice<u32>| -> Result<Vec<u32>, EngineError> {
         let mut v = stream.clone_dtoh(s).map_err(driver_error)?;
-        v.truncate(cap);
+        v.truncate(groups);
         Ok(v)
     };
     match (func, is_i64) {
         (AggregateFunction::Count, _) => {
-            let mut counts = alloc::<u32>(stream, cap)?;
+            let mut counts = alloc::<u32>(stream, groups)?;
             let mut null_count = alloc::<u32>(stream, 1)?;
             if n > 0 {
                 let f = backend.function("aggregation", AGGREGATION_SRC, "oxide_agg_count")?;
@@ -711,9 +722,11 @@ fn run_aggregate(
                 launch.arg(&mut table.g_keys);
                 launch.arg(&mut table.g_state);
                 launch.arg(&table.capacity);
+                launch.arg(&table.g_index);
                 launch.arg(&mut counts);
                 launch.arg(&mut null_count);
-                // SAFETY: arguments match `oxide_agg_count`; per-slot buffers hold `capacity` entries.
+                // SAFETY: arguments match `oxide_agg_count`; per-group buffers hold `groups` entries,
+                // and `g_index` maps every published slot to a number below `groups`.
                 unsafe { launch.launch(grid_for(n)) }.map_err(driver_error)?;
             }
             Ok(HostAgg::Count {
@@ -725,8 +738,8 @@ fn run_aggregate(
             })
         }
         (AggregateFunction::Sum, true) => {
-            let mut sums = alloc::<i64>(stream, cap)?;
-            let mut counts = alloc::<u32>(stream, cap)?;
+            let mut sums = alloc::<i64>(stream, groups)?;
+            let mut counts = alloc::<u32>(stream, groups)?;
             let mut null_sum = alloc::<i64>(stream, 1)?;
             let mut null_count = alloc::<u32>(stream, 1)?;
             if n > 0 {
@@ -740,15 +753,17 @@ fn run_aggregate(
                 launch.arg(&mut table.g_keys);
                 launch.arg(&mut table.g_state);
                 launch.arg(&table.capacity);
+                launch.arg(&table.g_index);
                 launch.arg(&mut sums);
                 launch.arg(&mut counts);
                 launch.arg(&mut null_sum);
                 launch.arg(&mut null_count);
-                // SAFETY: arguments match `oxide_agg_sum_i64`; per-slot buffers hold `capacity` entries.
+                // SAFETY: arguments match `oxide_agg_sum_i64`; per-group buffers hold `groups` entries,
+                // and `g_index` maps every published slot to a number below `groups`.
                 unsafe { launch.launch(grid_for(n)) }.map_err(driver_error)?;
             }
             let mut s = stream.clone_dtoh(&sums).map_err(driver_error)?;
-            s.truncate(cap);
+            s.truncate(groups);
             Ok(HostAgg::SumI {
                 sums: s,
                 counts: dtoh_u32(&counts)?,
@@ -763,8 +778,8 @@ fn run_aggregate(
             })
         }
         (AggregateFunction::Sum, false) => {
-            let mut sums = alloc::<f64>(stream, cap)?;
-            let mut counts = alloc::<u32>(stream, cap)?;
+            let mut sums = alloc::<f64>(stream, groups)?;
+            let mut counts = alloc::<u32>(stream, groups)?;
             let mut null_sum = alloc::<f64>(stream, 1)?;
             let mut null_count = alloc::<u32>(stream, 1)?;
             if n > 0 {
@@ -778,15 +793,17 @@ fn run_aggregate(
                 launch.arg(&mut table.g_keys);
                 launch.arg(&mut table.g_state);
                 launch.arg(&table.capacity);
+                launch.arg(&table.g_index);
                 launch.arg(&mut sums);
                 launch.arg(&mut counts);
                 launch.arg(&mut null_sum);
                 launch.arg(&mut null_count);
-                // SAFETY: arguments match `oxide_agg_sum_f64`; per-slot buffers hold `capacity` entries.
+                // SAFETY: arguments match `oxide_agg_sum_f64`; per-group buffers hold `groups` entries,
+                // and `g_index` maps every published slot to a number below `groups`.
                 unsafe { launch.launch(grid_for(n)) }.map_err(driver_error)?;
             }
             let mut s = stream.clone_dtoh(&sums).map_err(driver_error)?;
-            s.truncate(cap);
+            s.truncate(groups);
             Ok(HostAgg::SumF {
                 sums: s,
                 counts: dtoh_u32(&counts)?,
@@ -802,12 +819,12 @@ fn run_aggregate(
         }
         (AggregateFunction::Min | AggregateFunction::Max, true) => {
             let mut mins = stream
-                .clone_htod(&vec![i64::MAX; cap])
+                .clone_htod(&vec![i64::MAX; groups.max(1)])
                 .map_err(driver_error)?;
             let mut maxs = stream
-                .clone_htod(&vec![i64::MIN; cap])
+                .clone_htod(&vec![i64::MIN; groups.max(1)])
                 .map_err(driver_error)?;
-            let mut counts = alloc::<u32>(stream, cap)?;
+            let mut counts = alloc::<u32>(stream, groups)?;
             let mut null_min = stream.clone_htod(&[i64::MAX]).map_err(driver_error)?;
             let mut null_max = stream.clone_htod(&[i64::MIN]).map_err(driver_error)?;
             let mut null_count = alloc::<u32>(stream, 1)?;
@@ -822,19 +839,21 @@ fn run_aggregate(
                 launch.arg(&mut table.g_keys);
                 launch.arg(&mut table.g_state);
                 launch.arg(&table.capacity);
+                launch.arg(&table.g_index);
                 launch.arg(&mut mins);
                 launch.arg(&mut maxs);
                 launch.arg(&mut counts);
                 launch.arg(&mut null_min);
                 launch.arg(&mut null_max);
                 launch.arg(&mut null_count);
-                // SAFETY: arguments match `oxide_agg_minmax_i64`; per-slot buffers hold `capacity` entries.
+                // SAFETY: arguments match `oxide_agg_minmax_i64`; per-group buffers hold `groups` entries,
+                // and `g_index` maps every published slot to a number below `groups`.
                 unsafe { launch.launch(grid_for(n)) }.map_err(driver_error)?;
             }
             let mut lo = stream.clone_dtoh(&mins).map_err(driver_error)?;
-            lo.truncate(cap);
+            lo.truncate(groups);
             let mut hi = stream.clone_dtoh(&maxs).map_err(driver_error)?;
-            hi.truncate(cap);
+            hi.truncate(groups);
             Ok(HostAgg::MinMaxI {
                 mins: lo,
                 maxs: hi,
@@ -859,12 +878,12 @@ fn run_aggregate(
             // group's first value always replaces them, and a group with no
             // value is NULL by its count whatever they hold.
             let mut mins = stream
-                .clone_htod(&vec![i64::MAX; cap])
+                .clone_htod(&vec![i64::MAX; groups.max(1)])
                 .map_err(driver_error)?;
             let mut maxs = stream
-                .clone_htod(&vec![i64::MIN; cap])
+                .clone_htod(&vec![i64::MIN; groups.max(1)])
                 .map_err(driver_error)?;
-            let mut counts = alloc::<u32>(stream, cap)?;
+            let mut counts = alloc::<u32>(stream, groups)?;
             let mut null_min = stream.clone_htod(&[i64::MAX]).map_err(driver_error)?;
             let mut null_max = stream.clone_htod(&[i64::MIN]).map_err(driver_error)?;
             let mut null_count = alloc::<u32>(stream, 1)?;
@@ -879,6 +898,7 @@ fn run_aggregate(
                 launch.arg(&mut table.g_keys);
                 launch.arg(&mut table.g_state);
                 launch.arg(&table.capacity);
+                launch.arg(&table.g_index);
                 launch.arg(&mut mins);
                 launch.arg(&mut maxs);
                 launch.arg(&mut counts);
@@ -886,12 +906,13 @@ fn run_aggregate(
                 launch.arg(&mut null_max);
                 launch.arg(&mut null_count);
                 // SAFETY: arguments match `oxide_agg_minmax_f64` (the `i64` buffers are its
-                // totalOrder keys); per-slot buffers hold `capacity` entries.
+                // totalOrder keys); per-group buffers hold `groups` entries, and `g_index`
+                // maps every published slot to a number below `groups`.
                 unsafe { launch.launch(grid_for(n)) }.map_err(driver_error)?;
             }
             let decode = |keys: &CudaSlice<i64>| -> Result<Vec<f64>, EngineError> {
                 let mut keys = stream.clone_dtoh(keys).map_err(driver_error)?;
-                keys.truncate(cap);
+                keys.truncate(groups);
                 Ok(keys.into_iter().map(from_total_order_key).collect())
             };
             Ok(HostAgg::MinMaxF {
@@ -916,8 +937,8 @@ fn run_aggregate(
 }
 
 /// Grouped `SUM/COUNT/MIN/MAX` over one `Int64` key. Reductions run on the
-/// device; the (small) group table is finalized on the host, so the result is
-/// returned host-resident.
+/// device; the groups are read back and finalized on the host, so the result
+/// is returned host-resident.
 pub(super) fn aggregate(
     backend: &CudaBackend,
     stream: &Arc<CudaStream>,
@@ -929,6 +950,9 @@ pub(super) fn aggregate(
     let keys = column(input, spec.group_by)?;
     require_int64(keys, "group key")?;
     let n = u32_len(input.num_rows, "aggregate input")?;
+    // The index stays on the device. Two slots per row keep its probe chains
+    // short, and since #29 a call is one input batch, so it is sized by the
+    // batch; everything that leaves the device is sized by the groups.
     let capacity = (2 * input.num_rows).max(16).next_power_of_two();
     let cap_u32 = u32_len(capacity, "group table capacity")?;
 
@@ -938,8 +962,14 @@ pub(super) fn aggregate(
         capacity: cap_u32,
         g_keys: alloc::<i64>(stream, capacity)?,
         g_state: alloc::<u32>(stream, capacity)?,
+        g_index: alloc::<u32>(stream, capacity)?,
+        groups: 0,
     };
     let mut null_flag = alloc::<u32>(stream, 1)?;
+    // A row opens at most one group, so the batch's rows bound the keys the
+    // numbering pass writes.
+    let mut group_keys = alloc::<i64>(stream, input.num_rows)?;
+    let mut n_groups = alloc::<u32>(stream, 1)?;
     if n > 0 {
         let f = backend.function("aggregation", AGGREGATION_SRC, "oxide_agg_insert_keys")?;
         let mut launch = stream.launch_builder(&f);
@@ -952,46 +982,83 @@ pub(super) fn aggregate(
         launch.arg(&mut null_flag);
         // SAFETY: arguments match `oxide_agg_insert_keys`; capacity >= 2 * n so every key finds a slot.
         unsafe { launch.launch(grid_for(n)) }.map_err(driver_error)?;
+
+        let f = backend.function("aggregation", AGGREGATION_SRC, "oxide_agg_number_groups")?;
+        let mut launch = stream.launch_builder(&f);
+        launch.arg(&table.g_keys);
+        launch.arg(&table.g_state);
+        launch.arg(&cap_u32);
+        launch.arg(&mut table.g_index);
+        launch.arg(&mut group_keys);
+        launch.arg(&mut n_groups);
+        // SAFETY: arguments match `oxide_agg_number_groups`; one thread per slot of the
+        // `capacity`-slot index, and at most `n` slots are published (one per distinct
+        // key), so every group number is below `group_keys`' `n` entries.
+        unsafe { launch.launch(grid_for(cap_u32)) }.map_err(driver_error)?;
     }
+    table.groups = first(
+        &stream.clone_dtoh(&n_groups).map_err(driver_error)?,
+        "group count",
+    )? as usize;
+    let host_keys = if table.groups == 0 {
+        Vec::new()
+    } else {
+        let numbered = group_keys.try_slice(0..table.groups).ok_or_else(|| {
+            EngineError::execution(format!(
+                "the device numbered {} groups in a batch of {} rows",
+                table.groups, input.num_rows
+            ))
+        })?;
+        stream.clone_dtoh(&numbered).map_err(driver_error)?
+    };
 
     let mut results = Vec::with_capacity(spec.aggregates.len());
     for (func, idx) in &spec.aggregates {
         let col = column(input, *idx)?;
         results.push(run_aggregate(backend, stream, &mut table, *func, col)?);
     }
-
-    let mut host_keys = stream.clone_dtoh(&table.g_keys).map_err(driver_error)?;
-    host_keys.truncate(capacity);
-    let mut host_state = stream.clone_dtoh(&table.g_state).map_err(driver_error)?;
-    host_state.truncate(capacity);
     let has_null_group = first(
         &stream.clone_dtoh(&null_flag).map_err(driver_error)?,
         "null flag",
     )? != 0;
-    let mut slots: Vec<(i64, usize)> = host_state
-        .iter()
-        .enumerate()
-        .filter(|(_, state)| **state == 2)
-        .map(|(slot, _)| (host_keys[slot], slot))
-        .collect();
-    slots.sort_unstable();
+    let batch = finish_groups(schema, spec, &host_keys, &results, has_null_group)?;
+    Ok(DeviceBatch::new(
+        BackendKind::Cuda,
+        batch.schema(),
+        batch.num_rows(),
+        BatchInner::Host(batch),
+    ))
+}
+
+/// The result batch from the groups read back. Group `g` has key `keys[g]`,
+/// and every per-group vector in `results` is indexed the same way; the
+/// groups come out sorted by key with the `NULL` group (when
+/// `has_null_group`) last, as the CPU reference emits them.
+fn finish_groups(
+    schema: &SchemaRef,
+    spec: &AggregateSpec,
+    keys: &[i64],
+    results: &[HostAgg],
+    has_null_group: bool,
+) -> Result<RecordBatch, EngineError> {
+    let mut groups: Vec<(i64, usize)> = keys.iter().copied().zip(0..).collect();
+    groups.sort_unstable();
 
     let key_field = field(schema, spec.group_by)?;
     let mut fields = vec![Field::new(key_field.name(), DataType::Int64, true)];
-    let mut key_values: Vec<Option<i64>> = slots.iter().map(|(k, _)| Some(*k)).collect();
+    let mut key_values: Vec<Option<i64>> = groups.iter().map(|(k, _)| Some(*k)).collect();
     if has_null_group {
         key_values.push(None);
     }
-    let rows = key_values.len();
     let mut arrays: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(key_values))];
 
-    for ((func, idx), agg) in spec.aggregates.iter().zip(&results) {
+    for ((func, idx), agg) in spec.aggregates.iter().zip(results) {
         let name = format!("{}({})", func.name(), field(schema, *idx)?.name());
         let (dt, array): (DataType, ArrayRef) = match agg {
             HostAgg::Count { counts, null_count } => {
-                let mut v: Vec<Option<i64>> = slots
+                let mut v: Vec<Option<i64>> = groups
                     .iter()
-                    .map(|(_, s)| Some(i64::from(counts[*s])))
+                    .map(|(_, g)| Some(i64::from(counts[*g])))
                     .collect();
                 if has_null_group {
                     v.push(Some(i64::from(*null_count)));
@@ -1004,9 +1071,9 @@ pub(super) fn aggregate(
                 null_sum,
                 null_count,
             } => {
-                let mut v: Vec<Option<i64>> = slots
+                let mut v: Vec<Option<i64>> = groups
                     .iter()
-                    .map(|(_, s)| (counts[*s] > 0).then_some(sums[*s]))
+                    .map(|(_, g)| (counts[*g] > 0).then_some(sums[*g]))
                     .collect();
                 if has_null_group {
                     v.push((*null_count > 0).then_some(*null_sum));
@@ -1019,9 +1086,9 @@ pub(super) fn aggregate(
                 null_sum,
                 null_count,
             } => {
-                let mut v: Vec<Option<f64>> = slots
+                let mut v: Vec<Option<f64>> = groups
                     .iter()
-                    .map(|(_, s)| (counts[*s] > 0).then_some(sums[*s]))
+                    .map(|(_, g)| (counts[*g] > 0).then_some(sums[*g]))
                     .collect();
                 if has_null_group {
                     v.push((*null_count > 0).then_some(*null_sum));
@@ -1036,16 +1103,16 @@ pub(super) fn aggregate(
                 null_max,
                 null_count,
             } => {
-                let pick = |s: usize| {
+                let pick = |g: usize| {
                     if *func == AggregateFunction::Min {
-                        mins[s]
+                        mins[g]
                     } else {
-                        maxs[s]
+                        maxs[g]
                     }
                 };
-                let mut v: Vec<Option<i64>> = slots
+                let mut v: Vec<Option<i64>> = groups
                     .iter()
-                    .map(|(_, s)| (counts[*s] > 0).then(|| pick(*s)))
+                    .map(|(_, g)| (counts[*g] > 0).then(|| pick(*g)))
                     .collect();
                 if has_null_group {
                     let nv = if *func == AggregateFunction::Min {
@@ -1065,16 +1132,16 @@ pub(super) fn aggregate(
                 null_max,
                 null_count,
             } => {
-                let pick = |s: usize| {
+                let pick = |g: usize| {
                     if *func == AggregateFunction::Min {
-                        mins[s]
+                        mins[g]
                     } else {
-                        maxs[s]
+                        maxs[g]
                     }
                 };
-                let mut v: Vec<Option<f64>> = slots
+                let mut v: Vec<Option<f64>> = groups
                     .iter()
-                    .map(|(_, s)| (counts[*s] > 0).then(|| pick(*s)))
+                    .map(|(_, g)| (counts[*g] > 0).then(|| pick(*g)))
                     .collect();
                 if has_null_group {
                     let nv = if *func == AggregateFunction::Min {
@@ -1090,14 +1157,7 @@ pub(super) fn aggregate(
         fields.push(Field::new(name, dt, true));
         arrays.push(array);
     }
-    let out_schema = Arc::new(Schema::new(fields));
-    let batch = RecordBatch::try_new(Arc::clone(&out_schema), arrays)?;
-    Ok(DeviceBatch::new(
-        BackendKind::Cuda,
-        out_schema,
-        rows,
-        BatchInner::Host(batch),
-    ))
+    Ok(RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)?)
 }
 
 // ---------------------------------------------------------------------------
@@ -1220,6 +1280,110 @@ mod tests {
         assert!(FILTER_PROJECT_SRC.contains("oxide_scatter_indices"));
         assert!(HASH_JOIN_SRC.contains("oxide_hj_expand"));
         assert!(AGGREGATION_SRC.contains("oxide_agg_minmax_f64"));
+        assert!(AGGREGATION_SRC.contains("oxide_agg_number_groups"));
         assert!(VECTOR_DISTANCE_SRC.contains("oxide_vec_distance"));
+    }
+
+    /// The host half of the aggregate (#45): the device numbers the groups in
+    /// no particular order and hands back one entry per group, and they leave
+    /// sorted by key with the `NULL` group last. A group that saw no value
+    /// reads `NULL` for SUM, MIN and MAX and 0 for COUNT, as the CPU
+    /// reference has it.
+    #[test]
+    fn numbered_groups_come_back_sorted_by_key() -> Result<(), EngineError> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("x", DataType::Int64, true),
+            Field::new("v", DataType::Float64, true),
+        ]));
+        let spec = AggregateSpec {
+            group_by: 0,
+            aggregates: vec![
+                (AggregateFunction::Sum, 1),
+                (AggregateFunction::Count, 1),
+                (AggregateFunction::Min, 2),
+                (AggregateFunction::Max, 2),
+            ],
+        };
+        // Groups 0, 1 and 2, numbered so by the device, hold keys 7, -3 and
+        // 5, and group 1 saw no value.
+        let min_max = || HostAgg::MinMaxF {
+            mins: vec![1.5, 0.0, -2.0],
+            maxs: vec![3.5, 0.0, -2.0],
+            counts: vec![2, 0, 1],
+            null_min: 4.0,
+            null_max: 4.25,
+            null_count: 2,
+        };
+        let results = [
+            HostAgg::SumI {
+                sums: vec![70, 0, 50],
+                counts: vec![2, 0, 1],
+                null_sum: 9,
+                null_count: 1,
+            },
+            HostAgg::Count {
+                counts: vec![2, 0, 1],
+                null_count: 1,
+            },
+            min_max(),
+            min_max(),
+        ];
+        let out = finish_groups(&schema, &spec, &[7, -3, 5], &results, true)?;
+        let expected = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Int64, true),
+                Field::new("SUM(x)", DataType::Int64, true),
+                Field::new("COUNT(x)", DataType::Int64, true),
+                Field::new("MIN(v)", DataType::Float64, true),
+                Field::new("MAX(v)", DataType::Float64, true),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![Some(-3), Some(5), Some(7), None])),
+                Arc::new(Int64Array::from(vec![None, Some(50), Some(70), Some(9)])),
+                Arc::new(Int64Array::from(vec![0, 1, 2, 1])),
+                Arc::new(Float64Array::from(vec![
+                    None,
+                    Some(-2.0),
+                    Some(1.5),
+                    Some(4.0),
+                ])),
+                Arc::new(Float64Array::from(vec![
+                    None,
+                    Some(-2.0),
+                    Some(3.5),
+                    Some(4.25),
+                ])),
+            ],
+        )?;
+        assert_eq!(out, expected);
+
+        // No group and no NULL group: no rows, the same columns.
+        let none = || HostAgg::MinMaxF {
+            mins: vec![],
+            maxs: vec![],
+            counts: vec![],
+            null_min: 0.0,
+            null_max: 0.0,
+            null_count: 0,
+        };
+        let empty = [
+            HostAgg::SumI {
+                sums: vec![],
+                counts: vec![],
+                null_sum: 0,
+                null_count: 0,
+            },
+            HostAgg::Count {
+                counts: vec![],
+                null_count: 0,
+            },
+            none(),
+            none(),
+        ];
+        let out = finish_groups(&schema, &spec, &[], &empty, false)?;
+        assert_eq!(out.num_rows(), 0);
+        assert_eq!(out.schema(), expected.schema());
+        Ok(())
     }
 }

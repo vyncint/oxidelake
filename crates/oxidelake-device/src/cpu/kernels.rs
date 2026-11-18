@@ -19,11 +19,11 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, FixedSizeListArray, Float32Array, Float64Array, Int64Array,
-    RecordBatch, Scalar, UInt32Array,
+    PrimitiveArray, RecordBatch, Scalar, UInt32Array,
 };
 use arrow::compute::kernels::cmp;
 use arrow::compute::{TakeOptions, and_kleene, filter_record_batch, take};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Float64Type, Int64Type, Schema};
 use oxidelake_core::EngineError;
 use oxidelake_core::params::{
     AggregateFunction, AggregateSpec, Comparison, DistanceMetric, Literal, Predicate,
@@ -435,243 +435,346 @@ fn index_u32(i: usize) -> Result<u32, EngineError> {
     u32::try_from(i).map_err(|_| EngineError::execution("batch exceeds u32::MAX rows"))
 }
 
-enum Acc {
-    I64 {
-        count: i64,
-        sum: i64,
-        min: i64,
-        max: i64,
-    },
-    F64 {
-        count: i64,
-        sum: f64,
-        min: f64,
-        max: f64,
-    },
+/// One aggregate's per-group state: a slot per group, `None` until the group
+/// sees a non-`NULL` value — which is what makes `SUM/MIN/MAX` `NULL` for a
+/// group that has none.
+#[derive(Debug)]
+enum Accumulator {
+    Count(Vec<i64>),
+    SumI64(Vec<Option<i64>>),
+    SumF64(Vec<Option<f64>>),
+    MinI64(Vec<Option<i64>>),
+    MaxI64(Vec<Option<i64>>),
+    MinF64(Vec<Option<f64>>),
+    MaxF64(Vec<Option<f64>>),
 }
 
-impl Acc {
-    fn for_type(dt: &DataType, index: usize) -> Result<Acc, EngineError> {
-        match dt {
-            DataType::Int64 => Ok(Acc::I64 {
-                count: 0,
-                sum: 0,
-                min: i64::MAX,
-                max: i64::MIN,
-            }),
-            DataType::Float64 => Ok(Acc::F64 {
-                count: 0,
-                sum: 0.0,
-                min: f64::INFINITY,
-                max: f64::NEG_INFINITY,
-            }),
-            other => Err(EngineError::unsupported(
-                "cpu.aggregate",
-                format!(
-                    "aggregate input column {index} has type {other:?}; v1 supports Int64 and Float64"
-                ),
-            )),
+fn primitive<'a, T: ArrowPrimitiveType>(
+    values: &'a ArrayRef,
+    what: &str,
+) -> Result<&'a PrimitiveArray<T>, EngineError> {
+    values
+        .as_any()
+        .downcast_ref::<PrimitiveArray<T>>()
+        .ok_or_else(|| {
+            EngineError::execution(format!(
+                "{what} input has type {:?}, expected {:?}",
+                values.data_type(),
+                T::DATA_TYPE
+            ))
+        })
+}
+
+/// Folds every valid `values[row]` into `slots[ids[row]]`: `first` starts a
+/// group's value, `next` combines it with the value the group holds.
+fn fold<T: ArrowPrimitiveType>(
+    values: &PrimitiveArray<T>,
+    ids: &[usize],
+    slots: &mut [Option<T::Native>],
+    first: impl Fn(T::Native) -> T::Native,
+    next: impl Fn(T::Native, T::Native) -> T::Native,
+) {
+    for (row, &g) in ids.iter().enumerate() {
+        if values.is_valid(row) {
+            let v = values.value(row);
+            slots[g] = Some(match slots[g] {
+                Some(held) => next(held, v),
+                None => first(v),
+            });
         }
     }
 }
 
-enum Input<'a> {
-    I(&'a Int64Array),
-    F(&'a Float64Array),
+/// `MIN` in IEEE 754 totalOrder (#101). `f64::min` is IEEE minNum: it skips
+/// NaN, so an all-NaN group used to keep the +inf it started from, and it
+/// leaves the sign of a zero result unspecified.
+fn total_min(held: f64, v: f64) -> f64 {
+    if v.total_cmp(&held).is_lt() { v } else { held }
 }
 
-/// Grouped `SUM/COUNT/MIN/MAX` over one `Int64` key.
+/// `MAX` in IEEE 754 totalOrder (#101); see [`total_min`].
+fn total_max(held: f64, v: f64) -> f64 {
+    if v.total_cmp(&held).is_gt() { v } else { held }
+}
+
+impl Accumulator {
+    fn new(func: AggregateFunction, input: &DataType, index: usize) -> Result<Self, EngineError> {
+        Ok(match (func, input) {
+            (AggregateFunction::Count, DataType::Int64 | DataType::Float64) => {
+                Self::Count(Vec::new())
+            }
+            (AggregateFunction::Sum, DataType::Int64) => Self::SumI64(Vec::new()),
+            (AggregateFunction::Sum, DataType::Float64) => Self::SumF64(Vec::new()),
+            (AggregateFunction::Min, DataType::Int64) => Self::MinI64(Vec::new()),
+            (AggregateFunction::Max, DataType::Int64) => Self::MaxI64(Vec::new()),
+            (AggregateFunction::Min, DataType::Float64) => Self::MinF64(Vec::new()),
+            (AggregateFunction::Max, DataType::Float64) => Self::MaxF64(Vec::new()),
+            (_, other) => {
+                return Err(EngineError::unsupported(
+                    "cpu.aggregate",
+                    format!(
+                        "aggregate input column {index} has type {other:?}; v1 supports Int64 and Float64"
+                    ),
+                ));
+            }
+        })
+    }
+
+    fn grow(&mut self, groups: usize) {
+        match self {
+            Self::Count(v) => v.resize(groups, 0),
+            Self::SumI64(v) | Self::MinI64(v) | Self::MaxI64(v) => v.resize(groups, None),
+            Self::SumF64(v) | Self::MinF64(v) | Self::MaxF64(v) => v.resize(groups, None),
+        }
+    }
+
+    /// Folds input values: `values[row]` belongs to group `ids[row]`.
+    fn update(&mut self, values: &ArrayRef, ids: &[usize]) -> Result<(), EngineError> {
+        match self {
+            Self::Count(counts) => {
+                for (row, &g) in ids.iter().enumerate() {
+                    if values.is_valid(row) {
+                        counts[g] += 1;
+                    }
+                }
+            }
+            // Wrapping, like every stock DataFusion `SUM` accumulator
+            // (`add_wrapping`), rather than an error (#100).
+            Self::SumI64(slots) => fold(
+                primitive::<Int64Type>(values, "SUM")?,
+                ids,
+                slots,
+                |v| v,
+                i64::wrapping_add,
+            ),
+            // From 0.0, not from the first value, as DataFusion's accumulator
+            // starts: the SUM of {-0.0} is 0.0.
+            Self::SumF64(slots) => fold(
+                primitive::<Float64Type>(values, "SUM")?,
+                ids,
+                slots,
+                |v| 0.0 + v,
+                |held, v| held + v,
+            ),
+            Self::MinI64(slots) => fold(
+                primitive::<Int64Type>(values, "MIN")?,
+                ids,
+                slots,
+                |v| v,
+                i64::min,
+            ),
+            Self::MaxI64(slots) => fold(
+                primitive::<Int64Type>(values, "MAX")?,
+                ids,
+                slots,
+                |v| v,
+                i64::max,
+            ),
+            Self::MinF64(slots) => fold(
+                primitive::<Float64Type>(values, "MIN")?,
+                ids,
+                slots,
+                |v| v,
+                total_min,
+            ),
+            Self::MaxF64(slots) => fold(
+                primitive::<Float64Type>(values, "MAX")?,
+                ids,
+                slots,
+                |v| v,
+                total_max,
+            ),
+        }
+        Ok(())
+    }
+
+    /// Folds partial results — this accumulator's own output for other rows.
+    /// Partial counts add up; the SUM, MIN or MAX of partial SUM, MIN or MAX
+    /// values is the same function again, so those fold like input.
+    fn merge(&mut self, partial: &ArrayRef, ids: &[usize]) -> Result<(), EngineError> {
+        if let Self::Count(counts) = self {
+            let partial = primitive::<Int64Type>(partial, "partial COUNT")?;
+            for (row, &g) in ids.iter().enumerate() {
+                if partial.is_valid(row) {
+                    counts[g] = counts[g].wrapping_add(partial.value(row));
+                }
+            }
+            return Ok(());
+        }
+        self.update(partial, ids)
+    }
+
+    /// The output column, groups in `order`.
+    fn finish(&self, order: &[usize]) -> (DataType, ArrayRef) {
+        fn pick<T: Copy>(slots: &[T], order: &[usize]) -> Vec<T> {
+            order.iter().map(|&g| slots[g]).collect()
+        }
+        match self {
+            Self::Count(counts) => (
+                DataType::Int64,
+                Arc::new(Int64Array::from(pick(counts, order))),
+            ),
+            Self::SumI64(slots) | Self::MinI64(slots) | Self::MaxI64(slots) => (
+                DataType::Int64,
+                Arc::new(Int64Array::from(pick(slots, order))),
+            ),
+            Self::SumF64(slots) | Self::MinF64(slots) | Self::MaxF64(slots) => (
+                DataType::Float64,
+                Arc::new(Float64Array::from(pick(slots, order))),
+            ),
+        }
+    }
+}
+
+/// Grouped `SUM/COUNT/MIN/MAX` over one `Int64` key, fed a batch at a time.
+///
+/// [`Self::update`] folds input rows; [`Self::merge`] folds a batch laid out
+/// as this aggregation's own output — what [`aggregate`] or a device kernel
+/// returned for other rows — so a device result for one batch and the CPU
+/// reference for the next accumulate into the same groups, and so does the
+/// final half of a two-phase aggregate. State is one slot per group and
+/// aggregate however many rows pass through (#29); [`Self::finish`] emits the
+/// groups sorted by key, `NULL` last.
+#[derive(Debug)]
+pub struct GroupedAggregator {
+    group_by: usize,
+    key_name: String,
+    inputs: Vec<usize>,
+    names: Vec<String>,
+    index: HashMap<i64, usize>,
+    null_group: Option<usize>,
+    keys: Vec<Option<i64>>,
+    accumulators: Vec<Accumulator>,
+}
+
+impl GroupedAggregator {
+    /// Accumulators for `spec` over batches of `schema`, with the key and
+    /// input types checked up front.
+    pub fn new(schema: &Schema, spec: &AggregateSpec) -> Result<Self, EngineError> {
+        let field = |index: usize| {
+            schema.fields().get(index).ok_or_else(|| {
+                EngineError::plan(format!(
+                    "column index {index} out of range for a batch with {} columns",
+                    schema.fields().len()
+                ))
+            })
+        };
+        let key = field(spec.group_by)?;
+        if key.data_type() != &DataType::Int64 {
+            return Err(EngineError::unsupported(
+                "cpu.int64_column",
+                format!(
+                    "group key column {} has type {:?}; v1 supports Int64",
+                    spec.group_by,
+                    key.data_type()
+                ),
+            ));
+        }
+        let mut accumulators = Vec::with_capacity(spec.aggregates.len());
+        let mut names = Vec::with_capacity(spec.aggregates.len());
+        for (func, index) in &spec.aggregates {
+            let input = field(*index)?;
+            accumulators.push(Accumulator::new(*func, input.data_type(), *index)?);
+            names.push(format!("{}({})", func.name(), input.name()));
+        }
+        Ok(Self {
+            group_by: spec.group_by,
+            key_name: key.name().clone(),
+            inputs: spec.aggregates.iter().map(|(_, index)| *index).collect(),
+            names,
+            index: HashMap::new(),
+            null_group: None,
+            keys: Vec::new(),
+            accumulators,
+        })
+    }
+
+    /// Groups seen so far.
+    pub fn groups(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// The group of every row of `keys`, opening groups for keys not seen yet.
+    fn group_ids(&mut self, keys: &Int64Array) -> Vec<usize> {
+        let mut ids = Vec::with_capacity(keys.len());
+        for row in 0..keys.len() {
+            let next = self.keys.len();
+            let id = if keys.is_valid(row) {
+                let key = keys.value(row);
+                let groups = &mut self.keys;
+                *self.index.entry(key).or_insert_with(|| {
+                    groups.push(Some(key));
+                    next
+                })
+            } else if let Some(g) = self.null_group {
+                g
+            } else {
+                self.keys.push(None);
+                self.null_group = Some(next);
+                next
+            };
+            ids.push(id);
+        }
+        for accumulator in &mut self.accumulators {
+            accumulator.grow(self.keys.len());
+        }
+        ids
+    }
+
+    /// Folds the rows of one input batch.
+    pub fn update(&mut self, batch: &RecordBatch) -> Result<(), EngineError> {
+        let keys = int64_column(batch, self.group_by, "group key")?;
+        let ids = self.group_ids(keys);
+        for (accumulator, &input) in self.accumulators.iter_mut().zip(&self.inputs) {
+            accumulator.update(column(batch, input)?, &ids)?;
+        }
+        Ok(())
+    }
+
+    /// Folds a partial result: a batch laid out as this aggregation's output
+    /// (the key, then one column per aggregate) that covers other rows.
+    pub fn merge(&mut self, partial: &RecordBatch) -> Result<(), EngineError> {
+        if partial.num_columns() != 1 + self.accumulators.len() {
+            return Err(EngineError::execution(format!(
+                "a partial aggregate has {} columns; this aggregation's output has {}",
+                partial.num_columns(),
+                1 + self.accumulators.len()
+            )));
+        }
+        let keys = int64_column(partial, 0, "partial group key")?;
+        let ids = self.group_ids(keys);
+        for (i, accumulator) in self.accumulators.iter_mut().enumerate() {
+            accumulator.merge(partial.column(1 + i), &ids)?;
+        }
+        Ok(())
+    }
+
+    /// The groups, sorted by key with the `NULL` group last.
+    pub fn finish(self) -> Result<RecordBatch, EngineError> {
+        let mut order: Vec<usize> = (0..self.keys.len()).collect();
+        // `None` sorts first as an `Option`; the reference puts it last.
+        order.sort_unstable_by_key(|&g| (self.keys[g].is_none(), self.keys[g]));
+        let mut fields = vec![Field::new(&self.key_name, DataType::Int64, true)];
+        let mut columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(
+            order.iter().map(|&g| self.keys[g]).collect::<Vec<_>>(),
+        ))];
+        for (accumulator, name) in self.accumulators.iter().zip(&self.names) {
+            let (data_type, array) = accumulator.finish(&order);
+            fields.push(Field::new(name, data_type, true));
+            columns.push(array);
+        }
+        Ok(RecordBatch::try_new(
+            Arc::new(Schema::new(fields)),
+            columns,
+        )?)
+    }
+}
+
+/// Grouped `SUM/COUNT/MIN/MAX` over one `Int64` key, in one pass over `batch`.
 pub fn aggregate(batch: &RecordBatch, spec: &AggregateSpec) -> Result<RecordBatch, EngineError> {
-    let keys = int64_column(batch, spec.group_by, "group key")?;
-    let mut inputs = Vec::with_capacity(spec.aggregates.len());
-    for (_, idx) in &spec.aggregates {
-        let col = column(batch, *idx)?;
-        let input = match col.data_type() {
-            DataType::Int64 => col.as_any().downcast_ref::<Int64Array>().map(Input::I),
-            DataType::Float64 => col.as_any().downcast_ref::<Float64Array>().map(Input::F),
-            _ => None,
-        };
-        inputs.push(input.ok_or_else(|| {
-            EngineError::unsupported(
-                "cpu.aggregate",
-                format!(
-                    "aggregate input column {idx} has type {:?}; v1 supports Int64 and Float64",
-                    col.data_type()
-                ),
-            )
-        })?);
-    }
-
-    let mut index: HashMap<Option<i64>, usize> = HashMap::new();
-    let mut group_keys: Vec<Option<i64>> = Vec::new();
-    let mut accs: Vec<Vec<Acc>> = Vec::new();
-    for row in 0..batch.num_rows() {
-        let key = keys.is_valid(row).then(|| keys.value(row));
-        let group = match index.get(&key) {
-            Some(&g) => g,
-            None => {
-                let mut fresh = Vec::with_capacity(spec.aggregates.len());
-                for (input, (_, idx)) in inputs.iter().zip(&spec.aggregates) {
-                    fresh.push(Acc::for_type(
-                        match input {
-                            Input::I(_) => &DataType::Int64,
-                            Input::F(_) => &DataType::Float64,
-                        },
-                        *idx,
-                    )?);
-                }
-                group_keys.push(key);
-                accs.push(fresh);
-                index.insert(key, group_keys.len() - 1);
-                group_keys.len() - 1
-            }
-        };
-        for (acc, input) in accs[group].iter_mut().zip(&inputs) {
-            match (acc, input) {
-                (
-                    Acc::I64 {
-                        count,
-                        sum,
-                        min,
-                        max,
-                    },
-                    Input::I(arr),
-                ) if arr.is_valid(row) => {
-                    let v = arr.value(row);
-                    *count += 1;
-                    // Wrapping, like every stock DataFusion `SUM` accumulator
-                    // (`add_wrapping`). This path is the reference the GPU
-                    // kernels are checked against and the one a device
-                    // operator falls back to, so an error here failed on a
-                    // GPU target a query the CPU target answered (#100).
-                    *sum = sum.wrapping_add(v);
-                    *min = (*min).min(v);
-                    *max = (*max).max(v);
-                }
-                (
-                    Acc::F64 {
-                        count,
-                        sum,
-                        min,
-                        max,
-                    },
-                    Input::F(arr),
-                ) if arr.is_valid(row) => {
-                    let v = arr.value(row);
-                    // IEEE 754 totalOrder (#101). `f64::min`/`max` are IEEE
-                    // minNum/maxNum: they skip NaN, so an all-NaN group kept
-                    // the +inf/-inf it started from — values not in the data —
-                    // and they leave the sign of a zero result unspecified.
-                    // The group's first value seeds both, so the starting
-                    // values are never compared with.
-                    if *count == 0 || v.total_cmp(min).is_lt() {
-                        *min = v;
-                    }
-                    if *count == 0 || v.total_cmp(max).is_gt() {
-                        *max = v;
-                    }
-                    *count += 1;
-                    *sum += v;
-                }
-                _ => {}
-            }
-        }
-    }
-
-    let mut order: Vec<usize> = (0..group_keys.len()).collect();
-    order.sort_by(|&a, &b| match (group_keys[a], group_keys[b]) {
-        (Some(x), Some(y)) => x.cmp(&y),
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, None) => std::cmp::Ordering::Equal,
-    });
-
-    let key_field = batch.schema().field(spec.group_by).clone();
-    let mut fields = vec![Field::new(key_field.name(), DataType::Int64, true)];
-    let mut columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(
-        order.iter().map(|&g| group_keys[g]).collect::<Vec<_>>(),
-    ))];
-
-    for (a, (func, idx)) in spec.aggregates.iter().enumerate() {
-        let name = format!("{}({})", func.name(), batch.schema().field(*idx).name());
-        let (dt, array): (DataType, ArrayRef) = match (func, &inputs[a]) {
-            (AggregateFunction::Count, _) => (
-                DataType::Int64,
-                Arc::new(Int64Array::from(
-                    order
-                        .iter()
-                        .map(|&g| Some(acc_count(&accs[g][a])))
-                        .collect::<Vec<_>>(),
-                )),
-            ),
-            (AggregateFunction::Sum, Input::I(_)) => (
-                DataType::Int64,
-                Arc::new(Int64Array::from(
-                    order
-                        .iter()
-                        .map(|&g| match &accs[g][a] {
-                            Acc::I64 { count, sum, .. } if *count > 0 => Some(*sum),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>(),
-                )),
-            ),
-            (AggregateFunction::Sum, Input::F(_)) => (
-                DataType::Float64,
-                Arc::new(Float64Array::from(
-                    order
-                        .iter()
-                        .map(|&g| match &accs[g][a] {
-                            Acc::F64 { count, sum, .. } if *count > 0 => Some(*sum),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>(),
-                )),
-            ),
-            (AggregateFunction::Min | AggregateFunction::Max, Input::I(_)) => (
-                DataType::Int64,
-                Arc::new(Int64Array::from(
-                    order
-                        .iter()
-                        .map(|&g| match &accs[g][a] {
-                            Acc::I64 {
-                                count, min, max, ..
-                            } if *count > 0 => Some(if *func == AggregateFunction::Min {
-                                *min
-                            } else {
-                                *max
-                            }),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>(),
-                )),
-            ),
-            (AggregateFunction::Min | AggregateFunction::Max, Input::F(_)) => (
-                DataType::Float64,
-                Arc::new(Float64Array::from(
-                    order
-                        .iter()
-                        .map(|&g| match &accs[g][a] {
-                            Acc::F64 {
-                                count, min, max, ..
-                            } if *count > 0 => Some(if *func == AggregateFunction::Min {
-                                *min
-                            } else {
-                                *max
-                            }),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>(),
-                )),
-            ),
-        };
-        fields.push(Field::new(name, dt, true));
-        columns.push(array);
-    }
-    Ok(RecordBatch::try_new(
-        Arc::new(Schema::new(fields)),
-        columns,
-    )?)
+    let mut groups = GroupedAggregator::new(&batch.schema(), spec)?;
+    groups.update(batch)?;
+    groups.finish()
 }
 
 /// `x` as a signed integer that orders like IEEE 754 totalOrder: comparing
@@ -692,12 +795,6 @@ pub const fn total_order_key(x: f64) -> i64 {
 /// device's starting values for `MIN` and `MAX`.
 pub const fn from_total_order_key(key: i64) -> f64 {
     f64::from_bits((key ^ ((((key >> 63) as u64) >> 1) as i64)) as u64)
-}
-
-fn acc_count(acc: &Acc) -> i64 {
-    match acc {
-        Acc::I64 { count, .. } | Acc::F64 { count, .. } => *count,
-    }
 }
 
 /// Appends a `Float32` distance column between `query` and each row's vector.
@@ -985,6 +1082,149 @@ mod tests {
             maxk.iter().collect::<Vec<_>>(),
             vec![Some(1), Some(2), Some(5), None]
         );
+    }
+
+    /// `k Int64?`, `i Int64?`, `f Float64?`.
+    fn edge_batch(rows: &[(Option<i64>, Option<i64>, Option<f64>)]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("i", DataType::Int64, true),
+            Field::new("f", DataType::Float64, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+                )),
+                Arc::new(Float64Array::from(
+                    rows.iter().map(|r| r.2).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// Every column as bit patterns (`None` for `NULL`), so a comparison
+    /// tells `-0.0` from `0.0` and a NaN's sign.
+    fn bits(batch: &RecordBatch) -> Vec<Vec<Option<u64>>> {
+        batch
+            .columns()
+            .iter()
+            .map(|c| {
+                if let Some(ints) = c.as_any().downcast_ref::<Int64Array>() {
+                    ints.iter().map(|v| v.map(|v| v as u64)).collect()
+                } else {
+                    let floats = c.as_any().downcast_ref::<Float64Array>().unwrap();
+                    floats.iter().map(|v| v.map(f64::to_bits)).collect()
+                }
+            })
+            .collect()
+    }
+
+    /// Folding batch after batch, or merging each batch's own result in
+    /// either order, gives exactly what one pass over all the rows gives —
+    /// the streaming aggregate's whole correctness argument (#29). The rows
+    /// carry every value the accumulators treat specially: `NULL` keys and
+    /// values, a group with no values, Int64 sums that wrap, NaN of both
+    /// signs, signed zeros and an infinity. (A float `SUM` over NaNs of both
+    /// signs would depend on the order of addition, in DataFusion too, so no
+    /// group mixes them.)
+    #[test]
+    fn batch_by_batch_and_merged_partials_equal_one_pass() {
+        use AggregateFunction::{Count, Max, Min, Sum};
+        let nan = f64::NAN;
+        let rows = [
+            (Some(1), Some(i64::MAX - 1), Some(1.0)),
+            (Some(2), Some(5), Some(nan)),
+            (None, Some(i64::MAX), Some(-0.0)),
+            (Some(1), Some(i64::MAX - 1), Some(nan)),
+            (Some(3), None, None),
+            (Some(4), Some(i64::MIN), Some(-nan)),
+            (None, Some(i64::MAX), Some(0.0)),
+            (Some(1), Some(-3), Some(3.0)),
+            (Some(4), Some(7), Some(f64::NEG_INFINITY)),
+            (Some(2), Some(-1), Some(0.25)),
+        ];
+        let spec = AggregateSpec {
+            group_by: 0,
+            aggregates: vec![
+                (Sum, 1),
+                (Count, 1),
+                (Min, 1),
+                (Max, 1),
+                (Sum, 2),
+                (Count, 2),
+                (Min, 2),
+                (Max, 2),
+            ],
+        };
+        let whole = aggregate(&edge_batch(&rows), &spec).unwrap();
+        for split in 1..rows.len() {
+            let (a, b) = rows.split_at(split);
+            let (a, b) = (edge_batch(a), edge_batch(b));
+            let mut streamed = GroupedAggregator::new(&a.schema(), &spec).unwrap();
+            streamed.update(&a).unwrap();
+            streamed.update(&b).unwrap();
+            let mut merged = GroupedAggregator::new(&a.schema(), &spec).unwrap();
+            merged.merge(&aggregate(&b, &spec).unwrap()).unwrap();
+            merged.merge(&aggregate(&a, &spec).unwrap()).unwrap();
+            assert_eq!(
+                bits(&streamed.finish().unwrap()),
+                bits(&whole),
+                "update, split at {split}"
+            );
+            assert_eq!(
+                bits(&merged.finish().unwrap()),
+                bits(&whole),
+                "merge, split at {split}"
+            );
+        }
+        // And the answers themselves: wrapped sums, totalOrder extremes.
+        let sums = whole
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(
+            sums.iter().collect::<Vec<_>>(),
+            vec![Some(-7), Some(4), None, Some(i64::MIN + 7), Some(-2)]
+        );
+        let float = |c: usize| bits(&whole)[c].clone();
+        assert_eq!(
+            float(7),
+            [Some(1.0), Some(0.25), None, Some(-nan), Some(-0.0)]
+                .map(|v| v.map(f64::to_bits))
+                .to_vec()
+        );
+        assert_eq!(
+            float(8),
+            [
+                Some(nan),
+                Some(nan),
+                None,
+                Some(f64::NEG_INFINITY),
+                Some(0.0)
+            ]
+            .map(|v| v.map(f64::to_bits))
+            .to_vec()
+        );
+    }
+
+    /// A partial result that is not laid out as this aggregation's output is
+    /// refused, not folded into the wrong accumulators.
+    #[test]
+    fn merging_a_mislaid_partial_is_an_error() {
+        let spec = AggregateSpec {
+            group_by: 0,
+            aggregates: vec![(AggregateFunction::Count, 1)],
+        };
+        let mut groups = GroupedAggregator::new(&schema(), &spec).unwrap();
+        assert!(groups.merge(&batch()).is_err());
+        assert_eq!(groups.groups(), 0);
     }
 
     #[test]

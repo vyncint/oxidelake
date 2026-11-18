@@ -235,6 +235,20 @@ versions (0.x) may contain breaking changes; they are always listed under a
   `CoalescePartitionsExec` over the partial half; the final half merges
   partial results, so a `COUNT` reads there as `SUM(count(t.v)[count])`.
 
+- **The CUDA aggregate reads back its groups, not its group table** (the
+  aggregate half of #45). Every call allocated accumulators of two slots
+  per input row and copied all of them back with the table's keys and
+  states, so a batch's device-to-host traffic followed its rows whatever
+  the number of groups: 16.3 MB for a 65 536-row batch with 101 groups
+  and eight aggregates (the 0.2.0 kernel and host flow, run on the CPU
+  under a shim of the CUDA builtins). A second launch now numbers the
+  groups densely on the device, the accumulators hold one entry per group,
+  and only the groups are read back: 12 KB for the same batch. The index
+  of keys stays two slots per row, on the device, and since #29 a call is
+  one batch. Results are unchanged. Compiled, not yet run on a GPU:
+  STATUS.md has the T4 commands, and `tests/aggregate_timing.rs` times a
+  10-million-row `GROUP BY` before and after.
+
 ### Fixed
 
 - **`SUM(Int64)` wraps on overflow under a GPU target, as it does in stock
@@ -255,11 +269,14 @@ versions (0.x) may contain breaking changes; they are always listed under a
   skip `NaN`: an all-`NaN` group reported `MIN = inf`, `MAX = -inf`, values
   that are not in the data, and the sign of a zero result was unspecified.
   The CUDA kernel now reduces the same order on integer keys. **Visible
-  change:** for a group containing `NaN` or a signed zero, a GPU target's
-  answer can differ from `--target cpu`, because stock DataFusion's grouped
-  float `MIN`/`MAX` depends on row order (`MIN` of {1.0, NaN, 3.0} is 3.0
-  there) and lets its starting values through (`MAX` of {-inf} is
-  `f64::MIN`); the GPU target's answer is the order-independent one.
+  change:** for a group containing `NaN`, or both `-0.0` and `0.0`, a GPU
+  target's answer can differ from `--target cpu`, because stock
+  DataFusion's grouped float `MIN`/`MAX` depends on row order (`MIN` of
+  {1.0, NaN, 3.0} is 3.0 there, and of {0.0, -0.0} whichever zero it reads
+  first) and lets its starting values through (`MAX` of {-inf} is
+  `f64::MIN`); the GPU target's answer is the order-independent one, and the
+  one DataFusion's own ungrouped `MIN`/`MAX` gives. A group with one sign of
+  zero gets DataFusion's answer on every target.
 
 - **An `ORDER BY` over an aggregate of sorted input comes back in order
   under a GPU target** (#89). DataFusion aggregates input that is sorted on
@@ -425,6 +442,23 @@ versions (0.x) may contain breaking changes; they are always listed under a
   is refused. `oxidelake_planner::codec::PLAN_FINGERPRINT` and
   `build_description()` are public, and `make test-mixed-build` runs both
   cases with real binaries.
+- **A `GROUP BY` under a GPU target holds its groups, not its input** (#29).
+  `GpuAggregateExec` collected each input partition whole before
+  aggregating, so every grouped aggregate on a `cuda` or `metal` target, and
+  on a cluster with `OXIDE_CLUSTER_BACKEND=cuda`, held its input in memory
+  at once, and a CUDA device was handed the whole partition in one call,
+  which fails above 2^30 rows (the group table, two slots per row rounded up
+  to a power of two, must be addressable with a `u32`). It now hands the
+  backend one input batch at a time and folds each batch's groups into one
+  accumulator per group on the host. Measured with `/usr/bin/time -v` on a
+  machine without a GPU, a `GROUP BY k` over 20 million rows under
+  `--target cuda` peaked at 1,039 MiB and now peaks at 158 MiB, which no
+  longer grows with the input (stock DataFusion: 138 MiB). **Visible change:**
+  the operator's `batches` counter in telemetry and the TUI now counts input
+  batches, as every other operator's does, where it counted one per
+  partition; `rows_in` and `rows_out` are unchanged. New public pieces:
+  `GpuOperator::aggregate_into` and
+  `oxidelake_device::cpu::kernels::GroupedAggregator`.
 
 ### Fixed
 
