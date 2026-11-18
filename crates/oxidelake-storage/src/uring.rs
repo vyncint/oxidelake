@@ -47,6 +47,15 @@ const STORE: &str = "UringLocalFileSystem";
 /// visible nor bounded (#44).
 const JOB_QUEUE: usize = 256;
 
+/// The most of an object a streamed get reads at once (#112). `get_opts`
+/// used to read its whole range into one buffer before returning the
+/// stream, so streaming a 1 GiB object cost 1 GiB, and one larger than the
+/// address space left aborted on the allocation. Each chunk is now read on
+/// the ring when the consumer asks for it. 8 MiB keeps a Parquet column
+/// chunk read through `get_range` to one chunk (and no copy) in the common
+/// case; `LocalFileSystem`'s streams use 8 KiB.
+const STREAM_CHUNK: u64 = 8 << 20;
+
 enum Job {
     Read {
         /// The descriptor the caller opened and checked (#113). The job
@@ -319,6 +328,27 @@ fn worker(mut rx: mpsc::Receiver<Job>, mut ring: IoUring) {
     }
 }
 
+/// Reads `range` of `file` on the ring thread behind `tx`.
+async fn ring_read(
+    tx: &mpsc::Sender<Job>,
+    location: &Path,
+    file: Arc<File>,
+    range: Range<u64>,
+) -> Result<Bytes> {
+    let (reply, rx) = oneshot::channel();
+    tx.send(Job::Read { file, range, reply })
+        .await
+        .map_err(|_| Error::Generic {
+            store: STORE,
+            source: "io_uring worker thread has exited".into(),
+        })?;
+    let result = rx.await.map_err(|_| Error::Generic {
+        store: STORE,
+        source: "io_uring worker dropped the reply".into(),
+    })?;
+    result.map_err(|e| UringLocalFileSystem::io_error(location, e))
+}
+
 /// An object `LocalFileSystem::get_opts` opened and checked: the descriptor
 /// and its answer for it (#113).
 struct Opened {
@@ -410,19 +440,33 @@ impl UringLocalFileSystem {
     }
 
     async fn read(&self, location: &Path, file: Arc<File>, range: Range<u64>) -> Result<Bytes> {
-        let (reply, rx) = oneshot::channel();
-        self.tx
-            .send(Job::Read { file, range, reply })
-            .await
-            .map_err(|_| Error::Generic {
-                store: STORE,
-                source: "io_uring worker thread has exited".into(),
-            })?;
-        let result = rx.await.map_err(|_| Error::Generic {
-            store: STORE,
-            source: "io_uring worker dropped the reply".into(),
-        })?;
-        result.map_err(|e| Self::io_error(location, e))
+        ring_read(&self.tx, location, file, range).await
+    }
+
+    /// `range` of `file` as a stream of chunks of at most [`STREAM_CHUNK`]
+    /// bytes, each read on the ring only when the consumer pulls it (#112):
+    /// the stream holds one chunk at a time, whatever the object's size.
+    fn chunks(
+        &self,
+        location: &Path,
+        file: Arc<File>,
+        range: Range<u64>,
+    ) -> BoxStream<'static, Result<Bytes>> {
+        let tx = self.tx.clone();
+        let location = location.clone();
+        let end = range.end;
+        stream::try_unfold(range.start, move |offset| {
+            let (tx, location, file) = (tx.clone(), location.clone(), Arc::clone(&file));
+            async move {
+                if offset >= end {
+                    return Ok(None);
+                }
+                let next = end.min(offset.saturating_add(STREAM_CHUNK));
+                let chunk = ring_read(&tx, &location, file, offset..next).await?;
+                Ok(Some((chunk, next)))
+            }
+        })
+        .boxed()
     }
 
     /// Writes `payload` as the object at `location` and returns its e_tag.
@@ -501,8 +545,8 @@ impl ObjectStore for UringLocalFileSystem {
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
         // Preconditions (#44) and the range are `LocalFileSystem`'s answer
-        // for the descriptor `open` returns, and the read below is from that
-        // descriptor (#113).
+        // for the descriptor `open` returns, and the stream below reads from
+        // that descriptor (#113), a bounded chunk at a time (#112).
         let head = options.head;
         let Opened {
             file,
@@ -513,8 +557,7 @@ impl ObjectStore for UringLocalFileSystem {
         let payload = if head {
             stream::empty().boxed()
         } else {
-            let bytes = self.read(location, file, range.clone()).await?;
-            stream::once(async move { Ok(bytes) }).boxed()
+            self.chunks(location, file, range.clone())
         };
         Ok(GetResult {
             payload: GetResultPayload::Stream(payload),

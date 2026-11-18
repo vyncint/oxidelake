@@ -562,7 +562,70 @@ async fn child() {
             names.sort();
             println!("{RECORD}FILES {}", names.join(" "));
         }
+        // Streams an object larger than this child's whole address space
+        // (#112). The file is sparse: it costs no disk, and reading it costs
+        // only what the store holds at once. Markers at a few offsets, one
+        // across the 8 MiB mark, check that every chunk lands in place.
+        "stream" => {
+            use futures::StreamExt;
+            let file = std::fs::File::create(dir.join("big.bin")).unwrap();
+            file.set_len(STREAMED).unwrap();
+            for (i, at) in MARKERS.iter().enumerate() {
+                std::os::unix::fs::FileExt::write_all_at(&file, &marker(i), *at).unwrap();
+            }
+            drop(file);
+            let mut stream = store
+                .get(&Path::from("big.bin"))
+                .await
+                .unwrap()
+                .into_stream();
+            let (mut chunks, mut largest, mut total) = (0u64, 0u64, 0u64);
+            let mut seen = [[0u8; 8]; MARKERS.len()];
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.unwrap();
+                let len = chunk.len() as u64;
+                for (i, at) in MARKERS.iter().enumerate() {
+                    for k in 0..8 {
+                        if let Some(j) = (at + k).checked_sub(total).filter(|j| *j < len) {
+                            seen[i][k as usize] = chunk[j as usize];
+                        }
+                    }
+                }
+                chunks += 1;
+                largest = largest.max(len);
+                total += len;
+            }
+            println!("{RECORD}TOTAL {total}");
+            println!("{RECORD}CHUNKS {chunks}");
+            println!("{RECORD}LARGEST {largest}");
+            let markers = (0..MARKERS.len()).all(|i| seen[i] == marker(i));
+            println!("{RECORD}MARKERS {markers}");
+            println!("{RECORD}MAXRSS_KIB {}", max_rss_kib());
+        }
         other => panic!("unknown case {other}"),
+    }
+}
+
+/// The streamed object's size: more than [`ADDRESS_SPACE_CAP`], so a store
+/// that buffers the whole of it cannot even reserve the buffer.
+const STREAMED: u64 = 3 << 30;
+
+/// Where the streamed object carries non-zero bytes: its first and last
+/// eight, eight across the 8 MiB mark, and eight in the middle.
+const MARKERS: [u64; 4] = [0, (8 << 20) - 4, (3 << 29) + 12_345, STREAMED - 8];
+
+fn marker(i: usize) -> [u8; 8] {
+    (0x0101_0101_0101_0101u64 * (i as u64 + 1)).to_le_bytes()
+}
+
+/// Peak resident set of this process, in KiB (Linux reports `ru_maxrss` in
+/// KiB).
+fn max_rss_kib() -> i64 {
+    // SAFETY: getrusage writes into the zeroed struct it is given.
+    unsafe {
+        let mut usage: libc::rusage = std::mem::zeroed();
+        libc::getrusage(libc::RUSAGE_SELF, &mut usage);
+        usage.ru_maxrss
     }
 }
 
@@ -717,6 +780,57 @@ fn a_failed_put_leaves_the_old_object() {
             "old.bin",
             "{which}: a staged file was left behind\n{}",
             run.explain()
+        );
+    }
+}
+
+/// Streaming an object holds a bounded part of it at a time, whatever its
+/// size (#112). The io_uring store read the whole range into one buffer
+/// before returning the stream: one chunk the size of the object, a peak
+/// RSS to match (1,027 MiB for a 1 GiB object in the review), and an
+/// allocation failure for an object larger than the address space left.
+/// The object here is larger than the child's whole address space.
+#[cfg(target_os = "linux")]
+#[test]
+fn streaming_an_object_larger_than_the_address_space_holds_a_bounded_part_of_it() {
+    /// Measured on Linux 7.0: 12,704 KiB for the io_uring store (8 MiB
+    /// chunks), 4,452 KiB for `LocalFileSystem` (8 KiB chunks). Far below
+    /// any buffer of the whole object; above the few chunks a streaming
+    /// store holds at once.
+    const RSS_LIMIT_KIB: i64 = 64 * 1024;
+    fn no_further_limit() -> std::io::Result<()> {
+        Ok(())
+    }
+    for which in store_names() {
+        let run = run_child("stream", which, no_further_limit);
+        let value = |key: &str| -> u64 { run.value(key).parse().unwrap() };
+        assert_eq!(
+            value("TOTAL"),
+            STREAMED,
+            "{which}: bytes streamed\n{}",
+            run.explain()
+        );
+        assert!(
+            value("LARGEST") <= 8 << 20,
+            "{which}: a chunk of more than 8 MiB\n{}",
+            run.explain()
+        );
+        assert_eq!(
+            run.value("MARKERS"),
+            "true",
+            "{which}: a chunk out of place\n{}",
+            run.explain()
+        );
+        let rss: i64 = run.value("MAXRSS_KIB").parse().unwrap();
+        assert!(
+            rss < RSS_LIMIT_KIB,
+            "{which}: peak RSS {rss} KiB streaming {STREAMED} bytes\n{}",
+            run.explain()
+        );
+        println!(
+            "{which}: {} chunks, the largest {} bytes, peak RSS {rss} KiB",
+            run.value("CHUNKS"),
+            run.value("LARGEST")
         );
     }
 }
