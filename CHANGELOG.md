@@ -469,7 +469,9 @@ versions (0.x) may contain breaking changes; they are always listed under a
   `SIGTERM` mid-query left it hanging (apache/datafusion-ballista#2539,
   #2698). `oxide-scheduler` now fails a query that held output on a worker
   it loses, whether killed, stopped or silent past `--worker-timeout`, with
-  an error naming the worker, and `--stage-max-failures` defaults to 1, so
+  an error naming the worker (one killed in the middle of a transfer shows
+  as a broken shuffle stream instead), and `--stage-max-failures` defaults
+  to 1, so
   a failed fetch from a lost worker ends the query too; a query whose tasks
   on that worker had not finished anything still runs them again elsewhere.
   **Migration:** a query that used to survive losing a worker now fails;
