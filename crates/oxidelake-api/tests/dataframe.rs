@@ -216,3 +216,44 @@ async fn read_parquet_and_explain_show_placement() {
     let rows = frame.collect().await.unwrap();
     assert!(rows.iter().map(RecordBatch::num_rows).sum::<usize>() > 0);
 }
+
+/// `show` prints the table DataFusion's `DataFrame::show` printed, then a
+/// newline, and nothing else (#125 replaced its `println!`). It writes to
+/// the process's stdout, so the check runs it in a child, this test again,
+/// with stdout piped. The closed-pipe case is `tests/show_closed_pipe.rs`.
+#[tokio::test]
+async fn show_prints_the_table_and_a_newline() {
+    const CHILD: &str = "OXIDELAKE_TEST_SHOW_TABLE_CHILD";
+    const NAME: &str = "show_prints_the_table_and_a_newline";
+    const QUERY: &str = "SELECT 1 AS a, CAST(NULL AS VARCHAR) AS b";
+    let session = OxideSession::local().unwrap();
+    if std::env::var_os(CHILD).is_some() {
+        let shown = session.sql_frame(QUERY).await.unwrap().show().await;
+        // Out before the harness prints its result line after the table.
+        std::process::exit(if shown.is_ok() { 0 } else { 3 });
+    }
+    let table = session
+        .sql_frame(QUERY)
+        .await
+        .unwrap()
+        .into_inner()
+        .to_string()
+        .await
+        .unwrap();
+    assert!(table.contains("| 1 |"), "{table}");
+
+    // `--nocapture`, so a `print!`-based `show` reaches the pipe too.
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([NAME, "--exact", "--nocapture", "--quiet"])
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    // The harness's "running 1 test" line, then exactly the table.
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.ends_with(&format!("\n{table}\n")),
+        "expected the table then a newline:\n{table}\ngot:\n{stdout}"
+    );
+}

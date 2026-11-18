@@ -85,7 +85,10 @@ enum Command {
         /// GPU-target default (65536). Batch boundaries never change results.
         #[arg(long, value_name = "ROWS")]
         batch_size: Option<usize>,
-        /// How to print the result: table, json or csv.
+        /// How to print the result: table, json or csv. In json every object
+        /// carries every column, a NULL as `null`, and NaN, infinity and
+        /// negative infinity, which JSON has no number for, as the strings
+        /// "NaN", "Infinity" and "-Infinity".
         #[arg(long, value_name = "FORMAT", default_value = "table")]
         output: OutputFormat,
     },

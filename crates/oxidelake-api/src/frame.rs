@@ -8,6 +8,7 @@
 //! `SELECT *, l2_distance(emb, …) AS d` and lowers to `GpuVectorDistanceExec`
 //! on a GPU target.
 
+use std::io::Write;
 use std::sync::Arc;
 
 use datafusion::arrow::array::RecordBatch;
@@ -127,9 +128,28 @@ impl OxideFrame {
         Ok(self.inner.collect().await?)
     }
 
-    /// Executes the frame and prints it as a table.
+    /// Executes the frame and prints it on stdout as a table, formatted as
+    /// DataFusion's `DataFrame::show` formats it.
+    ///
+    /// A reader that goes away before the table is written, as `… | head -1`
+    /// does once it has its line, is a clean stop: `show` returns `Ok`, as
+    /// `oxide sql` exits 0 there (#34). Any other write failure is
+    /// [`EngineError::Io`].
     pub async fn show(self) -> Result<(), EngineError> {
-        Ok(self.inner.show().await?)
+        // Not `DataFrame::show`: its `println!` panics on a closed pipe
+        // (#125). `to_string` is what it prints, so the text is the same.
+        let table = self.inner.to_string().await?;
+        // Locked after the last await: a `StdoutLock` is not `Send`, and
+        // holding one across an await would make this future unspawnable.
+        let mut stdout = std::io::stdout().lock();
+        match stdout
+            .write_all(table.as_bytes())
+            .and_then(|()| stdout.write_all(b"\n"))
+            .and_then(|()| stdout.flush())
+        {
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+            other => other.map_err(EngineError::from),
+        }
     }
 }
 
