@@ -127,10 +127,21 @@ async fn run(
 async fn ten_million_rows_one_hundred_keys() {
     let device = HardwareDetector::select().unwrap();
     assert!(
-        device.kind().is_gpu() && device.supports_aggregate(),
-        "no GPU backend that aggregates: {:?}",
+        device.kind().is_gpu(),
+        "no GPU backend detected: {:?}",
         device.kind()
     );
+    // Metal declines the aggregate up front (it has no aggregate kernel), so
+    // on a Mac every batch would run on the CPU and there is no device time
+    // to take. The on-device suite runs every ignored test there; say so and
+    // stop, as the join timing probe does.
+    if !device.supports_aggregate() {
+        println!(
+            "skipped: the {:?} backend has no device aggregate, so there is nothing to time",
+            device.kind()
+        );
+        return;
+    }
     let batches = table();
     let (reference, cpu_ms, _) = run(Arc::new(CpuBackend::new()), &batches).await;
     // Compiles the kernels (NVRTC, cached per backend) outside the timing.
