@@ -461,7 +461,13 @@ impl GpuOperator {
     /// Counts one input batch: its rows, the rows it produced and the bytes it
     /// moved. An aggregate passes the groups the batch opened as `rows_out`,
     /// since it emits its groups only when its input ends.
-    fn record_rows(&self, rows_in: usize, rows_out: usize, start: Instant, moved: Option<(u64, u64)>) {
+    fn record_rows(
+        &self,
+        rows_in: usize,
+        rows_out: usize,
+        start: Instant,
+        moved: Option<(u64, u64)>,
+    ) {
         if let Some(stats) = &self.stats {
             stats.record_batch(rows_in as u64, rows_out as u64, start.elapsed());
             if let Some((h2d, d2h)) = moved {
