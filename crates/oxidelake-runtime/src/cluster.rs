@@ -28,6 +28,7 @@ use ballista_scheduler::scheduler_process::start_server;
 use ballista_scheduler::scheduler_server::SessionBuilder;
 use ballista_scheduler::standalone::new_standalone_scheduler_with_builder;
 use datafusion::execution::SessionStateBuilder;
+use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::session_state::SessionState;
 use datafusion::prelude::SessionConfig;
@@ -35,7 +36,9 @@ use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use oxidelake_compute::oxide_udfs;
 use oxidelake_core::{BackendKind, EngineError};
 use oxidelake_planner::{HardwarePlacementRule, OxidePhysicalCodec, physical_optimizer_rules};
-use oxidelake_storage::{with_gpu_batch_size, with_pruning};
+use oxidelake_storage::{
+    BoundedReadStore, ParquetScanGuard, default_object_store, with_gpu_batch_size, with_pruning,
+};
 
 fn ballista_error(err: impl std::fmt::Display) -> EngineError {
     EngineError::execution(format!("ballista: {err}"))
@@ -72,6 +75,13 @@ pub fn config_producer() -> ConfigProducer {
 /// Builds the scheduler-side session state: Ballista's defaults plus the
 /// placement rule targeting the declared cluster capability. This is where
 /// `Gpu*Exec` nodes enter a distributed plan.
+///
+/// It is also where a cluster checks the Parquet files a query reads (#109).
+/// Executors scan with DataFusion's own reader, so [`ParquetScanGuard`]
+/// checks, while the scheduler plans, the metadata planning has just read
+/// into this session's cache, and the local store is bounded like an
+/// embedded session's, so that planning read cannot reserve memory for a
+/// range a corrupt footer declares past the end of the file.
 pub fn build_session_state(
     config: SessionConfig,
     target: BackendKind,
@@ -83,14 +93,22 @@ pub fn build_session_state(
     } else {
         config
     };
+    let runtime = Arc::new(RuntimeEnvBuilder::new().build()?);
+    runtime.register_object_store(
+        ObjectStoreUrl::local_filesystem().as_ref(),
+        Arc::new(BoundedReadStore::new(default_object_store())),
+    );
+    let guard = ParquetScanGuard::new()
+        .with_metadata_cache(runtime.cache_manager.get_file_metadata_cache());
     Ok(SessionStateBuilder::new()
         .with_default_features()
         .with_config(config)
-        .with_runtime_env(Arc::new(RuntimeEnvBuilder::new().build()?))
+        .with_runtime_env(runtime)
         .with_scalar_functions(scalar_functions)
         .with_aggregate_functions(ballista_aggregate_functions())
         .with_window_functions(ballista_window_functions())
         .with_physical_optimizer_rules(physical_optimizer_rules(HardwarePlacementRule::new(target)))
+        .with_physical_optimizer_rule(Arc::new(guard))
         .build())
 }
 
@@ -207,4 +225,39 @@ pub async fn start_standalone(
     }
     tracing::info!(%addr, executors, "standalone Ballista cluster started");
     Ok(addr)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// A cluster's Parquet checks live on the scheduler (#109): its executors
+    /// scan with DataFusion's own reader, so if the scheduler's session lost
+    /// the guard, its metadata cache or the bounded store, nothing in the
+    /// cluster would check a file at all.
+    #[test]
+    fn the_scheduler_session_checks_parquet_files_and_bounds_reads() {
+        let state = build_session_state(session_config(), BackendKind::CpuSimd).unwrap();
+        let guards: Vec<String> = state
+            .physical_optimizers()
+            .iter()
+            .filter(|rule| rule.name() == "ParquetScanGuard")
+            .map(|rule| format!("{rule:?}"))
+            .collect();
+        assert_eq!(guards.len(), 1, "{guards:?}");
+        assert!(
+            guards[0].contains("checks_metadata_cache: true"),
+            "{}",
+            guards[0]
+        );
+        let store = state
+            .runtime_env()
+            .object_store(ObjectStoreUrl::local_filesystem())
+            .unwrap();
+        assert!(
+            store.to_string().starts_with("BoundedReadStore("),
+            "{store}"
+        );
+    }
 }

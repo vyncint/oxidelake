@@ -27,6 +27,10 @@ What the project does continuously, enforced by required CI on every change:
   quotes every identifier; a model path given to `predict` must be a constant,
   and the layer shapes in the file it names must fit the tensor data the file
   holds before anything is allocated (#96).
+  A Parquet file's footer is checked against the file before any read is
+  sized by it, so a corrupt or hostile file is an `EngineError::Format`
+  rather than a panic or an allocation of whatever the footer declares
+  (`ParquetScanGuard`; what it does not cover is in `STATUS.md`).
 - **Dependency policy** (`deny` job): RUSTSEC advisories, a license allow-list,
   banned crates and crates.io-only sources on every PR; weekly grouped
   Dependabot updates that leave the DataFusion/Ballista chain's majors alone.

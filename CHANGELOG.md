@@ -308,6 +308,16 @@ versions (0.x) may contain breaking changes; they are always listed under a
   the second run of a query logged twice the first's numbers; it now counts
   that query's operators only.
 
+### Fixed
+
+- **A corrupt page found mid-scan is `EngineError::Format`, as
+  documented.** `classify_error` now looks inside the `Shared`,
+  `Diagnostic` and `Collection` wrappers DataFusion puts around a scan's
+  errors. A corrupt page in a repartitioned scan used to come back as
+  `EngineError::DataFusion(..)` while the same damage in a footer was
+  `Format`; code that matched on `EngineError::DataFusion` for such errors
+  now gets `Format` or `Io` (#118).
+
 ### Security
 
 - **thrift is out of the dependency graph** (#4, #54). parquet 59 decodes
@@ -362,6 +372,26 @@ versions (0.x) may contain breaking changes; they are always listed under a
   file is refused with an error naming it. The cache also takes one lock per
   model instead of one for all of them, so a load that fails or panics
   affects only its own model and is tried again on the next call.
+
+- **A Parquet file whose footer misstates its own layout is refused rather
+  than trusted** (#109). The reader took a footer at its word: a column chunk
+  with a negative length panicked the scan, one declared at 2 GB cost 2 GB of
+  memory to read a 98 KB file, and one at 2^40 bytes aborted the process on
+  the allocation. `register_parquet_table` (so `oxide --table` and
+  `OxideSession::register_parquet` too) now checks every file before
+  DataFusion reads any of it: each count the footer's encoding declares
+  against the bytes that follow it, every column chunk, page index and Bloom
+  filter range against the file's size, every page against its chunk, and a
+  schema at most 64 levels deep. A file that fails is refused with
+  `EngineError::Format` naming it and, where there is one, the row group and
+  column, and the table is not registered: repair or remove that file. A
+  file added to a table or replaced after registration is checked when a
+  scan opens it, by the new `ParquetScanGuard` physical optimizer rule, which
+  embedded sessions, `pruning_session` and a cluster's scheduler install; the
+  scheduler checks the metadata it read while planning, because executors
+  scan with DataFusion's own reader. `register_local_store` now puts the store
+  behind the new `BoundedReadStore`, which refuses a multi-range read past the
+  end of an object before the store underneath reserves memory for it.
 
 ## [0.2.0] - 2026-09-21
 

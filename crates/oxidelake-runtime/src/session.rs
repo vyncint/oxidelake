@@ -19,8 +19,8 @@ use oxidelake_core::telemetry::{OperatorSnapshot, TelemetryHub, TierCapacity};
 use oxidelake_core::{BackendKind, EngineError};
 use oxidelake_planner::{HardwarePlacementRule, physical_optimizer_rules};
 use oxidelake_storage::{
-    default_object_store, register_local_store, register_parquet_table, with_gpu_batch_size,
-    with_pruning,
+    ParquetScanGuard, default_object_store, register_local_store, register_parquet_table,
+    with_gpu_batch_size, with_pruning,
 };
 
 use crate::cluster;
@@ -181,6 +181,7 @@ impl OxideSession {
             .with_default_features()
             .with_config(config)
             .with_physical_optimizer_rules(physical_optimizer_rules(rule))
+            .with_physical_optimizer_rule(Arc::new(ParquetScanGuard::new()))
             .build();
         let ctx = SessionContext::new_with_state(state);
         register_local_store(&ctx, default_object_store());
@@ -561,6 +562,32 @@ mod tests {
                 "{name} of the second run:\n{first}\n{second}"
             );
         }
+    }
+
+    /// An embedded session scans through the Parquet guard and a bounded
+    /// local store (#109). Lose either and a corrupt footer's lengths reach
+    /// the reader unchecked again, while every query on a valid file still
+    /// passes.
+    #[test]
+    fn an_embedded_session_checks_parquet_files_and_bounds_reads() {
+        let session = OxideSession::local().unwrap();
+        let state = session.ctx().state();
+        assert!(
+            state
+                .physical_optimizers()
+                .iter()
+                .any(|rule| rule.name() == "ParquetScanGuard"),
+            "no ParquetScanGuard in the physical optimizer rules"
+        );
+        let store = session
+            .ctx()
+            .runtime_env()
+            .object_store(datafusion::execution::object_store::ObjectStoreUrl::local_filesystem())
+            .unwrap();
+        assert!(
+            store.to_string().starts_with("BoundedReadStore("),
+            "{store}"
+        );
     }
 
     /// The no-argument constructors and `SessionOptions::default()` are the

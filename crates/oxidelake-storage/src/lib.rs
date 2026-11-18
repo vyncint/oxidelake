@@ -14,8 +14,10 @@
 pub mod datagen;
 pub mod errors;
 pub mod ipc;
+mod parquet_check;
 pub mod parquet_io;
 pub mod parquet_opts;
+pub mod scan_guard;
 pub mod session;
 pub mod store;
 
@@ -31,11 +33,12 @@ pub use errors::classify_error;
 pub use ipc::{read_ipc_file, write_ipc_file};
 pub use parquet_io::{ParquetFileWriter, write_parquet};
 pub use parquet_opts::{Compression, ParquetWriteOptions};
+pub use scan_guard::ParquetScanGuard;
 pub use session::{
     GPU_BATCH_SIZE, PruningSummary, pruning_session, register_parquet_table, scan_pruning_metrics,
     with_gpu_batch_size, with_pruning, with_pruning_disabled,
 };
-pub use store::{default_object_store, register_local_store};
+pub use store::{BoundedReadStore, default_object_store, register_local_store};
 
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
 pub use uring::UringLocalFileSystem;
