@@ -18,7 +18,9 @@
 //!   and indexed on the device once per operator
 //!   ([`GpuBackend::prepare_join_build`]) and probed by every batch;
 //! * a hash join's output leaves in batches of a bounded size
-//!   ([`JoinProbe`]), however often its keys repeat.
+//!   ([`JoinProbe`]), however often its keys repeat;
+//!   groups are merged on the host ([`GroupedAggregator`]), so an aggregate
+//!   holds its groups rather than its input.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -30,7 +32,7 @@ use arrow::datatypes::{DataType, Field, FieldRef, Schema};
 use oxidelake_core::EngineError;
 use oxidelake_core::params::{AggregateSpec, DistanceMetric, Predicate, vector_dimension};
 use oxidelake_core::telemetry::OperatorStats;
-use oxidelake_device::cpu::kernels::{self, JoinTable};
+use oxidelake_device::cpu::kernels::{self, GroupedAggregator, JoinTable};
 use oxidelake_device::{
     AggregateArgs, DeviceBatch, DeviceJoinMatches, DeviceJoinTable, DeviceStream,
     FilterProjectArgs, GpuBackend, HashJoinArgs, JoinBuildArgs, JoinProbeArgs, VectorDistanceArgs,
@@ -456,13 +458,22 @@ impl GpuOperator {
         &self.streams[i]
     }
 
-    fn record(&self, rows_in: usize, out: &RecordBatch, start: Instant, moved: Option<(u64, u64)>) {
+    /// Counts one input batch: its rows, the rows it produced and the bytes it
+    /// moved. An aggregate passes the groups the batch opened as `rows_out`,
+    /// since it emits its groups only when its input ends.
+    fn record_rows(&self, rows_in: usize, rows_out: usize, start: Instant, moved: Option<(u64, u64)>) {
         if let Some(stats) = &self.stats {
-            stats.record_batch(rows_in as u64, out.num_rows() as u64, start.elapsed());
+            stats.record_batch(rows_in as u64, rows_out as u64, start.elapsed());
             if let Some((h2d, d2h)) = moved {
                 stats.record_transfer(h2d, d2h);
             }
         }
+    }
+
+    /// [`Self::record_rows`] for an operator that emits one batch per input
+    /// batch.
+    fn record(&self, rows_in: usize, out: &RecordBatch, start: Instant, moved: Option<(u64, u64)>) {
+        self.record_rows(rows_in, out.num_rows(), start, moved);
     }
 
     /// Runs `gpu` on a GPU backend; [`DeviceOutcome::Declined`] when the
@@ -939,20 +950,44 @@ impl GpuOperator {
         batch: &RecordBatch,
         spec: &AggregateSpec,
     ) -> Result<RecordBatch, EngineError> {
+        let mut groups = GroupedAggregator::new(&batch.schema(), spec)?;
+        self.aggregate_into(batch, spec, &mut groups)?;
+        groups.finish()
+    }
+
+    /// Folds one input batch into `groups`: the device aggregates the batch
+    /// and its groups are merged on the host, or the CPU reference folds the
+    /// rows directly. Between batches only the groups are held, so an
+    /// aggregate's memory follows its group count rather than its input
+    /// (#29), and a device's `u32` row limit applies to one batch.
+    pub fn aggregate_into(
+        &self,
+        batch: &RecordBatch,
+        spec: &AggregateSpec,
+        groups: &mut GroupedAggregator,
+    ) -> Result<(), EngineError> {
         let start = Instant::now();
+        let before = groups.groups();
         let outcome = match self.no_device_path(self.backend.supports_aggregate(), "aggregation") {
             Some(why) => DeviceOutcome::Declined(why),
             None => self.aggregate_on_device(batch, spec)?,
         };
-        let (out, moved) = match outcome {
-            DeviceOutcome::Ran(out, moved) => (out, Some(moved)),
+        let moved = match outcome {
+            DeviceOutcome::Ran(partial, moved) => {
+                groups.merge(&partial)?;
+                Some(moved)
+            }
             DeviceOutcome::Declined(why) => {
                 self.fell_back(&why);
-                (kernels::aggregate(batch, spec)?, None)
+                groups.update(batch)?;
+                None
             }
         };
-        self.record(batch.num_rows(), &out, start, moved);
-        Ok(out)
+        // A batch's rows out are the groups it opened: summed over the
+        // batches they are the rows the aggregate emits, where counting each
+        // batch's groups would count a group once per batch that touches it.
+        self.record_rows(batch.num_rows(), groups.groups() - before, start, moved);
+        Ok(())
     }
 
     fn aggregate_on_device(
@@ -1094,6 +1129,8 @@ mod tests {
         prepared: AtomicUsize,
         probes: AtomicUsize,
         joins: AtomicUsize,
+        /// The row count of every batch `aggregate` was handed, in order.
+        aggregate_rows: std::sync::Mutex<Vec<usize>>,
     }
 
     impl FakeGpu {
@@ -1224,6 +1261,10 @@ mod tests {
             stream: &DeviceStream,
             args: AggregateArgs<'_>,
         ) -> Result<DeviceBatch, EngineError> {
+            self.aggregate_rows
+                .lock()
+                .unwrap()
+                .push(args.input.num_rows());
             self.inner.aggregate(stream, args)
         }
         fn vector_distance(
@@ -1655,6 +1696,53 @@ mod tests {
         // tk and survives the filter, so its bitmap comes back too.
         assert_eq!(snapshot.bytes_h2d, 10 * 8 + 2 + 10 * 8, "{snapshot:?}");
         assert_eq!(snapshot.bytes_d2h, 10 * 8 + 2 + 10 * 8, "{snapshot:?}");
+    }
+
+    /// The exec hands the device one batch at a time and holds only groups
+    /// between them (#29): three 4-row batches are three 4-row calls, and
+    /// the per-batch groups merged on the host equal the reference over all
+    /// twelve rows. It used to concatenate its whole input into one call, so
+    /// the input had to fit in memory at once — and, on CUDA, in `u32::MAX`
+    /// rows.
+    #[tokio::test]
+    async fn the_aggregate_exec_streams_batches_to_the_device() {
+        use datafusion::physical_plan::collect;
+        use datafusion::prelude::SessionContext;
+        use oxidelake_core::params::AggregateFunction::{Count, Max, Sum};
+
+        let fake = FakeGpu::new(true);
+        let ctx = SessionContext::new();
+        let scan = ctx
+            .read_batches(vec![batch(), batch(), batch()])
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let spec = AggregateSpec {
+            group_by: 0,
+            aggregates: vec![(Sum, 2), (Count, 2), (Max, 0)],
+        };
+        let hub = TelemetryHub::new();
+        let exec = crate::exec::GpuAggregateExec::try_new(scan, spec.clone(), BackendKind::Cuda)
+            .unwrap()
+            .with_backend(Arc::clone(&fake) as Arc<dyn GpuBackend>)
+            .with_telemetry(Arc::clone(&hub));
+        let out = collect(Arc::new(exec), ctx.task_ctx()).await.unwrap();
+
+        assert_eq!(*fake.aggregate_rows.lock().unwrap(), vec![4, 4, 4]);
+        let all = arrow::compute::concat_batches(&batch().schema(), &[batch(), batch(), batch()])
+            .unwrap();
+        let expected = kernels::aggregate(&all, &spec).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].columns(), expected.columns());
+        // Rows out are the groups, counted once although every batch has them.
+        let operators = hub.snapshot().operators;
+        let snapshot = &operators[0];
+        assert_eq!(
+            (snapshot.batches, snapshot.rows_in, snapshot.rows_out),
+            (3, 12, 4)
+        );
+        assert_eq!(snapshot.fallback_batches, 0);
     }
 
     /// Aggregation and vector distance count too, not just the filter.

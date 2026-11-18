@@ -409,6 +409,23 @@ versions (0.x) may contain breaking changes; they are always listed under a
   is refused. `oxidelake_planner::codec::PLAN_FINGERPRINT` and
   `build_description()` are public, and `make test-mixed-build` runs both
   cases with real binaries.
+- **A `GROUP BY` under a GPU target holds its groups, not its input** (#29).
+  `GpuAggregateExec` collected each input partition whole before
+  aggregating, so every grouped aggregate on a `cuda` or `metal` target, and
+  on a cluster with `OXIDE_CLUSTER_BACKEND=cuda`, held its input in memory
+  at once, and a CUDA device was handed the whole partition in one call,
+  which fails above 2^30 rows (the group table, two slots per row rounded up
+  to a power of two, must be addressable with a `u32`). It now hands the
+  backend one input batch at a time and folds each batch's groups into one
+  accumulator per group on the host. Measured with `/usr/bin/time -v` on a
+  machine without a GPU, a `GROUP BY k` over 20 million rows under
+  `--target cuda` peaked at 1,039 MiB and now peaks at 158 MiB, which no
+  longer grows with the input (stock DataFusion: 138 MiB). **Visible change:**
+  the operator's `batches` counter in telemetry and the TUI now counts input
+  batches, as every other operator's does, where it counted one per
+  partition; `rows_in` and `rows_out` are unchanged. New public pieces:
+  `GpuOperator::aggregate_into` and
+  `oxidelake_device::cpu::kernels::GroupedAggregator`.
 
 ### Security
 

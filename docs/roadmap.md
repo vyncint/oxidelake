@@ -150,7 +150,10 @@ read it as "a running deployment can now tell whether its GPU is being used".
       stock DataFusion on a CUDA device.
 - [ ] `GpuAggregateExec` streams and partitions instead of collecting the
       whole input (#29, audit P4) — *Acceptance:* a input larger than device
-      memory completes.
+      memory completes. Both halves are in 0.3.0: each input partition is
+      aggregated on its own (#90), and a device is handed one batch at a
+      time while the operator keeps one accumulator per group (#29). Not yet
+      run on a GPU.
 - [ ] `SUM(Int64)` wraps on overflow on every backend, as stock DataFusion's
       does (#46) — *Acceptance:* the conformance overflow fixture equals
       DataFusion's wrapped answer on a CUDA device. The line first asked for

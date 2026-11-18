@@ -17,6 +17,7 @@ use arrow::array::{
 use arrow::buffer::NullBuffer;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::util::display::{ArrayFormatter, FormatOptions};
+use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::physical_plan::{ExecutionPlan, collect, displayable};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use oxidelake_compute::{
@@ -226,6 +227,18 @@ async fn check_join_chunked(backend: Arc<dyn GpuBackend>, seed: u64) {
         "seed={seed}: a {largest}-row batch from a join whose session batch size is {CHUNK}"
     );
     assert_eq!(sorted_rows(&batches), expected, "chunked join seed={seed}");
+/// `batch` as one partition of `piece`-row batches, the way a scan hands
+/// them over (one empty batch when `batch` has no rows).
+fn in_pieces(batch: &RecordBatch, piece: usize) -> Arc<dyn ExecutionPlan> {
+    let rows = batch.num_rows();
+    let mut pieces: Vec<RecordBatch> = (0..rows)
+        .step_by(piece)
+        .map(|offset| batch.slice(offset, piece.min(rows - offset)))
+        .collect();
+    if pieces.is_empty() {
+        pieces.push(batch.clone());
+    }
+    MemorySourceConfig::try_new_exec(&[pieces], batch.schema(), None).unwrap()
 }
 
 async fn check_aggregate(backend: Arc<dyn GpuBackend>, seed: u64, rows: usize) {
@@ -246,11 +259,34 @@ async fn check_aggregate(backend: Arc<dyn GpuBackend>, seed: u64, rows: usize) {
             (AggregateFunction::Max, 0),
         ],
     };
-    let exec = GpuAggregateExec::try_new(physical_plan(&ctx, batch).await, spec, backend.kind())
-        .unwrap()
-        .with_backend(backend);
-    let actual = exec_rows(&ctx, Arc::new(exec)).await;
-    assert_eq!(actual, expected, "aggregate seed={seed} rows={rows}");
+    // The rows as one batch, then as 7-row batches. The operator folds each
+    // batch's groups into its accumulators as the batches arrive (#29), so on
+    // a device every piece is a launch of its own whose groups are merged on
+    // the host — the path one batch never takes.
+    for piece in [rows.max(1), 7] {
+        let hub = TelemetryHub::new();
+        let exec =
+            GpuAggregateExec::try_new(in_pieces(&batch, piece), spec.clone(), backend.kind())
+                .unwrap()
+                .with_backend(Arc::clone(&backend))
+                .with_telemetry(Arc::clone(&hub));
+        let actual = exec_rows(&ctx, Arc::new(exec)).await;
+        assert_eq!(
+            actual, expected,
+            "aggregate seed={seed} rows={rows} piece={piece}"
+        );
+        // Equal rows would also come from the CPU fallback: on a backend that
+        // aggregates on its device, every batch must have run there.
+        if backend.kind().is_gpu() && backend.supports_aggregate() && rows > 0 {
+            let snapshot = &hub.snapshot().operators[0];
+            assert_eq!(
+                (snapshot.batches, snapshot.fallback_batches),
+                (rows.div_ceil(piece) as u64, 0),
+                "seed={seed} rows={rows} piece={piece}: {snapshot:?}"
+            );
+            assert!(snapshot.bytes_h2d > 0, "{snapshot:?}");
+        }
+    }
 }
 
 // --- aggregate edge cases (#100, #46) ----------------------------------------

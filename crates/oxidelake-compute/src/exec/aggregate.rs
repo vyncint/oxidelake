@@ -4,7 +4,6 @@ use std::fmt;
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
-use arrow::compute::concat_batches;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result};
@@ -20,11 +19,12 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
     SendableRecordBatchStream,
 };
-use futures::TryStreamExt;
+use futures::StreamExt;
 use oxidelake_core::BackendKind;
 use oxidelake_core::params::{AggregateFunction, AggregateSpec};
 use oxidelake_core::telemetry::TelemetryHub;
 use oxidelake_device::GpuBackend;
+use oxidelake_device::cpu::kernels::GroupedAggregator;
 
 use super::{ExecConfig, field_type, plan_err, plan_properties};
 use crate::display;
@@ -65,7 +65,11 @@ pub fn aggregate_output_schema(input: &Schema, spec: &AggregateSpec) -> Result<S
     Ok(Arc::new(Schema::new(fields)))
 }
 
-/// Grouped aggregation, one input partition at a time.
+/// Grouped aggregation that streams: each input batch is aggregated on the
+/// backend and its groups are merged into accumulators on the host, so the
+/// operator holds one entry per group however many rows it reads (#29), and
+/// a device sees one batch at a time — its `u32` row limit applies to a
+/// batch, not to the query.
 ///
 /// Each input partition is aggregated on its own and becomes the output
 /// partition with the same number: one batch, sorted by key with the `NULL`
@@ -280,8 +284,7 @@ impl ExecutionPlan for GpuAggregateExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let input = self.input.execute(partition, context)?;
-        let input_schema = self.input.schema();
+        let mut input = self.input.execute(partition, context)?;
         let operator = self.config.operator("GpuAggregateExec")?;
         let span = self
             .config
@@ -289,13 +292,19 @@ impl ExecutionPlan for GpuAggregateExec {
         let baseline = BaselineMetrics::new(&self.metrics, partition);
         let spec = self.spec.clone();
         let schema = Arc::clone(&self.schema);
+        let mut groups = GroupedAggregator::new(&self.input.schema(), &spec)?;
         let stream = futures::stream::once(async move {
-            let batches: Vec<RecordBatch> = input.try_collect().await?;
-            let all = concat_batches(&input_schema, &batches)?;
-            // Entered after the input is collected: the await is above it.
+            while let Some(batch) = input.next().await {
+                let batch = batch?;
+                // Entered for one batch's work, between awaits: a span held
+                // across an await is what `tracing` warns about.
+                let _entered = span.enter();
+                let _timer = baseline.elapsed_compute().timer();
+                operator.aggregate_into(&batch, &spec, &mut groups)?;
+            }
             let _entered = span.enter();
             let _timer = baseline.elapsed_compute().timer();
-            let out = operator.aggregate(&all, &spec)?;
+            let out = groups.finish()?;
             let out = RecordBatch::try_new(Arc::clone(&schema), out.columns().to_vec())?;
             baseline.record_output(out.num_rows());
             Ok::<_, DataFusionError>(out)
