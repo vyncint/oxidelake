@@ -32,6 +32,13 @@ Trusted Publishing.
   published bytes, #131), and only a target with no archive is built. A
   checksum attached without any archive stops the job: delete it with
   `gh release delete-asset` first.
+- A **self-hosted runner labelled `gpu`** for `gpu.yml` (#38): Linux, an
+  NVIDIA GPU with its driver and NVRTC, and a C toolchain (the workflow
+  installs rustup if it is missing). Register it to this repository only.
+  `gpu.yml` is dispatch-only because this repository is public: a runner
+  that took pull-request jobs would run a stranger's code on the GPU box.
+  **None is registered yet** (2026-11-18), so step 0's CUDA run cannot
+  happen until one is; see step 0 for what a release says meanwhile.
 - A **`release` GitHub environment** whose deployment branches are restricted
   to `v*` tags, so an OIDC publish token can never be minted from a branch.
 - **`v*` tags protected by a ruleset**, so only a repository admin can create
@@ -42,6 +49,15 @@ Trusted Publishing.
 ```sh
 # 0. Green main, and no flakes: run the stress workflow and wait for it.
 gh workflow run stress.yml && gh run watch
+#    Then execute CUDA on the same commit: CI only compiles it, and the one
+#    device run on record (2026-09-06, T4) found a kernel bug that CPU
+#    conformance had passed. gpu.yml runs `make test-cuda-device` on the
+#    self-hosted `gpu` runner. Required: put the run's GPU, driver and commit
+#    in STATUS.md's matrix in the release PR (step 3). release.yml does not
+#    check this; the checklist is the gate. With no `gpu` runner (the case
+#    until one is registered), the release PR and the release notes say the
+#    CUDA paths of this release are compiled-only, as ADR-0012 requires.
+gh workflow run gpu.yml --ref main && gh run watch
 
 # 1. Bump `version` in the workspace [workspace.package] AND every internal
 #    `version = "…"` in [workspace.dependencies], then refresh the lockfile.

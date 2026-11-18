@@ -15,6 +15,14 @@ versions (0.x) may contain breaking changes; they are always listed under a
   that exec instance has reported to its telemetry hub (`None` before it
   first executes, or without a hub). It is how a reader pairs a plan node
   with its own counters: the hub's entries carry only a name (#123).
+- **`gpu.yml`: the CUDA suites on a real device, on demand** (#38). A
+  `workflow_dispatch` workflow for a self-hosted runner labelled `gpu` runs
+  the new `make test-cuda-device` (the device tests with the ignored ones,
+  the conformance suite under `OXIDE_BACKEND=cuda`, and `embedded.rs`) and
+  uploads its log; the target fails rather than skips without a GPU.
+  `docs/RELEASING.md` step 0 now requires a green run on the release
+  candidate. No such runner is registered yet, so it has never run: until
+  one is, a release says its CUDA paths are compiled-only.
 
 ### Changed
 

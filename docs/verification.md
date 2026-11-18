@@ -132,7 +132,9 @@ Metal backend executes for real. And one CUDA session: an AWS `g4dn.xlarge`
 with an NVIDIA Tesla T4 (2026-09-06, driver 595.71, CUDA 13.2, Rust 1.98.0),
 where the CUDA path executed for the first time and found the aggregation
 kernel bug [STATUS.md](../STATUS.md) records. It was a manual session:
-nothing on record has executed CUDA code since, and no CI job does (#38).
+nothing on record has executed CUDA code since. `gpu.yml` can, on demand, on
+a self-hosted runner labelled `gpu`, but none is registered yet, so it has
+never run (#38).
 
 | Claim | Verifiable | How / where |
 |---|---|---|
@@ -148,7 +150,10 @@ nothing on record has executed CUDA code since, and no CI job does (#38).
 | CUDA performance | **no** | no CUDA timing is on record; never claim a number |
 | io_uring object store | Linux only | skips with a logged reason when `io_uring_setup` returns EPERM/ENOSYS |
 
-On a CUDA machine, what the T4 session ran (STATUS.md's matrix):
+On a CUDA machine, what the T4 session ran (STATUS.md's matrix), and what
+`make test-cuda-device` runs, with `embedded.rs` under the cuda target after
+them; `gpu.yml` runs that target. It fails, rather than skips, when
+`nvidia-smi` shows no GPU, and it is not in `make gate`:
 
 ```bash
 cargo test -p oxidelake-device --features cuda -- --include-ignored

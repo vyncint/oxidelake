@@ -499,6 +499,74 @@ class FeatureCoverageTests(unittest.TestCase):
             self.assertIn(target, gate, f"ci.yml runs `make {target}` and `make gate` does not")
 
 
+class CudaDeviceTests(unittest.TestCase):
+    """gpu.yml executes the CUDA suites on a device, by hand only (#38).
+
+    No self-hosted runner exists yet, so the workflow has never run; these
+    pin what it will do when one does.
+    """
+
+    def make_cuda(self, nvidia_smi):
+        """`make test-cuda-device` with a fake nvidia-smi script and a cargo that records its calls."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("Makefile", "Cargo.toml"):
+                (root / name).write_text((ROOT / name).read_text())
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            calls = root / "cargo.log"
+            for name, body in (("cargo", f'echo "OXIDE_BACKEND=${{OXIDE_BACKEND:-}} $*" >> "{calls}"'),
+                               ("nvidia-smi", nvidia_smi)):
+                (bin_dir / name).write_text(f"#!/bin/sh\n{body}\n")
+                (bin_dir / name).chmod(0o755)
+            env = {k: v for k, v in os.environ.items() if k not in ("CARGO", "OXIDE_BACKEND")}
+            env["PATH"] = str(bin_dir) + os.pathsep + os.environ["PATH"]
+            run = subprocess.run(["make", "test-cuda-device"], cwd=root, env=env, text=True, capture_output=True)
+            return run, calls.read_text().splitlines() if calls.exists() else []
+
+    def test_without_a_gpu_it_fails_before_building_anything(self):
+        run, calls = self.make_cuda(
+            "echo 'NVIDIA-SMI has failed because it could not communicate with the NVIDIA driver.'\nexit 9")
+        self.assertNotEqual(run.returncode, 0, run.stdout)
+        self.assertIn("no NVIDIA GPU visible", run.stdout + run.stderr)
+        self.assertEqual(calls, [], "a run that executes nothing must not look like one that passed")
+
+    def test_with_a_gpu_it_runs_the_suites_the_t4_session_ran(self):
+        run, calls = self.make_cuda("echo 'GPU 0: Tesla T4 (UUID: GPU-00000000-0000-0000-0000-000000000000)'")
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertEqual(calls, [
+            "OXIDE_BACKEND= test -p oxidelake-device --features cuda --locked -- --include-ignored",
+            "OXIDE_BACKEND=cuda test -p oxidelake-compute --features cuda --locked -- --ignored",
+            "OXIDE_BACKEND=cuda test -p oxidelake-runtime --features cuda --locked --test embedded",
+        ])
+
+    def test_it_runs_only_when_dispatched_on_the_gpu_label(self):
+        lines = (ROOT / ".github/workflows/gpu.yml").read_text().splitlines()
+        start = lines.index("on:")
+        triggers = []
+        for line in lines[start + 1:]:
+            if line.strip() and not line.startswith(" "):
+                break
+            if line.startswith("  ") and not line.startswith("   ") and not line.lstrip().startswith("#"):
+                triggers.append(line.strip().rstrip(":"))
+        self.assertEqual(triggers, ["workflow_dispatch"],
+                         "a self-hosted runner on a public repository must never run pull_request code")
+        self.assertIn("    runs-on: [self-hosted, linux, gpu]", lines)
+
+    def test_a_failing_suite_fails_the_step_whose_output_is_teed(self):
+        script = step_script("gpu.yml", "CUDA suites on the device")
+        self.assertIn("make test-cuda-device", script)
+        with tempfile.TemporaryDirectory() as directory:
+            fake = Path(directory) / "make"
+            fake.write_text("#!/bin/sh\necho 'test result: FAILED. 1 failed'\nexit 2\n")
+            fake.chmod(0o755)
+            run = subprocess.run(["bash", "--noprofile", "--norc", "-e", "-c", script], cwd=directory,
+                                 env={**os.environ, "PATH": directory + os.pathsep + os.environ["PATH"]},
+                                 capture_output=True, text=True)
+            self.assertNotEqual(run.returncode, 0, "tee's success hid the suite's failure")
+            self.assertIn("FAILED", (Path(directory) / "cuda-device.log").read_text())
+
+
 class MsrvJobTests(unittest.TestCase):
     """The CI msrv job compiles with the declared rust-version (#127).
 

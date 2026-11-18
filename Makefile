@@ -15,7 +15,7 @@ UNAME := $(shell uname -s)
 # selecting compute alone rebuilt Arrow/DataFusion for the second pass in CI.
 METAL_TEST_ARGS := -p oxidelake-memory -p oxidelake-device -p oxidelake-compute -p oxidelake-runtime -p oxidelake-tui --features oxidelake-runtime/metal --locked --timings
 
-.PHONY: help fmt fmt-check lint lint-cuda lint-metal lint-predict lint-metrics test test-predict test-metrics test-io-uring test-mixed-build test-termlens-cli test-metal test-metal-device check-cuda check-predict-no-second-cuda doc coherence deny gate metal msrv quickstart clean-data release-scripts crate-metadata skill-version zizmor ci-scripts stress-tui
+.PHONY: help fmt fmt-check lint lint-cuda lint-metal lint-predict lint-metrics test test-predict test-metrics test-io-uring test-mixed-build test-termlens-cli test-metal test-metal-device test-cuda-device check-cuda check-predict-no-second-cuda doc coherence deny gate metal msrv quickstart clean-data release-scripts crate-metadata skill-version zizmor ci-scripts stress-tui
 
 help: ## list targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-14s %s\n", $$1, $$2}'
@@ -130,6 +130,22 @@ test-metal-device: ## reuse the Metal test graph for on-device conformance
 
 check-cuda: ## the GPU compile gate: cuda code builds with no CUDA installed
 	$(CARGO) check -p oxidelake-runtime --features cuda --locked
+
+# Not part of `make gate`: it executes CUDA, so it needs an NVIDIA GPU, its
+# driver and NVRTC, which no gate machine and no hosted runner has. gpu.yml
+# runs it on demand on a self-hosted runner labelled `gpu` (#38). The three
+# suites are the ones the 2026-09-06 T4 session ran (STATUS.md). Unlike
+# test-metal-device it fails, never skips, without a device: its whole
+# purpose is execution, and a skip would be a green run that executed
+# nothing. OXIDE_BACKEND=cuda makes the detector refuse to fall back to the
+# CPU backend; the conformance suite also proves bytes crossed to the device.
+test-cuda-device: ## execute the CUDA suites on an NVIDIA GPU (gpu.yml); fails without one
+	@nvidia-smi -L 2>/dev/null | grep -q '^GPU ' || { \
+	  echo "test-cuda-device: no NVIDIA GPU visible to nvidia-smi; this target executes CUDA and cannot pass without one"; \
+	  exit 1; }
+	$(CARGO) test -p oxidelake-device --features cuda --locked -- --include-ignored
+	OXIDE_BACKEND=cuda $(CARGO) test -p oxidelake-compute --features cuda --locked -- --ignored
+	OXIDE_BACKEND=cuda $(CARGO) test -p oxidelake-runtime --features cuda --locked --test embedded
 
 doc: ## rustdoc for the workspace, warnings are errors
 	RUSTDOCFLAGS="-D warnings" $(CARGO) doc --workspace --no-deps --all-features --locked
