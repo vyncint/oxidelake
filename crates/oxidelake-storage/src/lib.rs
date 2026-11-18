@@ -26,8 +26,9 @@ pub mod uring;
 
 #[cfg(feature = "datagen")]
 pub use datagen::{
-    CHUNK_ROWS, DemoTable, demo_batches, demo_chunks, demo_schema, demo_write_options,
-    write_demo_table,
+    CHUNK_ROWS, DemoOptions, DemoTable, SPECIAL_FLOAT_EVERY, SPECIAL_FLOATS, demo_batches,
+    demo_batches_with, demo_chunks, demo_chunks_with, demo_schema, demo_write_options,
+    write_demo_table, write_demo_table_with,
 };
 pub use errors::classify_error;
 pub use ipc::{read_ipc_file, write_ipc_file};

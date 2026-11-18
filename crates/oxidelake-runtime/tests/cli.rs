@@ -453,9 +453,8 @@ fn parse_csv(stdout: &str) -> BTreeMap<Option<i64>, i64> {
         .collect()
 }
 
-/// `k -> n` parsed out of the JSON form. A null `k` is *absent* from the
-/// object rather than `null`, which is arrow-json's encoding and is why this
-/// reads the key rather than expecting it.
+/// `k -> n` parsed out of the JSON form, where a NULL `k` is `null`: every
+/// object carries every column (#124).
 fn parse_json(stdout: &str) -> BTreeMap<Option<i64>, i64> {
     let trimmed = stdout.trim();
     let inner = trimmed
@@ -469,16 +468,24 @@ fn parse_json(stdout: &str) -> BTreeMap<Option<i64>, i64> {
         .split("},{")
         .map(|object| {
             let object = object.trim_matches(['{', '}']);
+            // A missing `k` fails here rather than reading as a NULL: the
+            // demo table's NULL keys group into a row whose key must be there.
             let mut row = (None, None);
             for field in object.split(',') {
                 let (name, value) = field.split_once(':').unwrap();
                 match name.trim_matches('"') {
-                    "k" => row.0 = Some(value.parse::<i64>().unwrap()),
+                    "k" => {
+                        row.0 = Some((value != "null").then(|| value.parse::<i64>().unwrap()));
+                    }
                     "n" => row.1 = Some(value.parse::<i64>().unwrap()),
                     other => panic!("unexpected field {other}"),
                 }
             }
-            (row.0, row.1.expect("every row has a count"))
+            (
+                row.0
+                    .unwrap_or_else(|| panic!("a row without its `k` key: {{{object}}}")),
+                row.1.expect("every row has a count"),
+            )
         })
         .collect()
 }
@@ -546,6 +553,25 @@ fn an_empty_result_keeps_its_csv_header_and_json_array() {
     };
     assert_eq!(run("csv"), "k,n\n");
     assert_eq!(run("json"), "[]\n");
+}
+
+/// The issue's own command (#124): `v` is NULL and keeps its key, and `n` is
+/// NaN, which JSON has no number for and which used to be written as the
+/// `null` that a NULL is written as.
+#[test]
+fn json_output_keeps_null_keys_and_tells_nan_from_null() {
+    let assert = oxide()
+        .args([
+            "sql",
+            "-q",
+            "SELECT 1 AS k, CAST(NULL AS DOUBLE) AS v, CAST('NaN' AS DOUBLE) AS n",
+            "--output",
+            "json",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert_eq!(stdout, "[{\"k\":1,\"v\":null,\"n\":\"NaN\"}]\n");
 }
 
 /// Zero rows per batch would be accepted by DataFusion and then return
@@ -617,6 +643,14 @@ fn the_flags_appear_in_help() {
     let help = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
     for flag in ["--batch-size", "--output", "--target", "--cluster"] {
         assert!(help.contains(flag), "oxide sql --help lacks {flag}\n{help}");
+    }
+    // What `--output json` writes for a NULL and a NaN is a contract a script
+    // depends on, so the flag's help states it (#124).
+    for encoding in ["null", "\"NaN\"", "\"Infinity\"", "\"-Infinity\""] {
+        assert!(
+            help.contains(encoding),
+            "oxide sql --help does not say how json writes {encoding}\n{help}"
+        );
     }
 
     let assert = Command::cargo_bin("oxide-worker")
@@ -1670,5 +1704,79 @@ fn a_public_or_wildcard_listener_is_refused_without_the_flag() {
         let help = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
         assert!(help.contains("--allow-insecure-bind"), "{bin}\n{help}");
         assert!(help.contains("--bind-host"), "{bin}\n{help}");
+    }
+}
+
+/// `gen-data --special-floats` writes every IEEE special value into `v`, and
+/// a Float64 filter over them returns the same rows planned for the CPU
+/// (DataFusion's own `FilterExec`) as for CUDA (`GpuFilterExec`: the CPU
+/// reference on a machine without a GPU, the device kernel on one with).
+/// DataFusion 55 has `NaN > 24.5` true and `-0.0 = 0.0` true; before #28 the
+/// reference had the second false, and the kernel the first.
+#[test]
+fn special_floats_filter_alike_on_every_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let assert = oxide()
+        .args([
+            "gen-data",
+            "--rows",
+            "4096",
+            "--out",
+            dir.path().to_str().unwrap(),
+            "--special-floats",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(stdout.contains("special floats in v"), "{stdout}");
+
+    // Read back with the parquet crate alone: every special value is there.
+    let file = File::open(dir.path().join("t.parquet")).unwrap();
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut bits = std::collections::BTreeSet::new();
+    for batch in reader {
+        let batch = batch.unwrap();
+        let v = batch
+            .column(batch.schema().index_of("v").unwrap())
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        bits.extend(v.iter().flatten().map(f64::to_bits));
+    }
+    for special in [
+        f64::NAN,
+        -f64::NAN,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        -0.0,
+        0.0,
+    ] {
+        assert!(bits.contains(&special.to_bits()), "no {special:?} in v");
+    }
+
+    let table_arg = format!("t={}", dir.path().display());
+    for predicate in ["v > 24.5", "v < 0.0", "v = 0.0", "v <= -0.0"] {
+        let query = format!("SELECT id, v FROM t WHERE {predicate} ORDER BY id");
+        let explain = oxide()
+            .args(["explain", "-q", &query, "--table", &table_arg])
+            .args(["--target", "cuda"])
+            .assert()
+            .success();
+        let plan = String::from_utf8(explain.get_output().stdout.clone()).unwrap();
+        assert!(plan.contains("GpuFilterExec[cuda]"), "{predicate}: {plan}");
+        let rows = |target: &str| {
+            let assert = oxide()
+                .args(["sql", "-q", &query, "--table", &table_arg])
+                .args(["--target", target, "--output", "csv"])
+                .assert()
+                .success();
+            String::from_utf8(assert.get_output().stdout.clone()).unwrap()
+        };
+        let cpu = rows("cpu");
+        assert!(cpu.lines().count() > 1, "{predicate} selected nothing");
+        assert_eq!(rows("cuda"), cpu, "{predicate}");
     }
 }

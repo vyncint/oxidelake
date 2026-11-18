@@ -101,6 +101,18 @@ versions (0.x) may contain breaking changes; they are always listed under a
   come back in build order, as the CPU reference returns them. Not yet run
   on a GPU (STATUS.md).
 
+- **`oxide sql --output json` keeps the key of a NULL and tells NaN from
+  NULL** (#124). Every object now carries every column, a NULL as `null`;
+  the key used to be left out, so a script could not tell a NULL from a
+  column that does not exist. NaN, infinity and negative infinity, which
+  JSON has no number for, are the strings `"NaN"`, `"Infinity"` and
+  `"-Infinity"` in every float type, inside lists, structs and
+  dictionaries too; all three used to be written `null`, like a NULL. A
+  script that took a missing key for NULL reads `null` instead, and one
+  that reads a float column accepts the three strings, which Python's
+  `float()` and JavaScript's `Number()` read back. `--help` and the README
+  say so.
+
 ### Fixed
 
 - **A LIMIT over a GPU-placed filter or join returns its row count again**
@@ -538,6 +550,15 @@ versions (0.x) may contain breaking changes; they are always listed under a
   `GpuOperator::aggregate_into` and
   `oxidelake_device::cpu::kernels::GroupedAggregator`.
 
+
+- **`OxideFrame::show()` no longer panics when stdout closes** (#125). It
+  was DataFusion's `DataFrame::show`, whose `println!` panics on a closed
+  pipe, so a program showing a frame into `… | head -1` died with `failed
+  printing to stdout: Broken pipe`: the crash #34 fixed in `oxide sql` and
+  left in the library. `show` now writes the same table itself, and a
+  reader that has gone is a clean stop that returns `Ok`, as `oxide sql`
+  exits 0 there; any other write failure is an `EngineError::Io`.
+
 ### Fixed
 
 - **A crates.io error can no longer switch the release's semver check off.**
@@ -626,6 +647,40 @@ versions (0.x) may contain breaking changes; they are always listed under a
   crates.io description no longer offers PyO3 bindings, which were
   deferred and do not exist. An io_uring comment named a test file that does
   not exist; it names the test that does.
+
+- **NULL elements inside a vector column survive a GPU filter or join**
+  (#105). The device transfer format carries one validity bit per row, so a
+  NULL element inside a valid `FixedSizeList<Float32>` row came back from a
+  CUDA or Metal filter, or a CUDA join, as a valid `0.0`, where the CPU path
+  kept it NULL. Such a column now stays on the host, as a `Utf8` column
+  does, and is gathered at the rows the device selected; the rest of the
+  batch still runs on the device. `columns::extract` refuses one as
+  `Unsupported`, so a vector distance over it, whose kernel has to read the
+  column, runs on the CPU reference, counted in `fallback_batches`, with the
+  same distances. NULL elements under a NULL row, which a builder's
+  `append_null` leaves, do not count. New:
+  `columns::row_with_null_element`.
+
+- **A `Float64` filter planned for a GPU returns the rows `--target cpu`
+  returns, over NaN and `-0.0` too** (#28). A `--target cuda` or
+  `--target metal` filter, or a cluster's GPU placement, could select other
+  rows than `--target cpu` for two kinds of value. A NaN: the CUDA kernel
+  compared with plain IEEE `>` and `=`, where a NaN matches nothing, but
+  DataFusion orders floats by IEEE totalOrder, so `v > 4.0` selects a NaN
+  (a NaN sorts above `+inf`; one with its sign bit set, x86's default NaN,
+  below `-inf`). And `-0.0`: DataFusion 55 reads it as `+0.0` in a
+  comparison (`-0.0 = 0.0` is true; under 0.2.0's DataFusion 54 it was
+  false on every target), but the CPU reference did not — and the
+  reference is what runs every `Float64` predicate on Metal, any
+  GPU-planned query on a machine without that GPU, and every per-batch
+  fallback — so there `v = 0.0` skipped the `-0.0` rows and `v < 0.0`
+  returned them. Both now compare as DataFusion 55 does; only rows holding
+  a NaN or a `-0.0` come back differently. New: `oxide gen-data
+  --special-floats`, which puts NaN, ±0.0 and ±inf into `v` on every 16th
+  row to compare targets on (the default table is unchanged), and behind it
+  `DemoOptions`, `write_demo_table_with`, `demo_batches_with`,
+  `demo_chunks_with`, `SPECIAL_FLOATS` and `SPECIAL_FLOAT_EVERY` in
+  `oxidelake-storage`.
 
 ### Security
 
