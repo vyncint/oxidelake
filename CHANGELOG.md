@@ -10,6 +10,25 @@ versions (0.x) may contain breaking changes; they are always listed under a
 
 ### Added
 
+- **Graceful shutdown, Ballista's retry limits, and what losing a worker
+  does** (#31). `oxide-scheduler` handled no signal: `SIGTERM` killed it
+  (status 143) with every query it was running. It now refuses new queries
+  on `SIGTERM` or `SIGINT`, saying it is shutting down, gives the running
+  ones up to `--drain-timeout` (20 s) to finish, and exits 0.
+  `oxide-worker` already stopped gracefully through Ballista (no new tasks,
+  its scheduler runs its tasks elsewhere, then it waits for them) but waited
+  for ever; `--drain-timeout` now bounds the wait, and it exits 0 either
+  way. A second signal stops either at once. New scheduler flags
+  `--task-max-failures` and `--stage-max-failures` (Ballista's retry
+  limits, 4 each) and `--worker-timeout` (seconds a silent worker still
+  counts, 180), and worker flag `--heartbeat-interval` (60); the defaults
+  are Ballista's, so a deployment that sets none behaves as before. **Known
+  issue, not fixed here:** on Ballista 55 a query that loses a worker in the
+  middle, killed or stopped, can return some groups twice with exit 0, or
+  wait until a new worker joins. Run the scheduler with
+  `--stage-max-failures 1`, which turns the common case into an error naming
+  the lost worker, and stop workers between queries (README, Cluster mode).
+
 - **`operator_stats()` on `GpuFilterExec`, `GpuHashJoinExec`,
   `GpuAggregateExec` and `GpuVectorDistanceExec`** returns the counters
   that exec instance has reported to its telemetry hub (`None` before it

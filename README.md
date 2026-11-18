@@ -131,6 +131,10 @@ The end-to-end test in `crates/oxidelake-runtime/tests/cli.rs` spawns exactly th
 
 A scheduler admits only workers of its own build: the same OxideLake release, built with `predict` if and only if the scheduler is. `cuda` and `metal` do not count, so a default-build scheduler with `--features cuda` workers is a supported cluster. A worker of another build is refused when it registers and exits non-zero naming both builds, and a query sent to a cluster whose workers were all refused fails at once with the same reason. The check guards against a mismatched deployment, not against an attacker: a worker declares its own build ([SECURITY.md](https://github.com/vyncint/oxidelake/blob/main/SECURITY.md)).
 
+`SIGTERM` or `SIGINT` stops either binary gracefully, and a second signal stops it at once. A scheduler refuses new queries, saying it is shutting down, gives the running ones up to `--drain-timeout` to finish, and exits 0. A worker takes no new tasks, its scheduler runs the tasks it had elsewhere, and it exits 0 once they finish or `--drain-timeout` passes; keep that under your supervisor's own limit (Kubernetes sends `SIGKILL` 30 s after `SIGTERM` by default). A worker that dies without a word is presumed lost once the scheduler's `--worker-timeout` passes with no heartbeat from it (the worker's `--heartbeat-interval`, which must be well under the timeout). Until then a query holding tasks on it waits, unless a shuffle fetch from it fails first: Ballista retries a fetch three times, three seconds apart, then runs the stage again, up to `--stage-max-failures` times. The scheduler's port serves Ballista's `/healthz` (always `ok`) and `/readyz` (`ready: N executors registered`, or 503 before the first); a worker serves nothing over HTTP except `--metrics-port`.
+
+**Ballista 55 does not recover a query from a lost worker reliably** (#31). With a worker killed, or stopped with `SIGTERM`, in the middle of a join, most of our runs either returned some groups twice, with exit 0, or never finished until a new worker joined, because the rollback loses track of the surviving workers' task slots. Until that is fixed upstream, run `oxide-scheduler --stage-max-failures 1`, which turns the common case, a failed fetch from the lost worker, into an error naming it; stop and restart workers between queries, not during them; and treat a query that ran while a worker was lost as suspect.
+
 ### DataFrame API
 
 ```rust
@@ -200,6 +204,10 @@ error, never a silent fallback.
 | `--port` | `50050` | gRPC port. |
 | `--cluster-backend` | `$OXIDE_CLUSTER_BACKEND`, then `cpu` | The capability the cluster declares, which is what placement rewrites against. |
 | `--metrics-port` / `--metrics-host` | off / `127.0.0.1` | As for the worker. A scheduler plans but does not execute, so its counters are empty; the endpoint exists so every process is scraped the same way. |
+| `--task-max-failures` | `4` | Times one task may fail before its query fails; `1` means no retry. A task lost with its worker runs again elsewhere without counting. Ballista's `task_max_failures`. |
+| `--stage-max-failures` | `4` | Times a stage may run again because a shuffle fetch failed, its input lost with a worker; `1` means no retry, and is the safe setting on Ballista 55 ([Cluster mode](#cluster-mode)). Ballista's `stage_max_failures`. |
+| `--worker-timeout` | `180` | Seconds without a heartbeat before a worker is presumed lost and its tasks run elsewhere. A query holding tasks on a dead worker waits this long. |
+| `--drain-timeout` | `20` | On `SIGTERM`/`SIGINT`, new queries are refused and the running ones get this many seconds to finish; then the scheduler exits 0. |
 
 ### `oxide-worker`
 
@@ -212,6 +220,8 @@ error, never a silent fallback.
 | `--work-dir` | a temporary directory | Where shuffle files go. |
 | `--metrics-port` / `--metrics-host` | off / `127.0.0.1` | Serve Prometheus metrics at `/metrics` (needs `--features metrics`). Unauthenticated: bind it on a private interface. Without the feature the flag is refused, never ignored. |
 | `--backend` | `$OXIDE_BACKEND`, then detected | The backend this worker executes on. Selected before the first task, so it reaches the operators; a backend the machine cannot provide is a startup error. |
+| `--heartbeat-interval` | `60` | Seconds between heartbeats to the scheduler; keep it well under the scheduler's `--worker-timeout`. |
+| `--drain-timeout` | `20` | On `SIGTERM`/`SIGINT`, no new tasks are taken (the scheduler runs this worker's tasks elsewhere) and the running ones get this many seconds to finish; then the worker exits 0. |
 
 ### Environment
 

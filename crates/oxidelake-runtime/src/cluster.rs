@@ -8,8 +8,12 @@
 //! tests and the CLI.
 
 use std::any::Any;
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use ballista_core::extension::{
     SessionConfigExt, ballista_aggregate_functions, ballista_scalar_functions,
@@ -24,8 +28,8 @@ use ballista_core::utils::{default_config_producer, default_session_builder};
 use ballista_core::{ConfigProducer, RuntimeProducer};
 use ballista_executor::executor_process::{ExecutorProcessConfig, start_executor_process};
 use ballista_executor::new_standalone_executor_from_builder;
-use ballista_scheduler::cluster::BallistaCluster;
 use ballista_scheduler::cluster::memory::InMemoryJobState;
+use ballista_scheduler::cluster::{BallistaCluster, JobState};
 use ballista_scheduler::config::SchedulerConfig;
 use ballista_scheduler::scheduler_process::start_server;
 use ballista_scheduler::scheduler_server::SessionBuilder;
@@ -50,6 +54,7 @@ use oxidelake_storage::{
 use crate::admission::{
     REFUSED, SameBuildClusterState, failing_without_a_usable_worker, tagged_executor_id,
 };
+use crate::shutdown::{ShutdownSignal, Stopped, drain, refusing_while_draining, unfinished_jobs};
 
 fn ballista_error(err: impl std::fmt::Display) -> EngineError {
     EngineError::execution(format!("ballista: {err}"))
@@ -266,6 +271,53 @@ pub fn scheduler_config(bind_host: &str, port: u16, target: BackendKind) -> Sche
     }
 }
 
+/// How long a scheduler waits on a silent worker unless told otherwise:
+/// Ballista's `executor_timeout_seconds`.
+pub const DEFAULT_WORKER_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Sets how long a worker may go without a heartbeat before `config`'s
+/// scheduler presumes it lost and re-runs its tasks elsewhere (#31), in
+/// whole seconds, at least one.
+///
+/// Until then a worker that died holding tasks holds its query too, unless a
+/// shuffle fetch from it fails first. Ballista checks for silent workers on
+/// a fixed 15-second tick, which would make a timeout shorter than that a
+/// fiction; the tick here is a third of the timeout, never more than 15
+/// seconds. A query left with no worker at all fails after the same timeout
+/// again, as Ballista's own scheduler binary arranges it.
+pub fn with_worker_timeout(mut config: SchedulerConfig, timeout: Duration) -> SchedulerConfig {
+    let seconds = timeout.as_secs().max(1);
+    config.executor_timeout_seconds = seconds;
+    config.expire_dead_executor_interval_seconds = (seconds / 3).clamp(1, 15);
+    config.no_executors_grace_period_seconds = seconds;
+    config
+}
+
+type SchedulerServe = Pin<Box<dyn Future<Output = ballista_core::error::Result<()>> + Send>>;
+
+/// A scheduler ready to serve, with what a shutdown needs to reach.
+struct Scheduler {
+    serve: SchedulerServe,
+    jobs: Arc<dyn JobState>,
+    draining: Arc<AtomicBool>,
+}
+
+impl Scheduler {
+    fn new(config: SchedulerConfig) -> Result<Self, EngineError> {
+        let address: SocketAddr = format!("{}:{}", config.bind_host, config.bind_port)
+            .parse()
+            .map_err(|e| EngineError::plan(format!("invalid scheduler bind address: {e}")))?;
+        let draining = Arc::new(AtomicBool::new(false));
+        let cluster = same_build_cluster(&config, Arc::clone(&draining));
+        let jobs = cluster.job_state();
+        Ok(Self {
+            serve: Box::pin(start_server(cluster, address, Arc::new(config))),
+            jobs,
+            draining,
+        })
+    }
+}
+
 /// Runs a Ballista scheduler until it exits.
 ///
 /// The scheduler admits only workers of its own build (#92): one whose plan
@@ -273,19 +325,68 @@ pub fn scheduler_config(bind_host: &str, port: u16, target: BackendKind) -> Sche
 /// cluster whose workers were all refused fails at once with the reason,
 /// where Ballista would hold it for a worker that is never coming.
 pub async fn run_scheduler(config: SchedulerConfig) -> Result<(), EngineError> {
-    let address: SocketAddr = format!("{}:{}", config.bind_host, config.bind_port)
-        .parse()
-        .map_err(|e| EngineError::plan(format!("invalid scheduler bind address: {e}")))?;
-    let cluster = same_build_cluster(&config);
-    start_server(cluster, address, Arc::new(config))
-        .await
-        .map_err(ballista_error)
+    Scheduler::new(config)?.serve.await.map_err(ballista_error)
+}
+
+/// Runs a scheduler like [`run_scheduler`] until `signal`, then stops it
+/// gracefully (#31): a query sent from then on fails at once saying the
+/// scheduler is shutting down, and the queries already running get up to
+/// `drain_timeout` to finish before this returns. A second signal stops it at
+/// once. Ballista's scheduler keeps every query in memory, so whatever is
+/// still running when this returns fails.
+pub async fn run_scheduler_with_shutdown(
+    config: SchedulerConfig,
+    mut signal: ShutdownSignal,
+    drain_timeout: Duration,
+) -> Result<Stopped, EngineError> {
+    let Scheduler {
+        mut serve,
+        jobs,
+        draining,
+    } = Scheduler::new(config)?;
+    let first = tokio::select! {
+        served = &mut serve => return served.map(|()| Stopped::Drained).map_err(ballista_error),
+        first = signal.recv() => first,
+    };
+    draining.store(true, Ordering::SeqCst);
+    tracing::info!(
+        signal = first,
+        running = unfinished_jobs(jobs.as_ref()).await,
+        drain_timeout_s = drain_timeout.as_secs_f64(),
+        "shutting down: refusing new queries and waiting for the running ones"
+    );
+    // The server keeps serving while the queries drain: their clients still
+    // poll it for their status.
+    tokio::select! {
+        served = &mut serve => served.map(|()| Stopped::Drained).map_err(ballista_error),
+        unfinished = drain(jobs.as_ref(), drain_timeout) => Ok(if unfinished == 0 {
+            tracing::info!("every running query finished; scheduler stopped");
+            Stopped::Drained
+        } else {
+            tracing::warn!(
+                unfinished,
+                drain_timeout_s = drain_timeout.as_secs_f64(),
+                "the drain timeout passed with queries still running; they fail as this \
+                 scheduler stops"
+            );
+            Stopped::Abandoned
+        }),
+        second = signal.recv() => {
+            tracing::warn!(
+                signal = second,
+                unfinished = unfinished_jobs(jobs.as_ref()).await,
+                "a second signal: stopping now, and the queries still running fail"
+            );
+            Ok(Stopped::Abandoned)
+        }
+    }
 }
 
 /// What `BallistaCluster::new_from_config` builds, in-memory cluster and job
-/// state, with the cluster state admitting only workers of this build and
-/// the session builder failing a query that no admitted worker can run.
-fn same_build_cluster(config: &SchedulerConfig) -> BallistaCluster {
+/// state, with the cluster state admitting only workers of this build, the
+/// session builder failing a query that no admitted worker can run, and,
+/// once `draining` is set, every new query (#31).
+fn same_build_cluster(config: &SchedulerConfig, draining: Arc<AtomicBool>) -> BallistaCluster {
     let state = Arc::new(SameBuildClusterState::default());
     let session_builder = config
         .override_session_builder
@@ -297,9 +398,9 @@ fn same_build_cluster(config: &SchedulerConfig) -> BallistaCluster {
         .unwrap_or_else(|| Arc::new(default_config_producer));
     let jobs = InMemoryJobState::new(
         config.scheduler_id.clone(),
-        share_file_statistics_cache(failing_without_a_usable_worker(
-            session_builder,
-            Arc::clone(&state),
+        share_file_statistics_cache(refusing_while_draining(
+            failing_without_a_usable_worker(session_builder, Arc::clone(&state)),
+            draining,
         )),
         config_producer,
     );
@@ -356,6 +457,51 @@ pub async fn run_executor(config: ExecutorProcessConfig) -> Result<(), EngineErr
                 ballista_error(err)
             }
         })
+}
+
+/// Runs an executor like [`run_executor`], and once `signal` comes, gives it
+/// at most `drain_timeout` to stop (#31).
+///
+/// Ballista's executor sees the same signal and stops gracefully on its own:
+/// it takes no new tasks, tells the scheduler, which re-runs the tasks it was
+/// running elsewhere, and waits for those tasks to finish. That wait has no
+/// bound, so a task that does not finish would keep the worker alive until it
+/// is killed. When the bound passes, or a second signal comes, this returns
+/// [`Stopped::Abandoned`] and the caller should exit without waiting for the
+/// tasks still running.
+pub async fn run_executor_with_shutdown(
+    config: ExecutorProcessConfig,
+    mut signal: ShutdownSignal,
+    drain_timeout: Duration,
+) -> Result<Stopped, EngineError> {
+    let executor = run_executor(config);
+    tokio::pin!(executor);
+    let first = tokio::select! {
+        stopped = &mut executor => return stopped.map(|()| Stopped::Drained),
+        first = signal.recv() => first,
+    };
+    tracing::info!(
+        signal = first,
+        drain_timeout_s = drain_timeout.as_secs_f64(),
+        "stopping: taking no new tasks, and waiting for the running ones, which the scheduler \
+         re-runs elsewhere"
+    );
+    tokio::select! {
+        drained = tokio::time::timeout(drain_timeout, &mut executor) => match drained {
+            Ok(stopped) => stopped.map(|()| Stopped::Drained),
+            Err(_) => {
+                tracing::warn!(
+                    drain_timeout_s = drain_timeout.as_secs_f64(),
+                    "the drain timeout passed with tasks still running: stopping without them"
+                );
+                Ok(Stopped::Abandoned)
+            }
+        },
+        second = signal.recv() => {
+            tracing::warn!(signal = second, "a second signal: stopping without the running tasks");
+            Ok(Stopped::Abandoned)
+        }
+    }
 }
 
 /// Starts an in-process scheduler plus `executors` executors on ephemeral
