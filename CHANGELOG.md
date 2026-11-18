@@ -636,6 +636,20 @@ versions (0.x) may contain breaking changes; they are always listed under a
   current releases no longer pull the unmaintained `pin-utils`
   (RUSTSEC-2026-0441).
 
+- **A cluster process refuses to listen beyond a private network**
+  (#30). The scheduler's and workers' ports have no authentication or
+  encryption, and `oxide-scheduler --bind-host 0.0.0.0` started without a
+  word. Now `oxide-scheduler` and `oxide-worker` exit 1 when `--bind-host`
+  or `--metrics-host` is a public address or every address (`0.0.0.0`,
+  `::`), naming the risk and the way out: bind a loopback or private address
+  (10/8, 172.16/12, 192.168/16, fc00::/7), or pass `--allow-insecure-bind`
+  when a firewall or an authenticating proxy already decides who connects.
+  Either logs a warning whenever it listens beyond loopback. `oxide-worker
+  --bind-host` is new: the worker listened on `127.0.0.1` only, so a
+  scheduler on another machine could not reach it. TLS and authentication
+  are not built yet; README and SECURITY.md say what a production
+  deployment must put in front of the ports.
+
 - **Three "unmaintained" notices are accepted, with their reasons**:
   `chrono` (RUSTSEC-2026-0543) and `chrono-tz` (RUSTSEC-2026-0555), which
   are arrow 59's date/time and timezone support under every DataFusion and

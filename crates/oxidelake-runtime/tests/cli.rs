@@ -1465,3 +1465,71 @@ fn a_silent_worker_stops_counting_after_the_worker_timeout() {
         cluster.logs()
     );
 }
+
+// --- where cluster processes may listen (#30) -------------------------------
+
+/// A scheduler or worker asked to listen on a public address, or on every
+/// address, without `--allow-insecure-bind` refuses before it listens, and
+/// says what to do (#30). The ports are unauthenticated, so this is the
+/// whole of the security boundary until OxideLake has TLS and auth.
+///
+/// Port 1 keeps a regression from exposing anything while this runs: an
+/// unprivileged process cannot bind it, so a scheduler that skipped the
+/// check would fail on the bind, with another message, instead of
+/// listening on every interface.
+#[test]
+fn a_public_or_wildcard_listener_is_refused_without_the_flag() {
+    let refusals = [
+        (
+            "oxide-scheduler",
+            &["--bind-host", "0.0.0.0", "--port", "1"][..],
+        ),
+        ("oxide-scheduler", &["--bind-host", "::", "--port", "1"][..]),
+        (
+            "oxide-scheduler",
+            &["--bind-host", "203.0.113.7", "--port", "1"][..],
+        ),
+        (
+            "oxide-scheduler",
+            &[
+                "--port",
+                "1",
+                "--metrics-port",
+                "1",
+                "--metrics-host",
+                "0.0.0.0",
+            ][..],
+        ),
+        (
+            "oxide-worker",
+            &["--bind-host", "0.0.0.0", "--port", "1", "--grpc-port", "1"][..],
+        ),
+        (
+            "oxide-worker",
+            &["--metrics-port", "1", "--metrics-host", "203.0.113.7"][..],
+        ),
+    ];
+    for (bin, args) in refusals {
+        let assert = Command::cargo_bin(bin)
+            .unwrap()
+            .args(args)
+            .timeout(Duration::from_secs(30))
+            .assert()
+            .failure();
+        let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+        assert!(
+            stderr.contains("--allow-insecure-bind") && stderr.contains("no authentication"),
+            "{bin} {args:?}: {stderr}"
+        );
+    }
+    for bin in ["oxide-scheduler", "oxide-worker"] {
+        let assert = Command::cargo_bin(bin)
+            .unwrap()
+            .arg("--help")
+            .assert()
+            .success();
+        let help = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+        assert!(help.contains("--allow-insecure-bind"), "{bin}\n{help}");
+        assert!(help.contains("--bind-host"), "{bin}\n{help}");
+    }
+}

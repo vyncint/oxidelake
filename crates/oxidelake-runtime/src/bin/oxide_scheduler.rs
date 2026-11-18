@@ -6,6 +6,7 @@ use ballista_scheduler::config::SchedulerConfig;
 use clap::Parser;
 use oxidelake_core::BackendKind;
 use oxidelake_runtime::cluster;
+use oxidelake_runtime::exposure::{check_listen_address, warn_unless_loopback};
 use oxidelake_runtime::shutdown::ShutdownSignal;
 use tracing_subscriber::EnvFilter;
 
@@ -16,7 +17,10 @@ use tracing_subscriber::EnvFilter;
     about = "OxideLake scheduler (Apache DataFusion Ballista)"
 )]
 struct Cli {
-    /// Address to bind.
+    /// Address to bind: loopback or private (10/8, 172.16/12, 192.168/16,
+    /// fc00::/7). The port has no authentication or encryption, so a public
+    /// address, or every address (0.0.0.0, ::), needs
+    /// `--allow-insecure-bind`.
     #[arg(long, default_value = "127.0.0.1")]
     bind_host: String,
     /// gRPC port.
@@ -31,9 +35,15 @@ struct Cli {
     /// interface, as the Ballista ports already are.
     #[arg(long, value_name = "PORT")]
     metrics_port: Option<u16>,
-    /// Address the metrics endpoint binds to.
+    /// Address the metrics endpoint binds to, held to the same rule as
+    /// `--bind-host`.
     #[arg(long, default_value = "127.0.0.1", value_name = "HOST")]
     metrics_host: String,
+    /// Listen on a public address, or on every address, although the ports
+    /// have no authentication or encryption: say so only when a firewall or
+    /// an authenticating proxy already decides who can connect (SECURITY.md).
+    #[arg(long)]
+    allow_insecure_bind: bool,
     /// Times one task may fail before its query fails; 1 means no retry
     /// (Ballista's `task_max_failures`). A task lost with its worker is run
     /// again elsewhere without counting.
@@ -97,6 +107,13 @@ async fn main() -> anyhow::Result<()> {
     // Before anything is served, so a stop request during startup is held
     // for the shutdown below rather than killing the process.
     let signal = ShutdownSignal::listen()?;
+    // Before anything listens: the ports are unauthenticated, so where they
+    // listen is the whole of the security boundary (#30).
+    let exposure = check_listen_address("--bind-host", &cli.bind_host, cli.allow_insecure_bind)?;
+    if cli.metrics_port.is_some() {
+        check_listen_address("--metrics-host", &cli.metrics_host, cli.allow_insecure_bind)?;
+    }
+    warn_unless_loopback("the scheduler", &cli.bind_host, exposure);
     let target: BackendKind = match &cli.cluster_backend {
         Some(name) => name.parse()?,
         None => oxidelake_planner::cluster_target_from_env()?,

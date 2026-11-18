@@ -133,6 +133,8 @@ A scheduler admits only workers of its own build: the same OxideLake release, bu
 
 `SIGTERM` or `SIGINT` stops either binary gracefully, and a second signal stops it at once. A scheduler refuses new queries, saying it is shutting down, gives the running ones up to `--drain-timeout` to finish, and exits 0. A worker takes no new tasks, its scheduler runs the tasks it had elsewhere, and it exits 0 once they finish or `--drain-timeout` passes; keep that under your supervisor's own limit (Kubernetes sends `SIGKILL` 30 s after `SIGTERM` by default). A worker that dies without a word is presumed lost once the scheduler's `--worker-timeout` passes with no heartbeat from it (the worker's `--heartbeat-interval`, which must be well under the timeout). Until then a query holding tasks on it waits, unless a shuffle fetch from it fails first: Ballista retries a fetch three times, three seconds apart, then runs the stage again, up to `--stage-max-failures` times. The scheduler's port serves Ballista's `/healthz` (always `ok`) and `/readyz` (`ready: N executors registered`, or 503 before the first); a worker serves nothing over HTTP except `--metrics-port`.
 
+**Production deployments.** The cluster's ports (the scheduler's one port for gRPC, REST and probes, each worker's Flight and gRPC ports, and any `--metrics-port`) have no authentication and no encryption: whoever can connect can run queries, and a query can read any file a worker can read. Keep them on a network that only the cluster's own hosts and trusted clients can reach, such as a private subnet or a VPN, behind a firewall. `oxide-scheduler` and `oxide-worker` refuse to listen on a public address, or on every address (`0.0.0.0`, `::`), unless `--allow-insecure-bind` says that something else, such as that firewall, already decides who can connect, and they log a warning whenever they listen beyond loopback. TLS and authentication in OxideLake itself are tracked in #30.
+
 **Ballista 55 does not recover a query from a lost worker reliably** (#31). With a worker killed, or stopped with `SIGTERM`, in the middle of a join, most of our runs either returned some groups twice, with exit 0, or never finished until a new worker joined, because the rollback loses track of the surviving workers' task slots. Until that is fixed upstream, run `oxide-scheduler --stage-max-failures 1`, which turns the common case, a failed fetch from the lost worker, into an error naming it; stop and restart workers between queries, not during them; and treat a query that ran while a worker was lost as suspect.
 
 ### DataFrame API
@@ -200,7 +202,8 @@ error, never a silent fallback.
 
 | Knob | Default | What it does |
 | --- | --- | --- |
-| `--bind-host` | `127.0.0.1` | Address to bind. |
+| `--bind-host` | `127.0.0.1` | Address to bind: loopback or private (10/8, 172.16/12, 192.168/16, fc00::/7). A public address or every address (`0.0.0.0`, `::`) is refused without `--allow-insecure-bind`, because the port is unauthenticated. |
+| `--allow-insecure-bind` | off | Accepts a public or wildcard `--bind-host`/`--metrics-host`. Only when a firewall or an authenticating proxy already decides who can connect ([Production deployments](#cluster-mode)). |
 | `--port` | `50050` | gRPC port. |
 | `--cluster-backend` | `$OXIDE_CLUSTER_BACKEND`, then `cpu` | The capability the cluster declares, which is what placement rewrites against. |
 | `--metrics-port` / `--metrics-host` | off / `127.0.0.1` | As for the worker. A scheduler plans but does not execute, so its counters are empty; the endpoint exists so every process is scraped the same way. |
@@ -214,11 +217,13 @@ error, never a silent fallback.
 | Knob | Default | What it does |
 | --- | --- | --- |
 | `--scheduler-host` / `--scheduler-port` | `localhost` / `50050` | The scheduler to join. |
+| `--bind-host` | `127.0.0.1` | Address the Flight and gRPC ports bind, under the scheduler's rule: loopback or private, anything else only with `--allow-insecure-bind`. The scheduler connects back to the address it sees the worker connect from, so bind the interface that faces it. |
+| `--allow-insecure-bind` | off | As for the scheduler. |
 | `--port` | `50051` | Arrow Flight port for shuffle data. |
 | `--grpc-port` | `50052` | gRPC control port. |
 | `--concurrent-tasks` | available parallelism | Tasks run at once. |
 | `--work-dir` | a temporary directory | Where shuffle files go. |
-| `--metrics-port` / `--metrics-host` | off / `127.0.0.1` | Serve Prometheus metrics at `/metrics` (needs `--features metrics`). Unauthenticated: bind it on a private interface. Without the feature the flag is refused, never ignored. |
+| `--metrics-port` / `--metrics-host` | off / `127.0.0.1` | Serve Prometheus metrics at `/metrics` (needs `--features metrics`). Unauthenticated, so `--metrics-host` follows the `--bind-host` rule. Without the feature the flag is refused, never ignored. |
 | `--backend` | `$OXIDE_BACKEND`, then detected | The backend this worker executes on. Selected before the first task, so it reaches the operators; a backend the machine cannot provide is a startup error. |
 | `--heartbeat-interval` | `60` | Seconds between heartbeats to the scheduler; keep it well under the scheduler's `--worker-timeout`. |
 | `--drain-timeout` | `20` | On `SIGTERM`/`SIGINT`, no new tasks are taken (the scheduler runs this worker's tasks elsewhere) and the running ones get this many seconds to finish; then the worker exits 0. |

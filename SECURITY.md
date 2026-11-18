@@ -90,12 +90,16 @@ OxideLake is an analytical engine intended to run **on infrastructure you
 control**. Its security boundary is the machine or private network it runs on,
 not the query interface.
 
-- **Cluster mode has no authentication or transport encryption in v1.**
-  `oxide-scheduler` and `oxide-worker` speak plain gRPC and Arrow Flight and
-  will execute any plan a connected client submits, including reading any file
-  the worker process can read. Both bind to `127.0.0.1` by default; expose them
-  only on a trusted private network (or behind a mutually authenticated
-  proxy). TLS/auth is tracked as out of scope for v1 in `STATUS.md`.
+- **Cluster mode has no authentication or transport encryption yet, so the
+  network is the boundary, and the binaries hold it.** `oxide-scheduler` and
+  `oxide-worker` speak plain gRPC and Arrow Flight and will execute any plan
+  a connected client submits, including reading any file the worker process
+  can read. Both bind to `127.0.0.1` by default, accept a private address,
+  and refuse a public one, or every address at once, unless
+  `--allow-insecure-bind` is given (#30).
+
+  **Production deployments.** The cluster's ports (the scheduler's one port for gRPC, REST and probes, each worker's Flight and gRPC ports, and any `--metrics-port`) have no authentication and no encryption: whoever can connect can run queries, and a query can read any file a worker can read. Keep them on a network that only the cluster's own hosts and trusted clients can reach, such as a private subnet or a VPN, behind a firewall. `oxide-scheduler` and `oxide-worker` refuse to listen on a public address, or on every address (`0.0.0.0`, `::`), unless `--allow-insecure-bind` says that something else, such as that firewall, already decides who can connect, and they log a warning whenever they listen beyond loopback. TLS and authentication in OxideLake itself are tracked in #30.
+
 - **Workers trust their scheduler.** Physical plans arrive over the network and
   are decoded by `OxidePhysicalCodec`. Payloads are validated (magic, version,
   column indices, types, dimensions, a cap on predicate size) so a malformed
