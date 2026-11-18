@@ -1213,3 +1213,212 @@ mod vector_null_elements {
         assert_device_path_witnessed(&backend);
     }
 }
+
+/// IEEE special values in Float64 filters (#28).
+///
+/// DataFusion 55 compares floats in IEEE totalOrder (`f64::total_cmp`: -NaN <
+/// -inf < … < -0.0 < +0.0 < … < +inf < +NaN) after reading -0.0 as +0.0 on
+/// both sides. The CUDA filter kernel compared with plain IEEE `>`/`==`, so
+/// `NaN > 4.0` was false there; the CPU reference called Arrow's totalOrder
+/// kernels as they are, so `-0.0 = 0.0` was false there. `gen_left`'s `v`
+/// holds none of these values, so the suite above could see neither. They
+/// stay out of it: its `v` also feeds the aggregate check, and MIN/MAX over
+/// NaN and signed zeros is #101's.
+mod special_floats {
+    use std::cmp::Ordering;
+
+    use arrow::array::{AsArray, BooleanArray};
+    use arrow::compute::filter_record_batch;
+    use arrow::datatypes::{Float64Type, Int64Type};
+
+    use super::vector_null_elements::filter_once;
+    use super::*;
+
+    /// Every value where float comparison is subtle, ordinary ones between
+    /// them, and the two subnormals nearest zero.
+    const VALUES: [f64; 12] = [
+        f64::NAN,
+        -f64::NAN,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        0.0,
+        -0.0,
+        -1.5,
+        2.0,
+        4.0,
+        4.5,
+        5e-324,
+        -5e-324,
+    ];
+
+    /// `k Int64?`, `v Float64?` drawn from [`VALUES`] (one row in ten NULL),
+    /// `s Utf8` naming the row, so rows that render alike stay apart.
+    fn gen_special_floats(seed: u64, rows: usize) -> RecordBatch {
+        let mut rng = StdRng::seed_from_u64(seed ^ 0x5bec_1a1f);
+        let k: Vec<Option<i64>> = (0..rows)
+            .map(|_| (!rng.random_bool(0.1)).then(|| rng.random_range(0..10i64)))
+            .collect();
+        let v: Vec<Option<f64>> = (0..rows)
+            .map(|_| (!rng.random_bool(0.1)).then(|| VALUES[rng.random_range(0..VALUES.len())]))
+            .collect();
+        let s: Vec<String> = (0..rows).map(|i| format!("r{i}")).collect();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("v", DataType::Float64, true),
+            Field::new("s", DataType::Utf8, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(k)),
+                Arc::new(Float64Array::from(v)),
+                Arc::new(StringArray::from(s)),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// Each predicate in SQL and as the plan's `Predicate` (`k` is column 0,
+    /// `v` column 1). The literals include -0.0, NaN and both infinities.
+    fn predicates() -> Vec<(&'static str, Predicate)> {
+        let v = |op, x| Predicate::compare(1, op, Literal::Float64(x));
+        vec![
+            ("v > 4.0", v(Comparison::Gt, 4.0)),
+            ("v >= 4.5", v(Comparison::GtEq, 4.5)),
+            ("v < 0.0", v(Comparison::Lt, 0.0)),
+            ("v > -0.0", v(Comparison::Gt, -0.0)),
+            ("v <= -0.0", v(Comparison::LtEq, -0.0)),
+            ("v = 0.0", v(Comparison::Eq, 0.0)),
+            ("v = -0.0", v(Comparison::Eq, -0.0)),
+            ("v >= 'NaN'::double", v(Comparison::GtEq, f64::NAN)),
+            ("v = 'NaN'::double", v(Comparison::Eq, f64::NAN)),
+            ("v > 'inf'::double", v(Comparison::Gt, f64::INFINITY)),
+            ("v < '-inf'::double", v(Comparison::Lt, f64::NEG_INFINITY)),
+            (
+                "k >= 2 AND v > 4.0",
+                Predicate::and(
+                    Predicate::compare(0, Comparison::GtEq, Literal::Int64(2)),
+                    v(Comparison::Gt, 4.0),
+                ),
+            ),
+        ]
+    }
+
+    /// Whether `predicate` selects `row` in DataFusion 55's float order,
+    /// written out from `f64::total_cmp` rather than through Arrow or
+    /// DataFusion. The 55 bump moved that order once, for -0.0, without a
+    /// test noticing; if it moves again, this says so before the comparison
+    /// with the operator does.
+    fn selects(batch: &RecordBatch, predicate: &Predicate, row: usize) -> bool {
+        match predicate {
+            Predicate::Compare {
+                column,
+                op,
+                literal,
+            } => {
+                let col = batch.column(*column);
+                if col.is_null(row) {
+                    return false;
+                }
+                // `== 0.0` holds for both zeros and for nothing else.
+                let zeros_as_one = |x: f64| if x == 0.0 { 0.0 } else { x };
+                let ord: Ordering = match literal {
+                    Literal::Int64(x) => col.as_primitive::<Int64Type>().value(row).cmp(x),
+                    Literal::Float64(x) => {
+                        let value = col.as_primitive::<Float64Type>().value(row);
+                        zeros_as_one(value).total_cmp(&zeros_as_one(*x))
+                    }
+                };
+                match op {
+                    Comparison::Eq => ord.is_eq(),
+                    Comparison::Lt => ord.is_lt(),
+                    Comparison::LtEq => ord.is_le(),
+                    Comparison::Gt => ord.is_gt(),
+                    Comparison::GtEq => ord.is_ge(),
+                }
+            }
+            Predicate::And(l, r) => selects(batch, l, row) && selects(batch, r, row),
+        }
+    }
+
+    /// `SELECT s, k, v … WHERE predicate` by [`selects`].
+    fn rows_by_hand(batch: &RecordBatch, predicate: &Predicate) -> Vec<String> {
+        let keep: BooleanArray = (0..batch.num_rows())
+            .map(|row| Some(selects(batch, predicate, row)))
+            .collect();
+        let projected = batch.project(&[2, 0, 1]).unwrap();
+        sorted_rows(&[filter_record_batch(&projected, &keep).unwrap()])
+    }
+
+    async fn check_filter(backend: Arc<dyn GpuBackend>, seed: u64, rows: usize) {
+        let ctx = SessionContext::new();
+        let batch = gen_special_floats(seed, rows);
+        ctx.register_batch("t", batch.clone()).unwrap();
+        for (sql, predicate) in predicates() {
+            let expected = sql_rows(&ctx, &format!("SELECT s, k, v FROM t WHERE {sql}")).await;
+            assert_eq!(
+                expected,
+                rows_by_hand(&batch, &predicate),
+                "DataFusion's float order moved for `{sql}` (seed={seed} rows={rows}): \
+                 the CPU reference and filter_project.cu must follow it"
+            );
+            let exec = GpuFilterExec::try_new(
+                physical_plan(&ctx, batch.clone()).await,
+                predicate,
+                vec![2, 0, 1],
+                backend.kind(),
+            )
+            .unwrap()
+            .with_backend(Arc::clone(&backend));
+            let actual = exec_rows(&ctx, Arc::new(exec)).await;
+            assert_eq!(actual, expected, "`{sql}` seed={seed} rows={rows}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cpu_backend_filters_special_floats_like_datafusion() {
+        // A fixture that lost a value would make the check prove nothing.
+        let sample = gen_special_floats(1, 1000);
+        let v = sample.column(1).as_primitive::<Float64Type>();
+        for value in VALUES {
+            assert!(
+                v.iter().flatten().any(|x| x.to_bits() == value.to_bits()),
+                "no {value:?} in the fixture"
+            );
+        }
+        for &seed in &SEEDS {
+            for &rows in &SIZES {
+                check_filter(cpu(), seed, rows).await;
+            }
+        }
+    }
+
+    /// The same on a real device; on CUDA the comparisons must also have run
+    /// there (Metal has no `double` and declines Float64 predicates, so it
+    /// only has to agree). Run on a GPU box with
+    /// `OXIDE_BACKEND=cuda cargo test -p oxidelake-compute --features cuda -- --ignored`.
+    #[tokio::test]
+    #[ignore = "requires a GPU backend (CUDA or Metal) on this machine"]
+    async fn gpu_backend_filters_special_floats_like_datafusion_when_available() {
+        let backend = HardwareDetector::select().unwrap();
+        assert!(
+            backend.kind().is_gpu(),
+            "no GPU backend detected: {:?}",
+            backend.kind()
+        );
+        for &seed in &SEEDS {
+            for &rows in &SIZES {
+                check_filter(Arc::clone(&backend), seed, rows).await;
+            }
+        }
+        let batch = gen_special_floats(3, 1000);
+        for (sql, predicate) in predicates() {
+            let (fallbacks, h2d) =
+                filter_once(Arc::clone(&backend), &batch, &predicate, &[2, 0, 1]);
+            if backend.supports_predicate(&predicate) {
+                assert_eq!(fallbacks, 0, "`{sql}` ran on the CPU reference");
+                assert!(h2d > 0, "`{sql}` uploaded nothing");
+            }
+        }
+    }
+}

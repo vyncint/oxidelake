@@ -6,7 +6,8 @@
 // accesses; grid sizes are computed on the host.
 //
 // Pipeline (host orchestrated, all launches on one stream):
-//   1. oxide_compare_{i64,f64}  : one byte mask per comparison leaf
+//   1. oxide_compare_{i64,f64}  : one byte mask per comparison leaf (f64 in
+//                                 DataFusion's order, as the CPU reference)
 //   2. oxide_mask_and           : conjunction of leaf masks
 //   3. oxide_block_count        : selected rows per 256-thread block
 //   4. (host) exclusive scan of block counts -> block offsets, total
@@ -43,6 +44,21 @@ extern "C" __global__ void oxide_compare_i64(const long long* __restrict__ value
     mask[i] = (unsigned char)r;
 }
 
+// The order DataFusion's own filter compares doubles in, as a signed integer
+// key (#28): IEEE 754 totalOrder, -NaN < -inf < ... < -0.0 < +0.0 < ... <
+// +inf < +NaN, except that -0.0 is +0.0 — DataFusion 55 rewrites -0.0 to
+// +0.0 on both sides before Arrow's totalOrder kernels compare them. The CPU
+// reference does the same. Plain `>`/`==` on doubles does not: there
+// `NaN > 4.0` is false, where DataFusion has it true. Flipping the 63
+// magnitude bits of a negative value makes a signed comparison of the bit
+// patterns follow totalOrder (the transform `f64::total_cmp` applies), so
+// equal keys mean equal bits, -0.0 aside.
+extern "C" __device__ __forceinline__ long long oxide_f64_order_key(double v) {
+    long long bits = __double_as_longlong(v);
+    if ((unsigned long long)bits == 0x8000000000000000ULL) return 0;  // -0.0
+    return bits < 0 ? (bits ^ 0x7fffffffffffffffLL) : bits;
+}
+
 extern "C" __global__ void oxide_compare_f64(const double* __restrict__ values,
                                              const unsigned char* __restrict__ validity,
                                              int op,
@@ -52,14 +68,15 @@ extern "C" __global__ void oxide_compare_f64(const double* __restrict__ values,
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     if (!oxide_is_valid(validity, i)) { mask[i] = 0; return; }
-    double v = values[i];
+    long long v = oxide_f64_order_key(values[i]);
+    long long key = oxide_f64_order_key(literal);
     int r;
     switch (op) {
-        case 0: r = v == literal; break;
-        case 1: r = v <  literal; break;
-        case 2: r = v <= literal; break;
-        case 3: r = v >  literal; break;
-        default: r = v >= literal; break;
+        case 0: r = v == key; break;
+        case 1: r = v <  key; break;
+        case 2: r = v <= key; break;
+        case 3: r = v >  key; break;
+        default: r = v >= key; break;
     }
     mask[i] = (unsigned char)r;
 }

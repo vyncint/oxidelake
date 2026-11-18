@@ -5,7 +5,7 @@ use std::io::{self, Write};
 use clap::{Parser, Subcommand};
 use oxidelake_core::BackendKind;
 use oxidelake_runtime::{OutputFormat, OxideSession, SessionOptions, dashboard};
-use oxidelake_storage::{Compression, demo_write_options, write_demo_table};
+use oxidelake_storage::{Compression, DemoOptions, demo_write_options, write_demo_table_with};
 use tracing_subscriber::EnvFilter;
 
 /// Writes `text` to stdout, treating a closed reader as success (#34).
@@ -58,6 +58,12 @@ enum Command {
         /// Compression codec: none, lz4 or zstd.
         #[arg(long, default_value = "zstd")]
         compression: Compression,
+        /// Put IEEE special values into `v` on every 16th row (NaN, -0.0,
+        /// +0.0, +inf, -inf and a negative NaN, in turn), to compare backends
+        /// where float comparison is subtle. Off by default; the default table
+        /// is unchanged.
+        #[arg(long)]
+        special_floats: bool,
     },
     /// Run a SQL statement and print the result.
     Sql {
@@ -175,14 +181,22 @@ async fn main() -> anyhow::Result<()> {
             seed,
             row_group_rows,
             compression,
+            special_floats,
         } => {
             let options = demo_write_options(row_group_rows, compression);
-            let table = write_demo_table(std::path::Path::new(&out), rows, seed, &options)?;
+            let demo = DemoOptions::new().with_special_floats(special_floats);
+            let table =
+                write_demo_table_with(std::path::Path::new(&out), rows, seed, demo, &options)?;
             write_out(&format!(
-                "wrote {} rows to {} (seed {seed}, {row_group_rows} rows per row group, {})\n",
+                "wrote {} rows to {} (seed {seed}, {row_group_rows} rows per row group, {}{})\n",
                 table.rows,
                 table.path.display(),
                 compression.as_str(),
+                if special_floats {
+                    ", special floats in v"
+                } else {
+                    ""
+                },
             ))?;
         }
         Command::Sql {

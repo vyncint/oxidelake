@@ -1003,3 +1003,77 @@ fn mixed_build_a_predict_worker_is_refused_by_a_default_scheduler() {
     assert!(stderr.contains("no worker it can use"), "{stderr}");
     assert!(started.elapsed() < Duration::from_secs(30));
 }
+
+/// `gen-data --special-floats` writes every IEEE special value into `v`, and
+/// a Float64 filter over them returns the same rows planned for the CPU
+/// (DataFusion's own `FilterExec`) as for CUDA (`GpuFilterExec`: the CPU
+/// reference on a machine without a GPU, the device kernel on one with).
+/// DataFusion 55 has `NaN > 24.5` true and `-0.0 = 0.0` true; before #28 the
+/// reference had the second false, and the kernel the first.
+#[test]
+fn special_floats_filter_alike_on_every_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let assert = oxide()
+        .args([
+            "gen-data",
+            "--rows",
+            "4096",
+            "--out",
+            dir.path().to_str().unwrap(),
+            "--special-floats",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(stdout.contains("special floats in v"), "{stdout}");
+
+    // Read back with the parquet crate alone: every special value is there.
+    let file = File::open(dir.path().join("t.parquet")).unwrap();
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut bits = std::collections::BTreeSet::new();
+    for batch in reader {
+        let batch = batch.unwrap();
+        let v = batch
+            .column(batch.schema().index_of("v").unwrap())
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        bits.extend(v.iter().flatten().map(f64::to_bits));
+    }
+    for special in [
+        f64::NAN,
+        -f64::NAN,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        -0.0,
+        0.0,
+    ] {
+        assert!(bits.contains(&special.to_bits()), "no {special:?} in v");
+    }
+
+    let table_arg = format!("t={}", dir.path().display());
+    for predicate in ["v > 24.5", "v < 0.0", "v = 0.0", "v <= -0.0"] {
+        let query = format!("SELECT id, v FROM t WHERE {predicate} ORDER BY id");
+        let explain = oxide()
+            .args(["explain", "-q", &query, "--table", &table_arg])
+            .args(["--target", "cuda"])
+            .assert()
+            .success();
+        let plan = String::from_utf8(explain.get_output().stdout.clone()).unwrap();
+        assert!(plan.contains("GpuFilterExec[cuda]"), "{predicate}: {plan}");
+        let rows = |target: &str| {
+            let assert = oxide()
+                .args(["sql", "-q", &query, "--table", &table_arg])
+                .args(["--target", target, "--output", "csv"])
+                .assert()
+                .success();
+            String::from_utf8(assert.get_output().stdout.clone()).unwrap()
+        };
+        let cpu = rows("cpu");
+        assert!(cpu.lines().count() > 1, "{predicate} selected nothing");
+        assert_eq!(rows("cuda"), cpu, "{predicate}");
+    }
+}

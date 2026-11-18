@@ -2,7 +2,8 @@
 //! `RecordBatch`es. These define the semantics the GPU kernels must match:
 //!
 //! * filter: a comparison against `NULL` is `NULL`, and `NULL` predicates drop
-//!   the row (SQL `WHERE` semantics);
+//!   the row (SQL `WHERE` semantics); `Float64` compares as DataFusion's own
+//!   filter does, in IEEE 754 totalOrder with `-0.0` read as `+0.0`;
 //! * join: `NULL` keys never match;
 //! * aggregate: `NULL` keys form their own group; `SUM/MIN/MAX` skip `NULL`s
 //!   and are `NULL` for groups with no values; `COUNT` counts non-`NULL`s;
@@ -23,7 +24,7 @@ use arrow::array::{
 };
 use arrow::compute::kernels::cmp;
 use arrow::compute::{TakeOptions, and_kleene, filter_record_batch, take};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, Float64Type, Schema};
 use oxidelake_core::EngineError;
 use oxidelake_core::params::{
     AggregateFunction, AggregateSpec, Comparison, DistanceMetric, Literal, Predicate,
@@ -56,7 +57,45 @@ fn int64_column<'a>(
     })
 }
 
+const NEGATIVE_ZERO_BITS: u64 = (-0.0f64).to_bits();
+
+/// `-0.0` as `+0.0`; every other value, NaNs included, as it is.
+fn positive_zero(v: f64) -> f64 {
+    if v.to_bits() == NEGATIVE_ZERO_BITS {
+        0.0
+    } else {
+        v
+    }
+}
+
+/// A `Float64` column with its `-0.0`s read as `+0.0`; any other column, or
+/// one holding no `-0.0`, as it is.
+///
+/// Arrow's `cmp` kernels order floats by IEEE 754 totalOrder, where
+/// `-0.0 < +0.0`. DataFusion 55 rewrites `-0.0` to `+0.0` on both sides before
+/// it calls them (`apply_cmp`), so its `FilterExec` has `-0.0 = 0.0` true and
+/// `-0.0 < 0.0` false, and a GPU-placed filter has to select the rows that
+/// filter selects (#28). Scanning first leaves the usual column uncopied, as
+/// DataFusion's own normalization does.
+fn negative_zeros_as_positive(col: &ArrayRef) -> ArrayRef {
+    match col.as_any().downcast_ref::<Float64Array>() {
+        Some(values)
+            if values
+                .values()
+                .iter()
+                .any(|v| v.to_bits() == NEGATIVE_ZERO_BITS) =>
+        {
+            Arc::new(values.unary::<_, Float64Type>(positive_zero))
+        }
+        _ => Arc::clone(col),
+    }
+}
+
 /// Evaluates a predicate to a boolean mask (nulls where any operand is null).
+///
+/// `Float64` compares as DataFusion does: IEEE 754 totalOrder (a NaN sorts
+/// above `+inf`, or below `-inf` when its sign bit is set, and two NaNs are
+/// equal only bit for bit), with `-0.0` read as `+0.0`.
 pub fn evaluate_predicate(
     batch: &RecordBatch,
     predicate: &Predicate,
@@ -80,9 +119,10 @@ pub fn evaluate_predicate(
             }
             let scalar: ArrayRef = match literal {
                 Literal::Int64(v) => Arc::new(Int64Array::from(vec![*v])),
-                Literal::Float64(v) => Arc::new(Float64Array::from(vec![*v])),
+                Literal::Float64(v) => Arc::new(Float64Array::from(vec![positive_zero(*v)])),
             };
             let scalar = Scalar::new(scalar);
+            let col = &negative_zeros_as_positive(col);
             let mask = match op {
                 Comparison::Eq => cmp::eq(col, &scalar),
                 Comparison::Lt => cmp::lt(col, &scalar),
@@ -848,6 +888,39 @@ mod tests {
         assert_eq!(out.schema().field(0).name(), "s");
         let ks = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(ks.values(), &[2, 5]);
+    }
+
+    /// The order DataFusion 55's own filter compares floats in (#28).
+    #[test]
+    fn float_comparisons_order_as_datafusion_does() {
+        let values = [
+            f64::NAN,
+            -f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            0.0,
+            -0.0,
+            4.0,
+        ];
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("v", DataType::Float64, false)])),
+            vec![Arc::new(Float64Array::from(values.to_vec()))],
+        )
+        .unwrap();
+        let selected = |op, x| -> Vec<usize> {
+            let predicate = Predicate::compare(0, op, Literal::Float64(x));
+            let mask = evaluate_predicate(&batch, &predicate).unwrap();
+            (0..mask.len()).filter(|&row| mask.value(row)).collect()
+        };
+        // A NaN is above +inf, and below -inf when its sign bit is set.
+        assert_eq!(selected(Comparison::Gt, 4.0), [0, 2]);
+        assert_eq!(selected(Comparison::Lt, f64::NEG_INFINITY), [1]);
+        assert_eq!(selected(Comparison::Eq, f64::NAN), [0]);
+        // -0.0 and +0.0 are one value, in the column and in the literal.
+        assert_eq!(selected(Comparison::Eq, 0.0), [4, 5]);
+        assert_eq!(selected(Comparison::Eq, -0.0), [4, 5]);
+        assert_eq!(selected(Comparison::Lt, 0.0), [1, 3]);
+        assert_eq!(selected(Comparison::GtEq, -0.0), [0, 2, 4, 5, 6]);
     }
 
     #[test]

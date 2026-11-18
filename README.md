@@ -191,6 +191,7 @@ error, never a silent fallback.
 | `--seed` | `gen-data` | `42` | PRNG seed. The same seed always writes the same bytes. |
 | `--row-group-rows` | `gen-data` | `65536` | Rows per Parquet row group. |
 | `--compression` | `gen-data` | `zstd` | `none`, `lz4` or `zstd`. |
+| `--special-floats` | `gen-data` | off | Puts IEEE special values into `v` on every 16th row — NaN, -0.0, +0.0, +inf, -inf and a negative NaN, in turn — to compare backends where float comparison is subtle. Every other value, and the default table, stay the same. |
 
 ### `oxide-scheduler`
 
