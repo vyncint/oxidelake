@@ -111,7 +111,7 @@ DataFusion `ExecutionPlan` implementations: `GpuFilterExec` (fused filter + proj
 
 - filter + project: predicates `=, <, <=, >, >=` combined with `AND` over `Int64`/`Float64` columns against literals; projection = column selection; output is stream-compacted (block-scan prefix sums).
 - hash join: inner join on a single `Int64` key; an open-addressing linear-probing table in device memory with one slot per distinct key, holding that key's run in a row-index array — built once per operator on the host from the CPU reference's index and uploaded, then probed in parallel; a probe batch's matches stay on the device and its output is gathered in pieces of at most the session's batch size.
-- aggregate: `SUM/COUNT/MIN/MAX` over `Int64`/`Float64` grouped by one `Int64` key of low cardinality (atomic/radix reduction).
+- aggregate: `SUM/COUNT/MIN/MAX` over `Int64`/`Float64` grouped by one `Int64` key of low cardinality, one batch at a time with the groups merged on the host; on the device, an open-addressing index of the batch's keys, its groups numbered densely, and atomic reductions into one entry per group, so only the groups are read back.
 - vector distance: L2 and cosine between a query vector and a `FixedSizeList<Float32>` column (shared memory + warp shuffles on CUDA; threadgroup memory + simdgroup reductions on Metal).
 
 CUDA sources: `filter_project.cu`, `hash_join.cu`, `aggregation.cu`, `vector_distance.cu`. Metal sources: `filter_project.metal`, `vector_distance.metal` (joins and aggregates stay on CPU under Metal in v1 — say so in the docs). Kernels are plain `extern "C"` entry points with explicit grid-size math and bounds checks on every global access.

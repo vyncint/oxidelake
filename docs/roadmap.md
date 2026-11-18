@@ -176,8 +176,10 @@ read it as "a running deployment can now tell whether its GPU is being used".
 - [ ] CUDA join table persists across probe batches (#45) — *Acceptance:*
       the build side is uploaded once per join, not once per batch. The
       join half is in 0.3.0 (`GpuBackend::prepare_join_build`, compiled and
-      not yet run on a GPU); the aggregate half, sizing the group table by
-      distinct keys, is open.
+      not yet run on a GPU), and so is the aggregate half: a batch's groups
+      are numbered on the device, so its accumulators and what is read back
+      hold one entry per group rather than two per row (compiled, and checked
+      on the CPU under a shim of the CUDA builtins; not yet run on a GPU).
 - [x] io_uring store wired into sessions, or the claim stays demoted (#24,
       audit P12) — *the claim stays demoted*: no session constructs it, and
       every document says so. **0.1.4**

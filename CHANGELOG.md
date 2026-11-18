@@ -219,6 +219,20 @@ versions (0.x) may contain breaking changes; they are always listed under a
   `CoalescePartitionsExec` over the partial half; the final half merges
   partial results, so a `COUNT` reads there as `SUM(count(t.v)[count])`.
 
+- **The CUDA aggregate reads back its groups, not its group table** (the
+  aggregate half of #45). Every call allocated accumulators of two slots
+  per input row and copied all of them back with the table's keys and
+  states, so a batch's device-to-host traffic followed its rows whatever
+  the number of groups: 16.3 MB for a 65 536-row batch with 101 groups
+  and eight aggregates (the 0.2.0 kernel and host flow, run on the CPU
+  under a shim of the CUDA builtins). A second launch now numbers the
+  groups densely on the device, the accumulators hold one entry per group,
+  and only the groups are read back: 12 KB for the same batch. The index
+  of keys stays two slots per row, on the device, and since #29 a call is
+  one batch. Results are unchanged. Compiled, not yet run on a GPU:
+  STATUS.md has the T4 commands, and `tests/aggregate_timing.rs` times a
+  10-million-row `GROUP BY` before and after.
+
 ### Fixed
 
 - **`SUM(Int64)` wraps on overflow under a GPU target, as it does in stock

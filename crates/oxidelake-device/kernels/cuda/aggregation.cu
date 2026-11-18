@@ -1,11 +1,14 @@
 // OxideLake CUDA kernels: SUM/COUNT/MIN/MAX grouped by one Int64 key (docs/SPEC.md §2.3).
 //
 // Groups live in an open-addressing table (power-of-two capacity, atomicCAS
-// claim, state 0 empty / 1 claimed / 2 published). Aggregates are atomic
-// reductions into per-slot accumulators; the NULL key is its own group held
-// in dedicated accumulators (index 0 of the *_null arrays). The host reads the
-// table back, compacts occupied slots and sorts by key (NULL group last), so
-// the output matches the CPU reference exactly.
+// claim, state 0 empty / 1 claimed / 2 published) that never leaves the
+// device. Once every key is in, a second launch numbers the published slots
+// densely, 0..G-1 for G distinct keys, so the aggregates reduce atomically
+// into accumulators of G entries and the host reads back G keys and G values
+// per aggregate rather than the table, whose size follows the batch's rows
+// (#45). The NULL key is its own group held in dedicated accumulators (index
+// 0 of the *_null arrays). The host sorts the groups by key (NULL group
+// last), so the output matches the CPU reference exactly.
 //
 // Semantics: SUM/MIN/MAX skip NULL values and are NULL when a group has none
 // (count == 0); COUNT counts non-NULL values. SUM over Int64 wraps on
@@ -99,7 +102,29 @@ extern "C" __global__ void oxide_agg_insert_keys(const long long* __restrict__ k
     oxide_ag_slot(keys[i], g_keys, g_state, capacity, 1);
 }
 
-// Pass 2 kernels: one per (function, type). `counts` receives the non-NULL
+// Pass 1b, launched after pass 1 has finished: one thread per slot gives each
+// published slot the next group number and copies its key to that position,
+// so `group_keys` holds the G distinct keys in its first G entries and
+// `g_index` maps a slot to its group. Numbers come in no particular order;
+// the host sorts by key. Every published slot holds a key some row inserted,
+// so G <= rows and `group_keys` needs no more entries than the batch has rows.
+extern "C" __global__ void oxide_agg_number_groups(const long long* __restrict__ g_keys,
+                                                   const unsigned int* __restrict__ g_state,
+                                                   unsigned int capacity,
+                                                   unsigned int* __restrict__ g_index,
+                                                   long long* __restrict__ group_keys,
+                                                   unsigned int* __restrict__ n_groups) {
+    unsigned int slot = blockIdx.x * blockDim.x + threadIdx.x;
+    if (slot >= capacity) return;
+    if (g_state[slot] != 2u) return;
+    unsigned int id = atomicAdd(n_groups, 1u);
+    g_index[slot] = id;
+    group_keys[id] = g_keys[slot];
+}
+
+// Pass 2 kernels: one per (function, type), each launched after pass 1b. A
+// row finds its key's slot and reduces into entry `g_index[slot]` of
+// accumulators that hold one entry per group. `counts` receives the non-NULL
 // value count per group and doubles as COUNT.
 
 extern "C" __global__ void oxide_agg_sum_i64(const long long* __restrict__ keys,
@@ -110,6 +135,7 @@ extern "C" __global__ void oxide_agg_sum_i64(const long long* __restrict__ keys,
                                              long long* __restrict__ g_keys,
                                              unsigned int* __restrict__ g_state,
                                              unsigned int capacity,
+                                             const unsigned int* __restrict__ g_index,
                                              long long* __restrict__ sums,
                                              unsigned int* __restrict__ counts,
                                              long long* __restrict__ null_sum,
@@ -125,8 +151,9 @@ extern "C" __global__ void oxide_agg_sum_i64(const long long* __restrict__ keys,
     }
     unsigned int slot = oxide_ag_slot(keys[i], g_keys, g_state, capacity, 0);
     if (slot == 0xFFFFFFFFu) return;
-    atomicAdd((unsigned long long*)&sums[slot], (unsigned long long)v);
-    atomicAdd(&counts[slot], 1u);
+    unsigned int g = g_index[slot];
+    atomicAdd((unsigned long long*)&sums[g], (unsigned long long)v);
+    atomicAdd(&counts[g], 1u);
 }
 
 extern "C" __global__ void oxide_agg_sum_f64(const long long* __restrict__ keys,
@@ -137,6 +164,7 @@ extern "C" __global__ void oxide_agg_sum_f64(const long long* __restrict__ keys,
                                              long long* __restrict__ g_keys,
                                              unsigned int* __restrict__ g_state,
                                              unsigned int capacity,
+                                             const unsigned int* __restrict__ g_index,
                                              double* __restrict__ sums,
                                              unsigned int* __restrict__ counts,
                                              double* __restrict__ null_sum,
@@ -152,8 +180,9 @@ extern "C" __global__ void oxide_agg_sum_f64(const long long* __restrict__ keys,
     }
     unsigned int slot = oxide_ag_slot(keys[i], g_keys, g_state, capacity, 0);
     if (slot == 0xFFFFFFFFu) return;
-    atomicAdd(&sums[slot], v);
-    atomicAdd(&counts[slot], 1u);
+    unsigned int g = g_index[slot];
+    atomicAdd(&sums[g], v);
+    atomicAdd(&counts[g], 1u);
 }
 
 extern "C" __global__ void oxide_agg_minmax_i64(const long long* __restrict__ keys,
@@ -164,6 +193,7 @@ extern "C" __global__ void oxide_agg_minmax_i64(const long long* __restrict__ ke
                                                 long long* __restrict__ g_keys,
                                                 unsigned int* __restrict__ g_state,
                                                 unsigned int capacity,
+                                                const unsigned int* __restrict__ g_index,
                                                 long long* __restrict__ mins,
                                                 long long* __restrict__ maxs,
                                                 unsigned int* __restrict__ counts,
@@ -182,9 +212,10 @@ extern "C" __global__ void oxide_agg_minmax_i64(const long long* __restrict__ ke
     }
     unsigned int slot = oxide_ag_slot(keys[i], g_keys, g_state, capacity, 0);
     if (slot == 0xFFFFFFFFu) return;
-    atomicMin(&mins[slot], v);
-    atomicMax(&maxs[slot], v);
-    atomicAdd(&counts[slot], 1u);
+    unsigned int g = g_index[slot];
+    atomicMin(&mins[g], v);
+    atomicMax(&maxs[g], v);
+    atomicAdd(&counts[g], 1u);
 }
 
 // IEEE 754 totalOrder as a signed 64-bit integer: flipping every bit but
@@ -209,6 +240,7 @@ extern "C" __global__ void oxide_agg_minmax_f64(const long long* __restrict__ ke
                                                 long long* __restrict__ g_keys,
                                                 unsigned int* __restrict__ g_state,
                                                 unsigned int capacity,
+                                                const unsigned int* __restrict__ g_index,
                                                 long long* __restrict__ mins,
                                                 long long* __restrict__ maxs,
                                                 unsigned int* __restrict__ counts,
@@ -227,9 +259,10 @@ extern "C" __global__ void oxide_agg_minmax_f64(const long long* __restrict__ ke
     }
     unsigned int slot = oxide_ag_slot(keys[i], g_keys, g_state, capacity, 0);
     if (slot == 0xFFFFFFFFu) return;
-    atomicMin(&mins[slot], v);
-    atomicMax(&maxs[slot], v);
-    atomicAdd(&counts[slot], 1u);
+    unsigned int g = g_index[slot];
+    atomicMin(&mins[g], v);
+    atomicMax(&maxs[g], v);
+    atomicAdd(&counts[g], 1u);
 }
 
 // COUNT(value): non-NULL values per group (vvalid may be null = all valid).
@@ -240,6 +273,7 @@ extern "C" __global__ void oxide_agg_count(const long long* __restrict__ keys,
                                            long long* __restrict__ g_keys,
                                            unsigned int* __restrict__ g_state,
                                            unsigned int capacity,
+                                           const unsigned int* __restrict__ g_index,
                                            unsigned int* __restrict__ counts,
                                            unsigned int* __restrict__ null_count) {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -248,5 +282,6 @@ extern "C" __global__ void oxide_agg_count(const long long* __restrict__ keys,
     if (!oxide_ag_is_valid(kvalid, i)) { atomicAdd(null_count, 1u); return; }
     unsigned int slot = oxide_ag_slot(keys[i], g_keys, g_state, capacity, 0);
     if (slot == 0xFFFFFFFFu) return;
-    atomicAdd(&counts[slot], 1u);
+    unsigned int g = g_index[slot];
+    atomicAdd(&counts[g], 1u);
 }
