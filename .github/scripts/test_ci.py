@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import hashlib
+import re
 import socket
 import subprocess
 import tempfile
@@ -354,6 +355,11 @@ class SkillVersionTests(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
 
 
+def declared(path, key):
+    """The quoted value of `key = "…"` in a TOML file at the repository root."""
+    return re.search(rf'^{key} = "(.*)"$', (ROOT / path).read_text(), re.M).group(1)
+
+
 class ToolchainTests(unittest.TestCase):
     def test_msrv_uses_rustup_even_when_path_cargo_is_not_a_proxy(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -364,11 +370,87 @@ class ToolchainTests(unittest.TestCase):
             cargo.write_text('#!/bin/sh\necho "PATH Cargo does not support +toolchain" >&2\nexit 9\n')
             cargo.chmod(0o755)
             rustup = root / "rustup"
-            rustup.write_text('#!/bin/sh\ncase "$1" in\ntoolchain) exit 0 ;;\nrun) test "$3" = cargo && test "$4" = check ;;\n*) exit 2 ;;\nesac\n')
+            rustup.write_text(
+                '#!/bin/sh\ncase "$1" in\ntoolchain) exit 0 ;;\n'
+                'run) test "$2" = "$WANT" || exit 3\n'
+                '     case "$3" in cargo) test "$4" = check ;; rustc) test "$4" = --version ;; *) exit 4 ;; esac ;;\n'
+                '*) exit 2 ;;\nesac\n')
             rustup.chmod(0o755)
             run = subprocess.run(["make", "msrv"], cwd=root, text=True, capture_output=True,
-                                 env={**os.environ, "PATH": directory + os.pathsep + os.environ["PATH"]})
+                                 env={**os.environ, "PATH": directory + os.pathsep + os.environ["PATH"],
+                                      "WANT": declared("Cargo.toml", "rust-version")})
             self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+
+
+class MsrvJobTests(unittest.TestCase):
+    """The CI msrv job compiles with the declared rust-version (#127).
+
+    It installed 1.94.1 and then ran a plain `cargo check`, which rustup
+    resolved through rust-toolchain.toml to 1.98.0: a gate that could not
+    fail on an MSRV break.
+    """
+
+    PIN = "RUSTUP_TOOLCHAIN: ${{ steps.msrv.outputs.msrv }}"
+
+    @staticmethod
+    def steps():
+        job = workflow_job("ci.yml", "msrv")
+        starts = [i for i, line in enumerate(job) if line.startswith("      - ")]
+        return [job[a:b] for a, b in zip(starts, starts[1:] + [len(job)])]
+
+    @staticmethod
+    def run_text(step):
+        """What the step's `run:` executes, or "" for a `uses:` step."""
+        for i, line in enumerate(step):
+            key_text = line.strip().removeprefix("- ")
+            if key_text.startswith("run:"):
+                inline = key_text[len("run:"):].strip()
+                if inline != "|":
+                    return inline
+                key = len(line) - len(line.lstrip())
+                body = []
+                for later in step[i + 1:]:
+                    if later.strip() and len(later) - len(later.lstrip()) <= key:
+                        break
+                    body.append(later)
+                return "\n".join(body)
+        return ""
+
+    def test_every_step_that_compiles_names_the_declared_toolchain(self):
+        compiling = [step for step in self.steps()
+                     if re.search(r"\b(cargo|make|rustc)\b", self.run_text(step))]
+        self.assertTrue(compiling, "the msrv job compiles nothing")
+        for step in compiling:
+            self.assertIn(self.PIN, [line.strip() for line in step],
+                          "a step that compiles without RUSTUP_TOOLCHAIN gets rust-toolchain.toml's "
+                          "compiler, not the MSRV:\n" + "\n".join(step))
+        self.assertIn("make msrv", [self.run_text(step).strip() for step in compiling],
+                      "the job runs the check a contributor runs, `make msrv`")
+
+    def test_the_assertion_fails_when_rust_toolchain_toml_wins(self):
+        script = step_script("ci.yml", "Assert the MSRV toolchain is the one in use")
+        msrv = declared("Cargo.toml", "rust-version")
+        pinned = declared("rust-toolchain.toml", "channel")
+        self.assertNotEqual(msrv, pinned, "with no gap between the two this test proves nothing")
+        with tempfile.TemporaryDirectory() as directory:
+            rustc = Path(directory) / "rustc"
+            # rustup's precedence as this step meets it: RUSTUP_TOOLCHAIN,
+            # then rust-toolchain.toml (the runner's default comes last).
+            rustc.write_text(f'#!/bin/sh\necho "release: ${{RUSTUP_TOOLCHAIN:-{pinned}}}"\n')
+            rustc.chmod(0o755)
+
+            def step(**env):
+                base = {k: v for k, v in os.environ.items() if k != "RUSTUP_TOOLCHAIN"}
+                base.update(PATH=directory + os.pathsep + os.environ["PATH"], MSRV=msrv, **env)
+                # What a `run:` step with no `shell:` is on a Linux runner.
+                return subprocess.run(["bash", "--noprofile", "--norc", "-e", "-c", script],
+                                      env=base, capture_output=True, text=True)
+
+            pinned_run = step(RUSTUP_TOOLCHAIN=msrv)
+            self.assertEqual(pinned_run.returncode, 0, pinned_run.stdout + pinned_run.stderr)
+            unpinned = step()
+            self.assertNotEqual(unpinned.returncode, 0, unpinned.stdout)
+            self.assertIn(f"::error::the msrv job is not running rustc {msrv}", unpinned.stdout)
 
 
 class SemverBaselineTests(unittest.TestCase):

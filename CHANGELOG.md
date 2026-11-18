@@ -477,6 +477,12 @@ versions (0.x) may contain breaking changes; they are always listed under a
   columns; it is `-1.2e-5`). At 24 rows the Inspector now keeps its
   `H2D / D2H` and `cpu fallback` lines, which needed 28, and Telemetry the
   line saying whether its gauges can move at all, which needed 26 (#122).
+- **CI's `msrv` job compiles with the declared minimum Rust.** It installed
+  1.94.1 and then ran a plain `cargo check`, which rustup resolved through
+  `rust-toolchain.toml` to 1.98.0, so the job could not fail on code that
+  needs a newer compiler; `rust-version` was checked only by a local `make
+  msrv`. The job now runs `make msrv` under `RUSTUP_TOOLCHAIN` and first
+  asserts which `rustc` is in use (#127).
 
 ### Security
 

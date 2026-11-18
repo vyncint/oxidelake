@@ -283,7 +283,27 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ steps.msrv.outputs.msrv }}
-      - run: cargo check --workspace --all-targets --locked
+      # rust-toolchain.toml pins 1.98.0 so fmt and clippy output is
+      # reproducible, and rustup honours that file over the `rustup default`
+      # the action above sets: this job installed the MSRV and then compiled
+      # with 1.98.0, so it could not fail on an MSRV break (#127, the bug
+      # termlens#213 fixed the same way). RUSTUP_TOOLCHAIN outranks the file,
+      # and the assertion makes the no-op impossible to bring back quietly.
+      - name: Assert the MSRV toolchain is the one in use
+        env:
+          MSRV: ${{ steps.msrv.outputs.msrv }}
+          RUSTUP_TOOLCHAIN: ${{ steps.msrv.outputs.msrv }}
+        run: |
+          rustc -vV
+          rustc -vV | grep -q "^release: ${MSRV}$" \
+            || { echo "::error::the msrv job is not running rustc ${MSRV}"; exit 1; }
+      # The check `make msrv` runs locally, so the two cannot drift apart;
+      # it names its compiler with `rustup run`, which also holds past a
+      # cargo on PATH that is not rustup's proxy.
+      - name: Check the workspace with the declared rust-version
+        env:
+          RUSTUP_TOOLCHAIN: ${{ steps.msrv.outputs.msrv }}
+        run: make msrv
 
   docs:
     name: docs

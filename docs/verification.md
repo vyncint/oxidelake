@@ -94,7 +94,11 @@ invalid classification fails the gate.
 `make ci-scripts` covers source deletion/rename handling, malformed results,
 each required job's failures, Metal build-argument reuse, and stress coverage.
 It also verifies the metadata checker under the platform's Bash and the MSRV
-target with a standalone Cargo ahead of the Rustup proxy on `PATH`, and runs
+target with a standalone Cargo ahead of the Rustup proxy on `PATH`, checks
+that the `msrv` job compiles with the declared `rust-version` rather than
+`rust-toolchain.toml`'s 1.98.0 (every step that compiles sets
+`RUSTUP_TOOLCHAIN`, and the job's own assertion fails if the file wins,
+#127), and runs
 the release's crates.io baseline lookup against a local stand-in answering
 200, 404, 429 and 5xx: only a 200 lets `cargo-semver-checks` run, and nothing
 skips it. `binaries.yml`'s re-run steps run as they stand in the workflow

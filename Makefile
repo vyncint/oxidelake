@@ -159,8 +159,14 @@ endif
 
 metal: lint-metal test-metal test-metal-device ## Metal lane: lint, tests and conformance when a device is present
 
-msrv: ## build the workspace with the declared rust-version
+# `rustup run` and not a plain `cargo`: rust-toolchain.toml pins the
+# development toolchain, and rustup prefers that file to the default
+# toolchain, so a plain `cargo check` here compiles with 1.98.0 whatever is
+# installed and proves nothing about the MSRV (#127). The version line puts
+# the compiler that ran into the log.
+msrv: ## check the workspace with the declared rust-version, not rust-toolchain.toml's
 	rustup toolchain install $(MSRV) --profile minimal --no-self-update
+	rustup run $(MSRV) rustc --version
 	CARGO_TARGET_DIR=target/msrv rustup run $(MSRV) $(CARGO) check --workspace --all-targets --locked
 
 quickstart: ## release build, 1M-row demo table, one query
