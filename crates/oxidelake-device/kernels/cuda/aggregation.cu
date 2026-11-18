@@ -8,7 +8,10 @@
 // the output matches the CPU reference exactly.
 //
 // Semantics: SUM/MIN/MAX skip NULL values and are NULL when a group has none
-// (count == 0); COUNT counts non-NULL values.
+// (count == 0); COUNT counts non-NULL values. SUM over Int64 wraps on
+// overflow (the unsigned atomicAdd), as stock DataFusion's SUM and the CPU
+// reference do. MIN/MAX over Float64 follow IEEE 754 totalOrder, as Arrow's
+// comparisons and the CPU reference do (see oxide_total_order_key).
 //
 // Compiled at runtime with NVRTC; there is no nvcc build step.
 
@@ -184,27 +187,18 @@ extern "C" __global__ void oxide_agg_minmax_i64(const long long* __restrict__ ke
     atomicAdd(&counts[slot], 1u);
 }
 
-// Double min/max via compare-and-swap on the bit pattern.
-extern "C" __device__ __forceinline__ void oxide_atomic_min_f64(double* addr, double v) {
-    unsigned long long* a = (unsigned long long*)addr;
-    unsigned long long old = *a, assumed;
-    do {
-        assumed = old;
-        double cur = __longlong_as_double((long long)assumed);
-        if (!(v < cur)) return;
-        old = atomicCAS(a, assumed, (unsigned long long)__double_as_longlong(v));
-    } while (assumed != old);
-}
-
-extern "C" __device__ __forceinline__ void oxide_atomic_max_f64(double* addr, double v) {
-    unsigned long long* a = (unsigned long long*)addr;
-    unsigned long long old = *a, assumed;
-    do {
-        assumed = old;
-        double cur = __longlong_as_double((long long)assumed);
-        if (!(v > cur)) return;
-        old = atomicCAS(a, assumed, (unsigned long long)__double_as_longlong(v));
-    } while (assumed != old);
+// IEEE 754 totalOrder as a signed 64-bit integer: flipping every bit but
+// the sign of a negative double makes bit patterns compare, as signed
+// integers, the way Rust's `f64::total_cmp` and Arrow's float comparisons
+// order the values: -NaN < -inf < ... < -0.0 < 0.0 < ... < inf < NaN. MIN and
+// MAX then reduce with the native 64-bit atomicMin/atomicMax, and the host
+// decodes the result with the same transform (it is its own inverse). The
+// IEEE comparisons this replaces ignored NaN — an all-NaN group reported the
+// +inf/-inf the accumulators started at — and could not tell -0.0 from 0.0.
+extern "C" __device__ __forceinline__ long long oxide_total_order_key(double v) {
+    unsigned long long bits = (unsigned long long)__double_as_longlong(v);
+    unsigned long long flip = (0ull - (bits >> 63)) >> 1;
+    return (long long)(bits ^ flip);
 }
 
 extern "C" __global__ void oxide_agg_minmax_f64(const long long* __restrict__ keys,
@@ -215,26 +209,26 @@ extern "C" __global__ void oxide_agg_minmax_f64(const long long* __restrict__ ke
                                                 long long* __restrict__ g_keys,
                                                 unsigned int* __restrict__ g_state,
                                                 unsigned int capacity,
-                                                double* __restrict__ mins,
-                                                double* __restrict__ maxs,
+                                                long long* __restrict__ mins,
+                                                long long* __restrict__ maxs,
                                                 unsigned int* __restrict__ counts,
-                                                double* __restrict__ null_min,
-                                                double* __restrict__ null_max,
+                                                long long* __restrict__ null_min,
+                                                long long* __restrict__ null_max,
                                                 unsigned int* __restrict__ null_count) {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     if (!oxide_ag_is_valid(vvalid, i)) return;
-    double v = values[i];
+    long long v = oxide_total_order_key(values[i]);
     if (!oxide_ag_is_valid(kvalid, i)) {
-        oxide_atomic_min_f64(null_min, v);
-        oxide_atomic_max_f64(null_max, v);
+        atomicMin(null_min, v);
+        atomicMax(null_max, v);
         atomicAdd(null_count, 1u);
         return;
     }
     unsigned int slot = oxide_ag_slot(keys[i], g_keys, g_state, capacity, 0);
     if (slot == 0xFFFFFFFFu) return;
-    oxide_atomic_min_f64(&mins[slot], v);
-    oxide_atomic_max_f64(&maxs[slot], v);
+    atomicMin(&mins[slot], v);
+    atomicMax(&maxs[slot], v);
     atomicAdd(&counts[slot], 1u);
 }
 

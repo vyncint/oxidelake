@@ -11,7 +11,8 @@ use std::sync::Arc;
 use arrow::array::{Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::util::display::{ArrayFormatter, FormatOptions};
-use datafusion::physical_plan::displayable;
+use datafusion::physical_expr::Partitioning;
+use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, displayable};
 use datafusion::prelude::SessionContext;
 use oxidelake_core::BackendKind;
 use oxidelake_core::telemetry::TelemetryHub;
@@ -170,6 +171,100 @@ async fn scheduler_plans_carry_placement_tags() {
         && !target.is_gpu()
     {
         assert!(!text.contains("Gpu"), "{text}");
+    }
+}
+
+/// The first node of `plan`, depth first, that satisfies `matches`.
+fn find(
+    plan: &Arc<dyn ExecutionPlan>,
+    matches: &dyn Fn(&dyn ExecutionPlan) -> bool,
+) -> Option<Arc<dyn ExecutionPlan>> {
+    if matches(plan.as_ref()) {
+        return Some(Arc::clone(plan));
+    }
+    plan.children().into_iter().find_map(|c| find(c, matches))
+}
+
+/// Operators above an aggregate that were planned on its hash partitions: a
+/// `UNION ALL` interleaves two aggregates, and a partitioned join pairs
+/// their partitions. The lowered aggregate declared one partition, so the
+/// scheduler failed to plan both (#90).
+const ON_AGGREGATE_PARTITIONS: [&str; 2] = [
+    "SELECT k, s FROM (SELECT k, sum(v) AS s FROM t GROUP BY k) \
+     UNION ALL SELECT k, s FROM (SELECT k, min(v) AS s FROM t GROUP BY k)",
+    "SELECT a.k, a.s, b.m FROM (SELECT k, sum(v) AS s FROM t GROUP BY k) a \
+     LEFT JOIN (SELECT k, avg(v) AS m FROM t GROUP BY k) b ON a.k = b.k",
+];
+
+/// Joins planned `Partitioned` however small their inputs, as for tables
+/// too large to collect into one partition. Ballista ships the client's
+/// settings with each job, so this reaches the scheduler's planner.
+const PARTITIONED_JOINS: [&str; 2] = [
+    "SET datafusion.optimizer.hash_join_single_partition_threshold = 0",
+    "SET datafusion.optimizer.hash_join_single_partition_threshold_rows = 0",
+];
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn aggregates_keep_their_partitioning_on_a_cluster() {
+    let dir = tempfile::tempdir().unwrap();
+    let (t_path, _) = write_dataset(dir.path());
+
+    // The scheduler's plans have the shapes that used to break, lowered.
+    let ctx = SessionContext::new_with_state(
+        build_session_state(session_config(), BackendKind::Cuda).unwrap(),
+    );
+    ctx.register_parquet("t", &t_path, Default::default())
+        .await
+        .unwrap();
+    for set in PARTITIONED_JOINS {
+        ctx.sql(set).await.unwrap();
+    }
+    for sql in ON_AGGREGATE_PARTITIONS {
+        let plan = ctx
+            .sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let text = displayable(plan.as_ref()).indent(true).to_string();
+        assert!(text.contains("GpuAggregateExec[cuda]"), "{sql}\n{text}");
+        // The parent that relies on the aggregate's partitions: the union's
+        // interleave, or a join (sort-merge under Ballista's settings) whose
+        // two inputs are hash-partitioned alike.
+        let parent = find(&plan, &|n| {
+            n.name() == "InterleaveExec" || n.name().ends_with("JoinExec")
+        })
+        .unwrap_or_else(|| panic!("{sql}\n{text}"));
+        let partitioning: Vec<_> = parent
+            .children()
+            .iter()
+            .map(|c| c.output_partitioning().clone())
+            .collect();
+        assert!(
+            partitioning
+                .iter()
+                .all(|p| matches!(p, Partitioning::Hash(_, n) if *n > 1 && *n == partitioning[0].partition_count())),
+            "{sql}: {partitioning:?}\n{text}"
+        );
+    }
+
+    // And through the scheduler and two executors they equal embedded mode.
+    let addr = start_standalone(BackendKind::Cuda, 2, 2).await.unwrap();
+    let cluster = OxideSession::connect(&format!("df://{addr}"))
+        .await
+        .unwrap();
+    cluster.register_parquet("t", &t_path).await.unwrap();
+    for set in PARTITIONED_JOINS {
+        cluster.sql(set).await.unwrap();
+    }
+    let embedded = OxideSession::local().unwrap();
+    embedded.register_parquet("t", &t_path).await.unwrap();
+    for sql in ON_AGGREGATE_PARTITIONS {
+        let distributed = sorted_rows(&cluster.sql(sql).await.unwrap().collect().await.unwrap());
+        let local = sorted_rows(&embedded.sql(sql).await.unwrap().collect().await.unwrap());
+        assert!(!local.is_empty(), "{sql}");
+        assert_eq!(distributed, local, "{sql}");
     }
 }
 

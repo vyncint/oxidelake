@@ -985,6 +985,173 @@ mod tests {
         }
     }
 
+    /// `SUM(Int64)` wraps on overflow on the device exactly as the CPU
+    /// reference — and stock DataFusion — does (#46, #100): #100's rows, a
+    /// downward wrap, an overflow that ends back in range, and the `NULL`
+    /// group, compared with `cpu::kernels::aggregate` value for value.
+    #[test]
+    #[ignore = "requires an NVIDIA GPU and driver"]
+    fn aggregate_wraps_int64_sums_like_the_reference() {
+        let backend = CudaBackend::new(0).unwrap();
+        let stream = backend.create_stream().unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("x", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![
+                    Some(1),
+                    Some(1),
+                    Some(2),
+                    Some(3),
+                    Some(3),
+                    Some(4),
+                    Some(4),
+                    Some(4),
+                    None,
+                    None,
+                ])),
+                Arc::new(Int64Array::from(vec![
+                    i64::MAX - 1,
+                    i64::MAX - 1,
+                    5,
+                    i64::MIN,
+                    -1,
+                    i64::MAX,
+                    1,
+                    -2,
+                    i64::MAX,
+                    i64::MAX,
+                ])),
+            ],
+        )
+        .unwrap();
+        let spec = AggregateSpec {
+            group_by: 0,
+            aggregates: vec![(AggregateFunction::Sum, 1), (AggregateFunction::Count, 1)],
+        };
+        let resident = backend.upload(&stream, &batch).unwrap();
+        let out = backend
+            .aggregate(
+                &stream,
+                AggregateArgs {
+                    input: &resident,
+                    spec: &spec,
+                },
+            )
+            .unwrap();
+        let device = backend.download(&stream, &out).unwrap();
+        assert_eq!(
+            device,
+            crate::cpu::kernels::aggregate(&batch, &spec).unwrap()
+        );
+        let sums = device
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(
+            sums.iter().collect::<Vec<_>>(),
+            vec![
+                Some(-4),
+                Some(5),
+                Some(i64::MAX),
+                Some(i64::MAX - 1),
+                Some(-2)
+            ]
+        );
+    }
+
+    /// MIN/MAX(Float64) on the device in IEEE 754 totalOrder, compared with
+    /// the CPU reference bit for bit (#101): `NaN` greatest, a `NaN` with the
+    /// sign bit set least, `-0.0` below `0.0`, and an all-`NaN` group `NaN`
+    /// rather than the +inf/-inf the old kernel's accumulators started at.
+    #[test]
+    #[ignore = "requires an NVIDIA GPU and driver"]
+    fn aggregate_orders_floats_like_the_reference() {
+        let backend = CudaBackend::new(0).unwrap();
+        let stream = backend.create_stream().unwrap();
+        let nan = f64::NAN;
+        let rows = [
+            (Some(1), 1.0),
+            (Some(1), nan),
+            (Some(1), 3.0),
+            (Some(2), nan),
+            (Some(2), nan),
+            (Some(3), 0.0),
+            (Some(3), -0.0),
+            (Some(4), -0.0),
+            (Some(4), 0.0),
+            (Some(5), f64::INFINITY),
+            (Some(5), nan),
+            (Some(6), f64::NEG_INFINITY),
+            (Some(7), 1.0),
+            (Some(7), -nan),
+            (None, nan),
+            (None, 2.0),
+        ];
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("v", DataType::Float64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+                )),
+                Arc::new(Float64Array::from(
+                    rows.iter().map(|(_, v)| *v).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        let spec = AggregateSpec {
+            group_by: 0,
+            aggregates: vec![(AggregateFunction::Min, 1), (AggregateFunction::Max, 1)],
+        };
+        let resident = backend.upload(&stream, &batch).unwrap();
+        let out = backend
+            .aggregate(
+                &stream,
+                AggregateArgs {
+                    input: &resident,
+                    spec: &spec,
+                },
+            )
+            .unwrap();
+        let device = backend.download(&stream, &out).unwrap();
+        // Arrow compares primitive arrays by their bytes, so this tells
+        // -0.0 from 0.0 and a NaN's sign.
+        assert_eq!(
+            device,
+            crate::cpu::kernels::aggregate(&batch, &spec).unwrap()
+        );
+        let bits = |column: usize| {
+            device
+                .column(column)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .values()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>()
+        };
+        let want = |values: &[f64]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        let inf = f64::INFINITY;
+        assert_eq!(
+            bits(1),
+            want(&[1.0, nan, -0.0, -0.0, inf, f64::NEG_INFINITY, -nan, 2.0])
+        );
+        assert_eq!(
+            bits(2),
+            want(&[nan, nan, 0.0, 0.0, nan, f64::NEG_INFINITY, 1.0, nan])
+        );
+    }
+
     #[test]
     #[ignore = "requires an NVIDIA GPU and driver"]
     fn nvrtc_pipeline_compiles_and_launches_a_kernel() {

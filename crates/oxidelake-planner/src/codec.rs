@@ -261,7 +261,10 @@ impl OxidePhysicalCodec {
                 spec,
                 output,
             } => {
-                let exec = GpuAggregateExec::try_new(
+                // Per partition, never `try_new`: the decoded child is the
+                // plan as encoded, merge included when there was one, and a
+                // second merge would turn a stage's N tasks into one.
+                let exec = GpuAggregateExec::try_new_partitioned(
                     Arc::clone(child(inputs, 0, "GpuAggregateExec")?),
                     spec,
                     target,

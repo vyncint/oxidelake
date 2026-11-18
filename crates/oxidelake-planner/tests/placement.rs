@@ -236,6 +236,13 @@ fn plain_ctx_with(config: SessionConfig) -> SessionContext {
 }
 
 fn sorted_rows(batches: &[RecordBatch]) -> Vec<String> {
+    let mut rows = ordered_rows(batches);
+    rows.sort();
+    rows
+}
+
+/// Rows in the order they come back, for queries whose order is the point.
+fn ordered_rows(batches: &[RecordBatch]) -> Vec<String> {
     let opts = FormatOptions::default().with_null("NULL");
     let mut rows = Vec::new();
     for b in batches {
@@ -253,7 +260,6 @@ fn sorted_rows(batches: &[RecordBatch]) -> Vec<String> {
             );
         }
     }
-    rows.sort();
     rows
 }
 
@@ -1032,4 +1038,288 @@ async fn a_window_by_the_other_key_runs_over_a_lowered_hash_join() {
             .unwrap();
         assert_eq!(sorted_rows(&actual), sorted_rows(&expected), "{context}");
     }
+}
+
+// --- aggregates ------------------------------------------------------------
+
+/// Plans and runs `sql`, failing with the planner's or the executor's error
+/// (and the plan) rather than a bare `unwrap` panic.
+async fn run(ctx: &SessionContext, sql: &str) -> (String, Vec<RecordBatch>) {
+    let plan = match ctx.sql(sql).await {
+        Ok(df) => df.create_physical_plan().await,
+        Err(err) => Err(err),
+    }
+    .unwrap_or_else(|err| panic!("{sql}\nfailed to plan: {err}"));
+    let text = displayable(plan.as_ref()).indent(true).to_string();
+    let batches = collect(plan, ctx.task_ctx())
+        .await
+        .unwrap_or_else(|err| panic!("{sql}\nfailed to run: {err}\n{text}"));
+    (text, batches)
+}
+
+/// `SUM(Int64)` wraps on overflow under a GPU target as it does in stock
+/// DataFusion; the CPU reference used to fail the query instead (#100).
+#[tokio::test]
+async fn an_overflowing_sum_wraps_on_a_gpu_target() {
+    let sql = "SELECT k, SUM(x) AS s FROM (VALUES (1, 9223372036854775806), \
+               (1, 9223372036854775806), (2, 5)) AS v(k, x) GROUP BY k";
+    let (text, gpu) = run(&ctx_with_rule(BackendKind::Cuda), sql).await;
+    assert!(text.contains("GpuAggregateExec[cuda]"), "{text}");
+    assert_eq!(sorted_rows(&gpu), ["1|-4", "2|5"], "{text}");
+}
+
+/// DataFusion aggregates input sorted on its key in an ordered mode that
+/// emits the groups in the input's order, and plans the operators above on
+/// that order: an `ORDER BY` on the key over it needs no sort. The lowered
+/// aggregate emitted groups by ascending key with `NULL` last whatever the
+/// input order, so these came back ascending and with `NULL` last (#89).
+/// Such an aggregate now stays on the CPU, and the placement note says why.
+#[tokio::test]
+async fn an_aggregate_over_sorted_input_keeps_its_order() {
+    for sql in [
+        "SELECT k, sum(v) AS s FROM (SELECT k, v FROM t ORDER BY k DESC LIMIT 1000) \
+         GROUP BY k ORDER BY k DESC",
+        "SELECT k, count(v) AS c FROM (SELECT k, v FROM t ORDER BY k NULLS FIRST LIMIT 900) \
+         GROUP BY k ORDER BY k NULLS FIRST",
+    ] {
+        let (text, gpu) = run(&ctx_with_rule(BackendKind::Cuda), sql).await;
+        let (_, cpu) = run(&plain_ctx(), sql).await;
+        assert_eq!(ordered_rows(&gpu), ordered_rows(&cpu), "{sql}\n{text}");
+        assert!(!text.contains("GpuAggregateExec"), "{sql}\n{text}");
+        let notes = placement_notes(sql).await;
+        assert!(
+            notes.iter().any(
+                |n| n.starts_with("AggregateExec:") && n.contains("sorted on the grouping key")
+            ),
+            "{sql}: {notes:?}"
+        );
+    }
+    // What the operators above were planned on is the output ordering, not
+    // the input order mode: DataFusion runs a constant key in the ordered
+    // mode too (a constant is trivially sorted), but it promises no order
+    // there — there is one group — and that aggregate is still lowered. The
+    // string comparison keeps the filter on the CPU: a `GpuFilterExec`
+    // declares no constants, and the aggregate rebuilt over one is planned
+    // in the unordered mode, which would make this case prove nothing.
+    assert_same_results(
+        "SELECT k, sum(v) FROM t WHERE k = 2 AND s <> 'x' GROUP BY k ORDER BY k DESC",
+        BackendKind::Cuda,
+        Some("GpuAggregateExec[cuda]"),
+    )
+    .await;
+}
+
+/// A session whose partition count and join thresholds are pinned, so the
+/// plans below have the same shape on every machine (the default follows
+/// the CPU count); `target: None` is plain DataFusion.
+fn ctx_with_options(
+    target: Option<BackendKind>,
+    configure: impl Fn(&mut datafusion::config::ConfigOptions),
+) -> SessionContext {
+    let mut config = datafusion::prelude::SessionConfig::new();
+    configure(config.options_mut());
+    let mut builder = SessionStateBuilder::new()
+        .with_default_features()
+        .with_config(config);
+    if let Some(target) = target {
+        builder = builder.with_physical_optimizer_rules(physical_optimizer_rules(
+            HardwarePlacementRule::new(target),
+        ));
+    }
+    let ctx = SessionContext::new_with_state(builder.build());
+    register(&ctx);
+    ctx
+}
+
+/// Four partitions, and joins planned `Partitioned` however small the
+/// inputs: stand-ins for inputs too large to collect into one partition.
+fn four_partitions(o: &mut datafusion::config::ConfigOptions) {
+    o.execution.target_partitions = 4;
+    o.optimizer.hash_join_single_partition_threshold = 0;
+    o.optimizer.hash_join_single_partition_threshold_rows = 0;
+}
+
+/// A `FinalPartitioned` aggregate hands the operators above it N hash
+/// partitions, and they were planned on them: `UNION ALL` interleaves two
+/// such aggregates, and a partitioned join pairs partition i with partition
+/// i. The lowered aggregate collapsed them to one, and these failed to plan
+/// ("Can not create InterleaveExec", "HashJoinExec requires children [0, 1]
+/// to be co-partitioned") (#90). Each half of the aggregate is now lowered
+/// where it stands, with DataFusion's exchange kept between them.
+#[tokio::test]
+async fn a_partitioned_aggregate_keeps_its_partitioning() {
+    for sql in [
+        "SELECT k, s FROM (SELECT k, sum(v) AS s FROM t GROUP BY k) \
+         UNION ALL SELECT k, s FROM (SELECT k, min(v) AS s FROM t GROUP BY k)",
+        "SELECT a.k, a.s, b.m FROM (SELECT k, sum(v) AS s FROM t GROUP BY k) a \
+         LEFT JOIN (SELECT k, avg(v) AS m FROM t GROUP BY k) b ON a.k = b.k",
+    ] {
+        let (text, gpu) = run(
+            &ctx_with_options(Some(BackendKind::Cuda), four_partitions),
+            sql,
+        )
+        .await;
+        assert!(text.contains("GpuAggregateExec[cuda]"), "{sql}\n{text}");
+        let (_, cpu) = run(&ctx_with_options(None, four_partitions), sql).await;
+        assert_eq!(sorted_rows(&gpu), sorted_rows(&cpu), "{sql}\n{text}");
+    }
+
+    // The shape behind it: the final half over DataFusion's hash exchange
+    // over the partial half, declaring the partitioning the stock final did.
+    let sql = "SELECT k, sum(v), count(v), min(v), max(k) FROM t GROUP BY k";
+    let (gpu, text) = plan_and_text(
+        &ctx_with_options(Some(BackendKind::Cuda), four_partitions),
+        sql,
+    )
+    .await;
+    let (stock, _) = plan_and_text(&ctx_with_options(None, four_partitions), sql).await;
+    let lines: Vec<&str> = text.lines().map(str::trim_start).collect();
+    assert!(
+        lines[0].starts_with(
+            "GpuAggregateExec[cuda]: group_by=[k], aggr=[SUM(sum(t.v)[sum]), \
+             SUM(count(t.v)[count]), MIN(min(t.v)[value]), MAX(max(t.k)[value])]"
+        ) && lines[1].starts_with("RepartitionExec: partitioning=Hash([k@0], 4)")
+            && lines[2].starts_with(
+                "GpuAggregateExec[cuda]: group_by=[k], aggr=[SUM(v), COUNT(v), MIN(v), MAX(k)]"
+            ),
+        "{text}"
+    );
+    assert_eq!(
+        gpu.properties().output_partitioning(),
+        stock.properties().output_partitioning(),
+        "{text}"
+    );
+    let rows = sorted_rows(
+        &collect(gpu, ctx_with_options(None, four_partitions).task_ctx())
+            .await
+            .unwrap(),
+    );
+    let expected = sorted_rows(
+        &collect(stock, ctx_with_options(None, four_partitions).task_ctx())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(rows, expected, "{text}");
+}
+
+/// The codec rebuilds a per-partition `GpuAggregateExec` per partition. The
+/// decoded child is the plan as encoded, so merging a multi-partition child
+/// again would hand a Ballista stage one partition where it runs a task for
+/// each of N (#90).
+#[tokio::test]
+async fn codec_keeps_a_per_partition_aggregate_per_partition() {
+    use datafusion::physical_plan::ExecutionPlanProperties;
+    use oxidelake_compute::{AggregateFunction, AggregateSpec, GpuAggregateExec};
+
+    let ctx = plain_ctx();
+    let scan = ctx
+        .table("t")
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    assert_eq!(scan.output_partitioning().partition_count(), 2);
+    let spec = AggregateSpec {
+        group_by: 0,
+        aggregates: vec![(AggregateFunction::Sum, 1)],
+    };
+    let node: Arc<dyn ExecutionPlan> = Arc::new(
+        GpuAggregateExec::try_new_partitioned(Arc::clone(&scan), spec, BackendKind::Cuda).unwrap(),
+    );
+    let codec = OxidePhysicalCodec::default();
+    let mut buf = Vec::new();
+    codec
+        .try_encode(
+            Arc::clone(&node),
+            &mut buf,
+            &DefaultPhysicalProtoConverter {},
+        )
+        .unwrap();
+    let back = codec
+        .try_decode(
+            &buf,
+            &[scan],
+            &ctx.task_ctx(),
+            &DefaultPhysicalProtoConverter {},
+        )
+        .unwrap();
+    assert_eq!(back.output_partitioning().partition_count(), 2);
+    assert_eq!(
+        displayable(back.children()[0].as_ref())
+            .one_line()
+            .to_string(),
+        displayable(node.children()[0].as_ref())
+            .one_line()
+            .to_string()
+    );
+}
+
+/// A final half is lowered only over the partial half it merges: one whose
+/// aggregates are not the lowered partial half's stays on the CPU and says
+/// why, rather than merging values that are not its partials — that would
+/// not fail, it would compute. DataFusion never plans such a pair, so this
+/// one is built by hand.
+#[tokio::test]
+async fn a_final_half_merges_only_its_own_partial_half() {
+    use datafusion::config::ConfigOptions;
+    use datafusion::functions_aggregate::min_max::min_udaf;
+    use datafusion::physical_expr::aggregate::AggregateExprBuilder;
+    use datafusion::physical_expr::expressions::col;
+    use datafusion::physical_optimizer::PhysicalOptimizerRule;
+    use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
+    use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+    use oxidelake_compute::{AggregateFunction, AggregateSpec, GpuAggregateExec};
+
+    let scan = plain_ctx()
+        .table("t")
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    let raw = scan.schema();
+    // A lowered partial half computing SUM(v) …
+    let partial: Arc<dyn ExecutionPlan> = Arc::new(
+        GpuAggregateExec::try_new_partitioned(
+            scan,
+            AggregateSpec {
+                group_by: 0,
+                aggregates: vec![(AggregateFunction::Sum, 1)],
+            },
+            BackendKind::Cuda,
+        )
+        .unwrap(),
+    );
+    // … under a final half that merges min(v): the same type, so only the
+    // check of the functions can tell the two apart.
+    let min = AggregateExprBuilder::new(min_udaf(), vec![col("v", &raw).unwrap()])
+        .schema(Arc::clone(&raw))
+        .alias("min(t.v)")
+        .build()
+        .unwrap();
+    let group =
+        PhysicalGroupBy::new_single(vec![(col("k", &partial.schema()).unwrap(), "k".to_owned())]);
+    let plan: Arc<dyn ExecutionPlan> = Arc::new(
+        AggregateExec::try_new(
+            AggregateMode::Final,
+            group,
+            vec![Arc::new(min)],
+            vec![None],
+            Arc::new(CoalescePartitionsExec::new(partial)),
+            raw,
+        )
+        .unwrap(),
+    );
+    let hub = oxidelake_core::telemetry::TelemetryHub::new();
+    let rule = HardwarePlacementRule::new(BackendKind::Cuda).with_telemetry(Arc::clone(&hub));
+    let plan = rule.optimize(plan, &ConfigOptions::default()).unwrap();
+    let text = displayable(plan.as_ref()).indent(true).to_string();
+    assert!(text.starts_with("AggregateExec: mode=Final"), "{text}");
+    let notes: Vec<String> = hub.skips().into_iter().map(|s| s.reason).collect();
+    assert!(
+        notes.iter().any(|n| n.contains("(min) does not merge")
+            && n.contains("partial half lowered below it (SUM)")),
+        "{notes:?}"
+    );
 }

@@ -48,7 +48,7 @@ Placement is a **physical optimizer rule**, not an AST pass: eligibility depends
 |---|---|---|
 | filter + project | `=, <, <=, >, >=` combined with `AND` over Int64/Float64 vs literals; column selection; stream-compacted output | CPU |
 | hash join | inner join, single Int64 key; one open-addressing slot per distinct key, built once per operator and probed in parallel | CPU |
-| aggregate | SUM/COUNT/MIN/MAX over Int64/Float64, one low-cardinality Int64 key | CPU |
+| aggregate | SUM/COUNT/MIN/MAX over Int64/Float64, one low-cardinality Int64 key, input not sorted on the key (#89) | CPU |
 | vector distance | L2 and cosine, query vector vs `FixedSizeList<Float32>` column | CPU |
 
 CUDA implements all four; Metal implements filter + project and vector distance in v1.

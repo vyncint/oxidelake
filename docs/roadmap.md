@@ -151,8 +151,11 @@ read it as "a running deployment can now tell whether its GPU is being used".
 - [ ] `GpuAggregateExec` streams and partitions instead of collecting the
       whole input (#29, audit P4) — *Acceptance:* a input larger than device
       memory completes.
-- [ ] CUDA `SUM` detects Int64 overflow instead of wrapping (#46) —
-      *Acceptance:* an overflowing sum is an error, not a wrong number.
+- [ ] `SUM(Int64)` wraps on overflow on every backend, as stock DataFusion's
+      does (#46) — *Acceptance:* the conformance overflow fixture equals
+      DataFusion's wrapped answer on a CUDA device. The line first asked for
+      an error, on the premise that DataFusion raises one; it wraps, so the
+      CPU reference was the outlier and now wraps too (#100).
 - [x] `SpillManager` and `MemoryInfo` reach the operators, or the docs and
       the TUI say they are library-only (#25) — *closed the second way*:
       tier capacities come from the backend's `MemoryInfo`, and the panel,

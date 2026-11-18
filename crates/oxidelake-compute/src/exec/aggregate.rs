@@ -9,13 +9,18 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::TaskContext;
-use datafusion::physical_expr::{Partitioning, PhysicalExpr};
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_expr::projection::ProjectionMapping;
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::execution_plan::EmissionType;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream, collect,
+    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
+    SendableRecordBatchStream,
 };
+use futures::TryStreamExt;
 use oxidelake_core::BackendKind;
 use oxidelake_core::params::{AggregateFunction, AggregateSpec};
 use oxidelake_core::telemetry::TelemetryHub;
@@ -60,8 +65,15 @@ pub fn aggregate_output_schema(input: &Schema, spec: &AggregateSpec) -> Result<S
     Ok(Arc::new(Schema::new(fields)))
 }
 
-/// Grouped aggregation. Consumes every input partition, then emits one batch
-/// sorted by key (`NULL` group last) from a single output partition.
+/// Grouped aggregation, one input partition at a time.
+///
+/// Each input partition is aggregated on its own and becomes the output
+/// partition with the same number: one batch, sorted by key with the `NULL`
+/// group last, emitted when that partition's input ends. That is a complete
+/// aggregate when the input is a single partition or is hash-partitioned on
+/// the key, and otherwise the partial half of a two-phase aggregate (#90).
+/// [`Self::try_new`] builds a complete aggregate of any input;
+/// [`Self::try_new_partitioned`] the per-partition one.
 #[derive(Debug)]
 pub struct GpuAggregateExec {
     input: Arc<dyn ExecutionPlan>,
@@ -73,18 +85,34 @@ pub struct GpuAggregateExec {
 }
 
 impl GpuAggregateExec {
-    /// Builds the exec, validating the key and aggregate input types.
+    /// A complete aggregate of `input`, validating the key and aggregate
+    /// input types. A multi-partition input is merged first, by a
+    /// `CoalescePartitionsExec` that [`Self::input`] then returns: the merge
+    /// is a plan node rather than something `execute` does, so a Ballista
+    /// stage boundary lands on it as on any other exchange.
     pub fn try_new(
         input: Arc<dyn ExecutionPlan>,
         spec: AggregateSpec,
         target: BackendKind,
     ) -> Result<Self> {
+        let input = if input.output_partitioning().partition_count() > 1 {
+            Arc::new(CoalescePartitionsExec::new(input)) as Arc<dyn ExecutionPlan>
+        } else {
+            input
+        };
+        Self::try_new_partitioned(input, spec, target)
+    }
+
+    /// Aggregates each input partition independently, validating the key and
+    /// aggregate input types (see the type's documentation for when that is
+    /// a complete aggregate).
+    pub fn try_new_partitioned(
+        input: Arc<dyn ExecutionPlan>,
+        spec: AggregateSpec,
+        target: BackendKind,
+    ) -> Result<Self> {
         let schema = aggregate_output_schema(&input.schema(), &spec)?;
-        let properties = plan_properties(
-            Arc::clone(&schema),
-            Partitioning::UnknownPartitioning(1),
-            EmissionType::Final,
-        );
+        let properties = properties(&input, spec.group_by, &schema)?;
         Ok(Self {
             input,
             spec,
@@ -128,11 +156,7 @@ impl GpuAggregateExec {
                 ));
             }
         }
-        self.properties = plan_properties(
-            Arc::clone(&schema),
-            Partitioning::UnknownPartitioning(1),
-            EmissionType::Final,
-        );
+        self.properties = properties(&self.input, self.spec.group_by, &schema)?;
         self.schema = schema;
         Ok(self)
     }
@@ -151,6 +175,42 @@ impl GpuAggregateExec {
     pub fn input(&self) -> &Arc<dyn ExecutionPlan> {
         &self.input
     }
+}
+
+/// The input's partitioning with the key renamed to the output column it
+/// becomes, which is what DataFusion's `AggregateExec` declares for the same
+/// input: an aggregate the placement rule substitutes hands the operators
+/// above it the partitioning they were planned on.
+fn properties(
+    input: &Arc<dyn ExecutionPlan>,
+    group_by: usize,
+    schema: &SchemaRef,
+) -> Result<Arc<PlanProperties>> {
+    let input_schema = input.schema();
+    let key: Arc<dyn PhysicalExpr> =
+        Arc::new(Column::new(field_name(&input_schema, group_by)?, group_by));
+    let mapping =
+        ProjectionMapping::try_new([(key, field_name(schema, 0)?.to_owned())], &input_schema)?;
+    let partitioning = input
+        .output_partitioning()
+        .project(&mapping, input.equivalence_properties());
+    Ok(plan_properties(
+        Arc::clone(schema),
+        partitioning,
+        EmissionType::Final,
+    ))
+}
+
+fn field_name(schema: &Schema, index: usize) -> Result<&str> {
+    schema
+        .fields()
+        .get(index)
+        .map(|f| f.name().as_str())
+        .ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "GpuAggregateExec: column index {index} out of range for {schema}"
+            ))
+        })
 }
 
 impl DisplayAs for GpuAggregateExec {
@@ -189,6 +249,8 @@ impl ExecutionPlan for GpuAggregateExec {
         Ok(TreeNodeRecursion::Continue)
     }
 
+    // Per-partition semantics whatever built this node: `try_new`'s merge,
+    // when there was one, is already the child being replaced.
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -196,7 +258,7 @@ impl ExecutionPlan for GpuAggregateExec {
         let [input] = <[Arc<dyn ExecutionPlan>; 1]>::try_from(children).map_err(|c| {
             DataFusionError::Plan(format!("GpuAggregateExec expects 1 child, got {}", c.len()))
         })?;
-        let mut exec = Self::try_new(input, self.spec.clone(), self.config.target)?
+        let mut exec = Self::try_new_partitioned(input, self.spec.clone(), self.config.target)?
             .with_output_schema(Arc::clone(&self.schema))?;
         exec.config = self.config.clone();
         Ok(Arc::new(exec))
@@ -207,13 +269,8 @@ impl ExecutionPlan for GpuAggregateExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        if partition != 0 {
-            return Err(DataFusionError::Internal(format!(
-                "GpuAggregateExec has a single output partition, got request for {partition}"
-            )));
-        }
-        let input = Arc::clone(&self.input);
-        let input_schema = input.schema();
+        let input = self.input.execute(partition, context)?;
+        let input_schema = self.input.schema();
         let operator = self.config.operator("GpuAggregateExec")?;
         let span = self
             .config
@@ -222,7 +279,7 @@ impl ExecutionPlan for GpuAggregateExec {
         let spec = self.spec.clone();
         let schema = Arc::clone(&self.schema);
         let stream = futures::stream::once(async move {
-            let batches = collect(input, context).await?;
+            let batches: Vec<RecordBatch> = input.try_collect().await?;
             let all = concat_batches(&input_schema, &batches)?;
             // Entered after the input is collected: the await is above it.
             let _entered = span.enter();

@@ -6,7 +6,11 @@
 //! * join: `NULL` keys never match;
 //! * aggregate: `NULL` keys form their own group; `SUM/MIN/MAX` skip `NULL`s
 //!   and are `NULL` for groups with no values; `COUNT` counts non-`NULL`s;
-//!   output is sorted by key with the `NULL` group last;
+//!   `SUM` over `Int64` wraps on overflow, as stock DataFusion's does;
+//!   `MIN`/`MAX` over `Float64` follow IEEE 754 totalOrder, the order Arrow's
+//!   comparison and sort kernels use (`NaN` greatest, a `NaN` with the sign
+//!   bit set least, `-0.0` below `0.0`); output is sorted by key with the
+//!   `NULL` group last;
 //! * vector distance: a `NULL` vector yields a `NULL` distance; cosine distance
 //!   is `1 - cos(θ)` and is `NaN` when either norm is zero.
 
@@ -434,7 +438,7 @@ fn index_u32(i: usize) -> Result<u32, EngineError> {
 enum Acc {
     I64 {
         count: i64,
-        sum: i128,
+        sum: i64,
         min: i64,
         max: i64,
     },
@@ -535,7 +539,12 @@ pub fn aggregate(batch: &RecordBatch, spec: &AggregateSpec) -> Result<RecordBatc
                 ) if arr.is_valid(row) => {
                     let v = arr.value(row);
                     *count += 1;
-                    *sum += i128::from(v);
+                    // Wrapping, like every stock DataFusion `SUM` accumulator
+                    // (`add_wrapping`). This path is the reference the GPU
+                    // kernels are checked against and the one a device
+                    // operator falls back to, so an error here failed on a
+                    // GPU target a query the CPU target answered (#100).
+                    *sum = sum.wrapping_add(v);
                     *min = (*min).min(v);
                     *max = (*max).max(v);
                 }
@@ -549,10 +558,20 @@ pub fn aggregate(batch: &RecordBatch, spec: &AggregateSpec) -> Result<RecordBatc
                     Input::F(arr),
                 ) if arr.is_valid(row) => {
                     let v = arr.value(row);
+                    // IEEE 754 totalOrder (#101). `f64::min`/`max` are IEEE
+                    // minNum/maxNum: they skip NaN, so an all-NaN group kept
+                    // the +inf/-inf it started from — values not in the data —
+                    // and they leave the sign of a zero result unspecified.
+                    // The group's first value seeds both, so the starting
+                    // values are never compared with.
+                    if *count == 0 || v.total_cmp(min).is_lt() {
+                        *min = v;
+                    }
+                    if *count == 0 || v.total_cmp(max).is_gt() {
+                        *max = v;
+                    }
                     *count += 1;
                     *sum += v;
-                    *min = min.min(v);
-                    *max = max.max(v);
                 }
                 _ => {}
             }
@@ -585,19 +604,18 @@ pub fn aggregate(batch: &RecordBatch, spec: &AggregateSpec) -> Result<RecordBatc
                         .collect::<Vec<_>>(),
                 )),
             ),
-            (AggregateFunction::Sum, Input::I(_)) => {
-                let mut out = Vec::with_capacity(order.len());
-                for &g in &order {
-                    out.push(match &accs[g][a] {
-                        Acc::I64 { count, sum, .. } if *count > 0 => Some(
-                            i64::try_from(*sum)
-                                .map_err(|_| EngineError::execution("SUM overflowed Int64"))?,
-                        ),
-                        _ => None,
-                    });
-                }
-                (DataType::Int64, Arc::new(Int64Array::from(out)))
-            }
+            (AggregateFunction::Sum, Input::I(_)) => (
+                DataType::Int64,
+                Arc::new(Int64Array::from(
+                    order
+                        .iter()
+                        .map(|&g| match &accs[g][a] {
+                            Acc::I64 { count, sum, .. } if *count > 0 => Some(*sum),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>(),
+                )),
+            ),
             (AggregateFunction::Sum, Input::F(_)) => (
                 DataType::Float64,
                 Arc::new(Float64Array::from(
@@ -654,6 +672,26 @@ pub fn aggregate(batch: &RecordBatch, spec: &AggregateSpec) -> Result<RecordBatc
         Arc::new(Schema::new(fields)),
         columns,
     )?)
+}
+
+/// `x` as a signed integer that orders like IEEE 754 totalOrder: comparing
+/// two keys as `i64` is `f64::total_cmp` on the values. A device has 64-bit
+/// integer atomic min/max but no totalOrder on doubles, so the CUDA kernel
+/// reduces these keys (`oxide_total_order_key` in `aggregation.cu` is the
+/// same transform) and the host decodes them with [`from_total_order_key`].
+pub const fn total_order_key(x: f64) -> i64 {
+    let bits = x.to_bits() as i64;
+    // Flip every bit but the sign of a negative value: negative values then
+    // order backwards by magnitude, below every positive one.
+    bits ^ ((((bits >> 63) as u64) >> 1) as i64)
+}
+
+/// The value whose [`total_order_key`] is `key`; the transform is its own
+/// inverse. `i64::MAX` decodes to the greatest value (a positive `NaN`) and
+/// `i64::MIN` to the least (a negative one), which is what makes them the
+/// device's starting values for `MIN` and `MAX`.
+pub const fn from_total_order_key(key: i64) -> f64 {
+    f64::from_bits((key ^ ((((key >> 63) as u64) >> 1) as i64)) as u64)
 }
 
 fn acc_count(acc: &Acc) -> i64 {
@@ -959,6 +997,51 @@ mod tests {
         let out = aggregate(&empty, &spec).unwrap();
         assert_eq!(out.num_rows(), 0);
         assert_eq!(out.num_columns(), 2);
+    }
+
+    /// The integer image the CUDA kernel reduces orders exactly as
+    /// `f64::total_cmp` and decodes to the same bits (#101): signed zeros,
+    /// subnormals, infinities and NaNs of either sign and any payload.
+    #[test]
+    fn total_order_keys_order_like_total_cmp_and_round_trip() {
+        let values = [
+            f64::from_bits(u64::MAX),
+            -f64::NAN,
+            f64::NEG_INFINITY,
+            f64::MIN,
+            -1.0,
+            -f64::from_bits(1),
+            -0.0,
+            0.0,
+            f64::from_bits(1),
+            f64::MIN_POSITIVE,
+            1.0,
+            f64::MAX,
+            f64::INFINITY,
+            f64::from_bits(0x7FF0_0000_0000_0001),
+            f64::NAN,
+            f64::from_bits(0x7FFF_FFFF_FFFF_FFFF),
+        ];
+        for a in values {
+            assert_eq!(
+                from_total_order_key(total_order_key(a)).to_bits(),
+                a.to_bits()
+            );
+            for b in values {
+                assert_eq!(
+                    total_order_key(a).cmp(&total_order_key(b)),
+                    a.total_cmp(&b),
+                    "{a:?} ({:#x}) vs {b:?} ({:#x})",
+                    a.to_bits(),
+                    b.to_bits()
+                );
+            }
+        }
+        assert_eq!(
+            from_total_order_key(i64::MAX).to_bits(),
+            0x7FFF_FFFF_FFFF_FFFF
+        );
+        assert_eq!(from_total_order_key(i64::MIN).to_bits(), u64::MAX);
     }
 
     #[test]

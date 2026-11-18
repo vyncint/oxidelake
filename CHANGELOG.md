@@ -195,6 +195,84 @@ versions (0.x) may contain breaking changes; they are always listed under a
   selects the CPU and logs why, and `OXIDE_BACKEND=cuda` fails at startup
   saying which. New: `CudaBackend::nvrtc_arch`.
 
+- **CUDA's `SUM(Int64)` wrap is no longer called a divergence** (#46). It is
+  what stock DataFusion does, so `cuda/ops.rs` no longer documents it as a
+  divergence by design and the roadmap line no longer asks for an overflow
+  error: #46 was filed on the premise that DataFusion raises one, and it
+  wraps. The CPU reference was the outlier and now wraps too (#100, under
+  Fixed). The `#[ignore]`d device test
+  `aggregate_wraps_int64_sums_like_the_reference` and the conformance
+  suite's GPU pass pin the kernel to the reference's wrapped answer when
+  they next run on a CUDA machine.
+
+- **`GpuAggregateExec` aggregates each input partition on its own** (#90).
+  `GpuAggregateExec::try_new` still builds a complete aggregate of any
+  input, but merges a multi-partition input with a `CoalescePartitionsExec`
+  that `input()` now returns, where it used to read every partition inside
+  `execute(0)`; the new `GpuAggregateExec::try_new_partitioned` aggregates
+  per partition and declares its input's partitioning, which is what the
+  placement rule and the plan codec build, and what `with_new_children`
+  keeps. Code that builds the exec with `try_new` gets the same rows;
+  code that walked from it to its input sees the merge node first.
+  **`EXPLAIN` shows two `GpuAggregateExec` nodes for a two-phase
+  aggregate**, the final half over DataFusion's `RepartitionExec` or
+  `CoalescePartitionsExec` over the partial half; the final half merges
+  partial results, so a `COUNT` reads there as `SUM(count(t.v)[count])`.
+
+### Fixed
+
+- **`SUM(Int64)` wraps on overflow under a GPU target, as it does in stock
+  DataFusion** (#100). The CPU reference — what every operator placed on a
+  device falls back to, and what every GPU kernel is checked against —
+  failed the query with `SUM overflowed Int64`, so a `GROUP BY` that
+  `--target cpu` answered errored under `--target cuda` or `metal` on a
+  machine without the device. It now wraps like DataFusion's `add_wrapping`
+  accumulators, and the conformance suite pins it to DataFusion's wrapped
+  answer on an overflow fixture. Nothing to change on your side: the error
+  was never DataFusion's behaviour, and no other target raised it.
+
+- **`MIN`/`MAX` over `Float64` follow IEEE 754 totalOrder under a GPU
+  target** (#101), the order Arrow's comparison and sort kernels — and so
+  the CPU filter path — already use: `NaN` is the greatest value, a `NaN`
+  with the sign bit set (which `0.0 / 0.0` produces on x86) the least, and
+  `-0.0` sorts below `0.0`. The CPU reference used IEEE minNum/maxNum, which
+  skip `NaN`: an all-`NaN` group reported `MIN = inf`, `MAX = -inf`, values
+  that are not in the data, and the sign of a zero result was unspecified.
+  The CUDA kernel now reduces the same order on integer keys. **Visible
+  change:** for a group containing `NaN` or a signed zero, a GPU target's
+  answer can differ from `--target cpu`, because stock DataFusion's grouped
+  float `MIN`/`MAX` depends on row order (`MIN` of {1.0, NaN, 3.0} is 3.0
+  there) and lets its starting values through (`MAX` of {-inf} is
+  `f64::MIN`); the GPU target's answer is the order-independent one.
+
+- **An `ORDER BY` over an aggregate of sorted input comes back in order
+  under a GPU target** (#89). DataFusion aggregates input that is sorted on
+  the grouping key in an ordered mode, emitting the groups in the input's
+  order, and plans the operators above on that order: `SELECT k, sum(v) FROM
+  (SELECT k, v FROM t ORDER BY k DESC LIMIT 1000) GROUP BY k ORDER BY k
+  DESC` needs no sort of its own. The placement rule replaced that aggregate
+  with a `GpuAggregateExec`, which emits groups by ascending key with the
+  `NULL` group last, so `--target cuda` and `metal` returned such queries
+  ascending, and `NULLS FIRST` with the `NULL` group last. The rule now
+  leaves an aggregate whose output is ordered on the CPU, and `oxide
+  explain` says why under `placement notes`. **Visible change:** these
+  aggregates no longer show as `GpuAggregateExec`; they run as stock
+  DataFusion's ordered aggregate, which streams with one group open at a
+  time.
+
+- **`UNION ALL` of two aggregates, and a partitioned join over one, work
+  under a GPU target** (#90), embedded and on a cluster. DataFusion plans a
+  two-phase aggregate's final half on N hash partitions and the operators
+  above it on those: a `UNION ALL` interleaves two such aggregates, a
+  partitioned join (or Ballista's sort-merge join) pairs partition i with
+  partition i. The placement rule replaced both halves and the exchange
+  between them with one `GpuAggregateExec` that declared a single
+  partition, so the first failed to plan (`Can not create InterleaveExec`)
+  and the second with `HashJoinExec requires children [0, 1] to be
+  co-partitioned`. The rule now lowers each half where it stands and keeps
+  DataFusion's exchange between them, and each `GpuAggregateExec` declares
+  the partitioning of the node it replaces.
+
 ### Security
 
 - **thrift is out of the dependency graph** (#4, #54). parquet 59 decodes
