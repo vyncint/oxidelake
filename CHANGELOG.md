@@ -421,6 +421,14 @@ versions (0.x) may contain breaking changes; they are always listed under a
   `float()` and JavaScript's `Number()` read back. `--help` and the README
   say so.
 
+- **`OxideFrame::show()` no longer panics when stdout closes** (#125). It
+  was DataFusion's `DataFrame::show`, whose `println!` panics on a closed
+  pipe, so a program showing a frame into `… | head -1` died with `failed
+  printing to stdout: Broken pipe`: the crash #34 fixed in `oxide sql` and
+  left in the library. `show` now writes the same table itself, and a
+  reader that has gone is a clean stop that returns `Ok`, as `oxide sql`
+  exits 0 there; any other write failure is an `EngineError::Io`.
+
 ### Security
 
 - **thrift is out of the dependency graph** (#4, #54). parquet 59 decodes

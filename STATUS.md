@@ -52,7 +52,7 @@ Filled in as phases complete. Every component goes under exactly one column — 
 | `oxide gen-data` (deterministic SplitMix64 dataset, Bloom filters on `id`/`k`) | datagen unit tests + CLI e2e with independent `parquet`-crate verification | | |
 | `oxide sql` / `oxide explain --target` / spawned-cluster `--cluster` equality | `oxidelake-runtime/tests/cli.rs` (assert_cmd, real `oxide-scheduler` + `oxide-worker` processes) | | |
 | Embedded cpu/cuda/metal target equivalence (incl. the vector query) | `oxidelake-runtime/tests/embedded.rs`; **(macOS)** the metal target actually executes on the device; **(T4)** the cuda target actually executes on the device — this test is what caught the aggregation kernel bug (failed 8 of 8 runs before the fix, 8 of 8 green after); the README quickstart (`gen-data` 1M rows → `explain`/`sql --target cuda`) plans `GpuFilterExec[cuda]` + `GpuAggregateExec[cuda]` and returns the same 98 group rows as `--target cpu` | | |
-| `OxideFrame` DataFrame API (filter/select/join/aggregate/vector_distance/explain/collect) | `oxidelake-api/tests/dataframe.rs` vs SQL equivalents | | |
+| `OxideFrame` DataFrame API (filter/select/join/aggregate/vector_distance/explain/collect/show) | `oxidelake-api/tests/dataframe.rs` vs SQL equivalents; `show` run in a child process, whole and into a closed pipe (`tests/show_closed_pipe.rs`, #125) | | |
 | `oxide tui` (query dashboard: plan DAG + live telemetry + column profiles) | dashboard unit test (plan tags, real counters, profiles); driven end to end in a sized PTY (demo + `--query --target metal`), `q` exits 0 | | |
 
 ## Resolved dependency set
