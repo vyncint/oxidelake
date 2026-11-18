@@ -318,6 +318,45 @@ versions (0.x) may contain breaking changes; they are always listed under a
   `Format`; code that matched on `EngineError::DataFusion` for such errors
   now gets `Format` or `Io` (#118).
 
+### Fixed
+
+- **A failed spill-manager insert no longer leaves its batch behind**
+  (#115). `SpillManager::insert_host` and `insert_device` registered the
+  batch and counted its bytes before evicting to make room, and when the
+  eviction failed they returned the error but kept the batch: registered
+  under an id the caller never received, so nothing could read or remove
+  it, and counted against the budget, so every failed insert made the next
+  eviction likelier to fail. A failed insert now forgets the batch and its
+  bytes and republishes the tier gauges; a batch the eviction had already
+  moved before it failed stays where it was moved.
+
+- **A slice is charged for its own rows, not its parent's buffers**
+  (#116). The spill manager sized a batch with `get_array_memory_size`,
+  which counts every buffer a slice shares with its parent in full: four
+  quarter slices of an 800 KB batch were charged 800 KB each, so under a
+  1.2 MB budget three of them spilled and nothing was freed.
+  `SpillManager::batch_bytes`, what the budgets count, is now each
+  column's own slice of its buffers (values, offsets, validity, and the
+  out-of-line strings of a `Utf8View` or `BinaryView` column), so the
+  slices of one batch together are charged what the batch is, and a sliced
+  batch reports less than it did. The buffers the slices share stay
+  allocated while any of them lives, which no per-batch measure can see.
+
+- **Two spill managers on one store and prefix no longer overwrite each
+  other's files** (#114). Each manager numbers its batches from 1 and
+  named their files `batch-<id>.arrow`, so a second manager on the same
+  prefix, in the same process or another one, wrote over the first one's
+  spill files: the first manager read back the second one's rows, and the
+  second one's batch was gone once the first promoted it and deleted the
+  file. Spill files are now named `batch-<tag>-<id>.arrow`, with a random
+  tag per manager.
+
+- **Dropping a spill manager deletes the spill files it still holds**
+  (#117). They were left in the spill directory. A drop cannot await, so
+  the deletes run on a thread and runtime of their own and the drop waits
+  for them; after 30 seconds it stops waiting and lets them finish in the
+  background. A file that cannot be deleted is logged at `warn`.
+
 ### Security
 
 - **thrift is out of the dependency graph** (#4, #54). parquet 59 decodes
@@ -392,6 +431,26 @@ versions (0.x) may contain breaking changes; they are always listed under a
   scan with DataFusion's own reader. `register_local_store` now puts the store
   behind the new `BoundedReadStore`, which refuses a multi-range read past the
   end of an object before the store underneath reserves memory for it.
+- **A corrupt Arrow IPC file is refused instead of panicking or aborting
+  the process** (#110). `read_ipc_file` and the spill reader
+  (`oxidelake_memory::ipc::decode_batch`) handed the file to arrow-ipc,
+  which takes the lengths it declares at their word: a negative block
+  length, a zero-length block or a missing schema panicked, a buffer
+  reaching past its message's body panicked on a slice, and a block, a
+  footer or a compressed buffer declaring a huge size aborted the process
+  on the failed allocation. A record batch whose message header was zeroed
+  ended the file early, so the spill reader returned an empty batch with
+  no error. The footer, every block and every buffer are now checked
+  against the file before arrow decodes it, nothing is allocated at a size
+  the file has not been shown to hold, and the decode runs under
+  `catch_unwind` for what arrow only asserts; each case is an
+  `EngineError::Format` that names the defect. **A compressed IPC file is
+  now refused by both readers**: these files are written uncompressed, and
+  a compressed buffer's declared size is allocated before it can be
+  checked. Read a compressed file you trust with arrow's own `FileReader`.
+  A failing read is now `EngineError::Io` rather than `Format`, and the
+  checked reader is public as `oxidelake_memory::ipc::read_batches`, over
+  any `Read + Seek`.
 
 ## [0.2.0] - 2026-09-21
 
