@@ -1,0 +1,84 @@
+# CUDA execution on a real NVIDIA device, on demand (#38).
+#
+# Nothing else here executes CUDA code. ci.yml runs on hosted runners with
+# no GPU, so the `cuda` feature is compiled and linted there (`make
+# check-cuda`, `make lint-cuda`) and every test that needs a device is
+# #[ignore]d. The only CUDA execution on record is the manual T4 session of
+# 2026-09-06, which found a correctness bug in the aggregation kernel that
+# 3 seeds x 5 sizes of CPU conformance had not (STATUS.md). "Compiles with
+# --features cuda" is not a verification status; this is how a release
+# candidate gets one. docs/RELEASING.md step 0 requires it.
+#
+# WHERE IT RUNS, AND WHY NOWHERE YET
+#
+# On a self-hosted runner labelled `gpu`: Linux, an NVIDIA GPU with its
+# driver (libcuda), NVRTC (the kernels are compiled at run time, ADR-0003),
+# and a C toolchain for the build. No such runner is registered yet, so a
+# dispatch waits in the queue until one is, and GitHub cancels it after a
+# day. This workflow has never run.
+#
+# It is dispatch-only, and must stay so. This is a public repository: a
+# self-hosted runner that ran pull_request jobs would run a stranger's code
+# on the GPU box. Only someone with write access can dispatch a workflow.
+#
+# WHAT IT ASSERTS
+#
+# `make test-cuda-device`: the device tests with the ignored ones (the
+# transfers, the pinned round trip, NVRTC compile and launch, and the
+# aggregation regression from the T4 session); the compute conformance
+# suite under OXIDE_BACKEND=cuda, which also proves bytes crossed to the
+# device, so equal results cannot come from the CPU fallback; and
+# embedded.rs, the multi-partition net that caught the aggregation bug. The
+# target fails rather than skips when no GPU is visible.
+name: gpu
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+# A second dispatch for the same ref waits; a run already on the device is
+# never cancelled.
+concurrency:
+  group: gpu-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # As in ci.yml: debuginfo adds nothing here and fills the runner's disk.
+  CARGO_PROFILE_DEV_DEBUG: "false"
+
+jobs:
+  cuda:
+    name: cuda (self-hosted gpu)
+    runs-on: [self-hosted, linux, gpu]
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Which device, driver and commit the result is about: STATUS.md's
+      # matrix records a CUDA run by these, and a log without them proves
+      # nothing about any particular machine.
+      - name: Record the device, driver and commit
+        run: |
+          set -euo pipefail
+          nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv
+          echo "commit: ${GITHUB_SHA}"
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+      - name: CUDA suites on the device
+        run: |
+          set -euo pipefail
+          make test-cuda-device 2>&1 | tee cuda-device.log
+      - name: Upload the log
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cuda-device-${{ github.sha }}
+          path: cuda-device.log
+          retention-days: 90
+          if-no-files-found: error

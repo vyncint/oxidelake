@@ -13,7 +13,7 @@ use ratatui::widgets::{
 use oxidelake_core::BackendKind;
 use oxidelake_core::telemetry::OperatorSnapshot;
 
-use crate::model::DashboardModel;
+use crate::model::{ColumnProfile, DashboardModel};
 use crate::state::{AppState, Panel};
 
 /// Human-readable byte count with a binary unit.
@@ -64,6 +64,18 @@ fn panel_block(title: &str, panel: Panel, focused: Panel) -> Block<'static> {
         .border_style(style)
 }
 
+/// The Inspector's height: the ten lines [`render_inspector`] draws for an
+/// operator, and its border. As 45% of the body it had eight lines at 24
+/// rows, which cut the last two — H2D / D2H and the CPU-fallback count, the
+/// line that tells a GPU run from a silent CPU one (#32) — below 28 rows
+/// (#122).
+const INSPECTOR_HEIGHT: u16 = 12;
+
+/// The Telemetry panel's: three two-row gauges, three lines under them and
+/// the border. As 45% of the body it cut the last line, which says whether
+/// the gauges can move at all (#25), below 26 rows (#122).
+const TELEMETRY_HEIGHT: u16 = 11;
+
 /// Draws the whole dashboard into `frame`.
 pub fn render(state: &AppState, model: &DashboardModel, frame: &mut Frame<'_>) {
     let area = frame.area();
@@ -75,10 +87,16 @@ pub fn render(state: &AppState, model: &DashboardModel, frame: &mut Frame<'_>) {
     .areas(area);
     let [left, right] =
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(body);
-    let [plan_area, inspector_area] =
-        Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(left);
-    let [telemetry_area, describe_area] =
-        Layout::vertical([Constraint::Percentage(45), Constraint::Percentage(55)]).areas(right);
+    let [plan_area, inspector_area] = Layout::vertical([
+        Constraint::Percentage(55),
+        Constraint::Min(INSPECTOR_HEIGHT),
+    ])
+    .areas(left);
+    let [telemetry_area, describe_area] = Layout::vertical([
+        Constraint::Min(TELEMETRY_HEIGHT),
+        Constraint::Percentage(55),
+    ])
+    .areas(right);
 
     frame.render_widget(
         Paragraph::new(Line::from(vec![
@@ -309,10 +327,28 @@ fn render_telemetry(state: &AppState, model: &DashboardModel, frame: &mut Frame<
     );
 }
 
-/// Describe's column widths, in header order. Named because the cell
-/// formatters below have to agree with the layout: ratatui clips a cell that
-/// overflows its column, and for a number that silently changes its value.
-const DESCRIBE_WIDTHS: [u16; 8] = [8, 8, 7, 7, 7, 6, 6, 6];
+/// Describe's columns in header order, each with the most cells it may take.
+/// A cell longer than that is fitted to it before anything is measured — a
+/// number rounded, never cut (#18), text marked with `…` — because ratatui
+/// clips a cell that overflows its column, and for a number that silently
+/// changes its value.
+const DESCRIBE_COLUMNS: [(&str, usize); 8] = [
+    ("column", 8),
+    ("type", 8),
+    ("min", 7),
+    ("max", 7),
+    ("nulls", 7),
+    ("p25", 6),
+    ("p50", 6),
+    ("p99", 6),
+];
+
+/// Which columns Describe keeps when the panel cannot hold them all, most
+/// important first, as indices into [`DESCRIBE_COLUMNS`]: the null count, the
+/// range, the median, the type, then the outer percentiles. The column name
+/// is not listed because it is always shown: a row of numbers is meaningless
+/// without it.
+const DESCRIBE_PRIORITY: [usize; 7] = [4, 2, 3, 6, 1, 7, 5];
 
 /// Drops a decimal fraction's trailing zeros, and the point left behind.
 fn trim_zeros(rendered: &str) -> String {
@@ -343,8 +379,13 @@ fn fit_text(raw: &str, width: usize) -> String {
 /// Describe has, that printed `197999`: an order of magnitude low, and below
 /// the median displayed above it, with nothing to show it had been cut. So a
 /// value that already fits is kept exactly as the query rendered it, and
-/// anything longer is *rounded* to the most decimals that fit, falling back to
-/// an exponent form when even the integer part is too wide.
+/// anything longer is *rounded*: of the fixed-point and exponent forms that
+/// fit, the one closest to the value, fixed-point with the most decimals on a
+/// tie. Taking the first fixed-point form that fit, as this did, rounded a
+/// small value to the decimals there was room for — `-0.000012345678` in
+/// seven columns printed `-0`, a different number rather than a shorter one
+/// (#122); it is `-1.2e-5` now. A form as far from the value as zero is never
+/// taken: with no room for any other, the number is cut visibly, with `…`.
 fn fit_number(raw: &str, width: usize) -> String {
     if raw.chars().count() <= width {
         return raw.to_owned();
@@ -355,51 +396,123 @@ fn fit_number(raw: &str, width: usize) -> String {
     if !value.is_finite() {
         return fit_text(raw, width);
     }
-    for precision in (0..=3).rev() {
-        let candidate = trim_zeros(&format!("{value:.precision$}"));
-        if candidate.chars().count() <= width {
-            return candidate;
-        }
-    }
-    for precision in (0..=2).rev() {
-        let candidate = format!("{value:.precision$e}");
-        if candidate.chars().count() <= width {
-            return candidate;
-        }
-    }
-    fit_text(raw, width)
+    let error = |candidate: &String| {
+        candidate.parse::<f64>().map_or(f64::INFINITY, |shown| {
+            if value == 0.0 {
+                shown.abs()
+            } else {
+                ((shown - value) / value).abs()
+            }
+        })
+    };
+    let fixed = (0..=3)
+        .rev()
+        .map(|precision| trim_zeros(&format!("{value:.precision$}")));
+    let exponent = (0..=2)
+        .rev()
+        .map(|precision| format!("{value:.precision$e}"));
+    fixed
+        .chain(exponent)
+        .filter(|candidate| candidate.chars().count() <= width)
+        // Zero is 100% off any value but zero.
+        .filter(|candidate| value == 0.0 || error(candidate) < 1.0)
+        // `min_by` keeps the first of equal candidates.
+        .min_by(|a, b| error(a).total_cmp(&error(b)))
+        .unwrap_or_else(|| fit_text(raw, width))
 }
 
 fn render_describe(state: &AppState, model: &DashboardModel, frame: &mut Frame<'_>, area: Rect) {
-    let header =
-        Row::new(["column", "type", "min", "max", "nulls", "p25", "p50", "p99"].map(Cell::from))
-            .style(Style::default().add_modifier(Modifier::BOLD));
-    let rows: Vec<Row<'_>> = model
-        .profiles
+    let cells: Vec<[String; 8]> = model.profiles.iter().map(describe_cells).collect();
+    let inside = Block::default().borders(Borders::ALL).inner(area).width;
+    let shown = describe_columns(&cells, usize::from(inside));
+    let hidden: Vec<&str> = DESCRIBE_COLUMNS
         .iter()
-        .map(|p| {
-            let w = DESCRIBE_WIDTHS.map(usize::from);
-            Row::new(vec![
-                Cell::from(fit_text(&p.name, w[0])),
-                Cell::from(fit_text(&p.data_type, w[1])),
-                Cell::from(fit_number(&p.min, w[2])),
-                Cell::from(fit_number(&p.max, w[3])),
-                Cell::from(fit_number(&p.null_count.to_string(), w[4])),
-                Cell::from(fit_number(&p.p25, w[5])),
-                Cell::from(fit_number(&p.p50, w[6])),
-                Cell::from(fit_number(&p.p99, w[7])),
-            ])
-        })
+        .enumerate()
+        .filter(|(index, _)| !shown.iter().any(|(column, _)| column == index))
+        .map(|(_, (header, _))| *header)
         .collect();
-    let widths = DESCRIBE_WIDTHS.map(Constraint::Length);
+    let title = if hidden.is_empty() {
+        "Describe".to_owned()
+    } else {
+        format!("Describe (hidden: {})", hidden.join(" "))
+    };
+    let header = Row::new(
+        shown
+            .iter()
+            .map(|&(column, _)| Cell::from(DESCRIBE_COLUMNS[column].0)),
+    )
+    .style(Style::default().add_modifier(Modifier::BOLD));
+    let rows = cells.iter().map(|row| {
+        Row::new(
+            shown
+                .iter()
+                .map(|&(column, _)| Cell::from(row[column].as_str())),
+        )
+    });
+    let widths = shown.iter().map(|&(_, width)| Constraint::Length(width));
     frame.render_widget(
-        Table::new(rows, widths).header(header).block(panel_block(
-            "Describe",
-            Panel::Describe,
-            state.panel(),
-        )),
+        Table::new(rows, widths)
+            .header(header)
+            .column_spacing(1)
+            .block(panel_block(&title, Panel::Describe, state.panel())),
         area,
     );
+}
+
+/// One profile's cells in [`DESCRIBE_COLUMNS`] order, each fitted to its
+/// column's cap.
+fn describe_cells(profile: &ColumnProfile) -> [String; 8] {
+    let cap = DESCRIBE_COLUMNS.map(|(_, cap)| cap);
+    [
+        fit_text(&profile.name, cap[0]),
+        fit_text(&profile.data_type, cap[1]),
+        fit_number(&profile.min, cap[2]),
+        fit_number(&profile.max, cap[3]),
+        fit_number(&profile.null_count.to_string(), cap[4]),
+        fit_number(&profile.p25, cap[5]),
+        fit_number(&profile.p50, cap[6]),
+        fit_number(&profile.p99, cap[7]),
+    ]
+}
+
+/// Which Describe columns fit in `width` cells, and how wide each is, as
+/// `(index into DESCRIBE_COLUMNS, width)` in header order.
+///
+/// The table used to ask for 62 cells whatever it held, which only a
+/// terminal 128 columns wide could give it. Narrower, ratatui squeezed every
+/// column below the width its cells had been fitted to and cut them with no
+/// mark: at 80x24 the demo's 76923 nulls printed as `769`, and the README's
+/// 1M-row table's largest `id`, 999999, as `9999` (#122). A column is now as
+/// wide as its header or its widest cell, and when they do not all fit, the
+/// panel keeps whole columns in [`DESCRIBE_PRIORITY`] order and the title
+/// names the rest: a value is never cut to make room.
+///
+/// Each column is kept if it still fits once every more important one has
+/// been placed. Dropping the least important columns until the rest fit
+/// would hide one that has room: at 80x24 the demo's p25 (four cells) would
+/// go before p99 (six), and then p99 too, though without p99 it fits.
+fn describe_columns(cells: &[[String; 8]], width: usize) -> Vec<(usize, u16)> {
+    let natural: [usize; 8] = std::array::from_fn(|column| {
+        cells
+            .iter()
+            .map(|row| row[column].chars().count())
+            .fold(DESCRIBE_COLUMNS[column].0.len(), usize::max)
+    });
+    let mut shown = vec![0];
+    let mut used = natural[0];
+    for column in DESCRIBE_PRIORITY {
+        // One cell between columns, as `Table::column_spacing(1)` draws it.
+        let needs = natural[column] + 1;
+        if used + needs <= width {
+            shown.push(column);
+            used += needs;
+        }
+    }
+    shown.sort_unstable();
+    shown
+        .into_iter()
+        .map(|column| (column, u16::try_from(natural[column]).unwrap_or(u16::MAX)))
+        .collect()
 }
 
 #[cfg(test)]
@@ -472,6 +585,23 @@ mod tests {
         }
     }
 
+    /// The first fixed-point form that fit used to win, and for a small value
+    /// that is zero: `-0.000012345678` in seven columns printed `-0`.
+    #[test]
+    fn a_small_value_is_never_rounded_to_zero() {
+        assert_eq!(fit_number("-0.000012345678", 7), "-1.2e-5");
+        assert_eq!(fit_number("0.000012345678", 7), "1.23e-5");
+        assert_eq!(fit_number("0.0005000000001", 5), "5e-4");
+        // No exponent form fits in four: the cut is marked instead.
+        assert_eq!(fit_number("-0.000012345678", 4), "-0.…");
+        for raw in ["-0.000012345678", "0.000012345678", "0.00049", "-0.0005"] {
+            for width in 4..=8 {
+                let cell = fit_number(raw, width);
+                assert_ne!(num(&cell), 0.0, "{raw:?} in {width} columns is {cell:?}");
+            }
+        }
+    }
+
     #[test]
     fn text_too_long_is_marked_as_shortened() {
         assert_eq!(fit_text("FixedSizeList(8 x Float32)", 8), "FixedSi…");
@@ -488,8 +618,48 @@ mod tests {
     }
 
     #[test]
-    fn every_describe_column_has_a_width() {
-        assert_eq!(DESCRIBE_WIDTHS.len(), 8, "one width per Describe column");
+    fn every_describe_column_but_the_name_has_a_priority_once() {
+        let mut order = DESCRIBE_PRIORITY.to_vec();
+        order.sort_unstable();
+        assert_eq!(order, (1..DESCRIBE_COLUMNS.len()).collect::<Vec<_>>());
+    }
+
+    fn row(cells: [&str; 8]) -> [String; 8] {
+        cells.map(str::to_owned)
+    }
+
+    #[test]
+    fn describe_columns_are_as_wide_as_their_widest_cell() {
+        let cells = [row([
+            "v", "Float64", "0.0", "24.0", "76923", "6.0", "12.0", "23.75",
+        ])];
+        let all: Vec<(usize, u16)> = [6, 7, 3, 4, 5, 3, 4, 5].into_iter().enumerate().collect();
+        // 37 cells of content and seven gaps.
+        assert_eq!(describe_columns(&cells, 44), all);
+        // One cell short, and the least important column goes.
+        let without_p25: Vec<(usize, u16)> = all.iter().copied().filter(|&(c, _)| c != 5).collect();
+        assert_eq!(describe_columns(&cells, 43), without_p25);
+    }
+
+    #[test]
+    fn describe_keeps_columns_by_priority_and_always_the_name() {
+        let cells = [row([
+            "v", "Float64", "0.0", "24.0", "76923", "6.0", "12.0", "23.75",
+        ])];
+        let names = |width| {
+            describe_columns(&cells, width)
+                .into_iter()
+                .map(|(column, _)| DESCRIBE_COLUMNS[column].0)
+                .collect::<Vec<_>>()
+        };
+        // The 80x24 panel: 38 cells inside the border. p99 (six cells with
+        // its gap) does not fit; p25 (four) then does, and is shown.
+        assert_eq!(
+            names(38),
+            ["column", "type", "min", "max", "nulls", "p25", "p50"]
+        );
+        assert_eq!(names(29), ["column", "min", "max", "nulls", "p50"]);
+        assert_eq!(names(0), ["column"]);
     }
 
     #[test]

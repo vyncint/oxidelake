@@ -27,7 +27,7 @@ Acceptance
 
 Deliverables
 - [x] `oxidelake-core`: `EngineError` (Io, Allocation, Device, Execution, Plan, Format, Unsupported…), `DeviceId`, `BackendKind`, `BufferLayout`, `BatchStream`, `TelemetryHub`
-- [x] `oxidelake-memory`: `AlignedBuf` (64/128 B), pinned host allocation via cudarc with observable `MemoryClass::{Pinned, Pageable}` fallback, Metal shared buffers (macOS), `SpillManager` (3 tiers, watermarks, LRU/clock, async demote/promote to Arrow IPC spill files, metrics)
+- [x] `oxidelake-memory`: `AlignedBuf` (64/128 B), pinned host allocation via cudarc with observable `MemoryClass::{Pinned, Pageable}` fallback, Metal shared buffers (macOS), `SpillManager` (3 tiers, byte budgets, least-recently-touched demotion inline when a tier goes over budget, promotion from disk on read, Arrow IPC spill files, tier and spill counters; no watermarks, background demotion or throughput metric)
 - [x] `oxidelake-device`: object-safe sync `GpuBackend`; `CpuBackend` fully functional; `CudaBackend` with the NVRTC pipeline wired; `MetalBackend` with runtime MSL compile; `HardwareDetector` with `OXIDE_BACKEND` override
 
 Acceptance

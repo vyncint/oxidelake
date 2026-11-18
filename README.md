@@ -8,7 +8,7 @@
 
 A GPU-accelerated, Arrow-native distributed analytical query engine, written in Rust. It reads and writes Parquet on object storage; a catalog, a metastore and transactions are out of scope, so it is a query engine over a lake rather than a lakehouse in the full sense.
 
-**Status: internal phases 0–7 complete; published 0.2.0. Production readiness is milestone v0.2.0, and 0.2.0 did not finish it** — ten [Phase 8](docs/roadmap.md) lines remain open, three of them needing a CUDA device to verify on. What 0.2.0 does add is the ability to tell what a deployment is actually doing: a CPU-fallback counter, placement notes under `oxide explain`, query spans, a per-query log line and a Prometheus endpoint. The default build is pure CPU and the whole gate is green on Linux x86_64 and macOS arm64. Both GPU backends have executed on real hardware: **Metal** on Apple silicon (conformance-tested against stock DataFusion on an M4 Pro) and **CUDA** on an NVIDIA T4 since 2026-09-06, where every kernel was NVRTC-compiled and launched — and where a correctness bug in the aggregation kernel was found. [STATUS.md](STATUS.md) holds the verification matrix, component by component, and is the ledger ADR-0012 makes it. The specification the engine was built to is [docs/SPEC.md](docs/SPEC.md).
+**Status: internal phases 0–7 complete; published 0.2.0. Production readiness is milestone v0.2.0, and 0.2.0 did not finish it** — ten [Phase 8](https://github.com/vyncint/oxidelake/blob/main/docs/roadmap.md) lines remain open, three of them needing a CUDA device to verify on. What 0.2.0 does add is the ability to tell what a deployment is actually doing: a CPU-fallback counter, placement notes under `oxide explain`, query spans, a per-query log line and a Prometheus endpoint. The default build is pure CPU and the whole gate is green on Linux x86_64 and macOS arm64. Both GPU backends have executed on real hardware: **Metal** on Apple silicon (conformance-tested against stock DataFusion on an M4 Pro) and **CUDA** on an NVIDIA T4 since 2026-09-06, where every kernel was NVRTC-compiled and launched — and where a correctness bug in the aggregation kernel was found. [STATUS.md](https://github.com/vyncint/oxidelake/blob/main/STATUS.md) holds the verification matrix, component by component, and is the ledger ADR-0012 makes it. The specification the engine was built to is [docs/SPEC.md](https://github.com/vyncint/oxidelake/blob/main/docs/SPEC.md).
 
 ## Install
 
@@ -113,7 +113,7 @@ an opinion. A NULL feature vector scores NULL, and so does one with a NULL
 element: no number is made up to stand in for the missing value. The
 CPU-only execution, and why this is a UDF rather than an operator, are
 recorded in
-[ADR-0015](docs/decisions/ADR-0015-in-database-inference-at-the-udf-layer.md).
+[ADR-0015](https://github.com/vyncint/oxidelake/blob/main/docs/decisions/ADR-0015-in-database-inference-at-the-udf-layer.md).
 
 `--target cpu|cuda|metal` picks the *placement* target; execution always uses the hardware that is present (operators planned for an absent GPU take the per-batch CPU path — exactly what cluster executors do with a scheduler's plan).
 
@@ -129,7 +129,7 @@ OXIDE_CLUSTER_BACKEND=cuda ./target/release/oxide-scheduler --port 50050 &
 
 The end-to-end test in `crates/oxidelake-runtime/tests/cli.rs` spawns exactly this topology on ephemeral ports and asserts the cluster output is byte-identical to embedded mode.
 
-A scheduler admits only workers of its own build: the same OxideLake release, built with `predict` if and only if the scheduler is. `cuda` and `metal` do not count, so a default-build scheduler with `--features cuda` workers is a supported cluster. A worker of another build is refused when it registers and exits non-zero naming both builds, and a query sent to a cluster whose workers were all refused fails at once with the same reason. The check guards against a mismatched deployment, not against an attacker: a worker declares its own build ([SECURITY.md](SECURITY.md)).
+A scheduler admits only workers of its own build: the same OxideLake release, built with `predict` if and only if the scheduler is. `cuda` and `metal` do not count, so a default-build scheduler with `--features cuda` workers is a supported cluster. A worker of another build is refused when it registers and exits non-zero naming both builds, and a query sent to a cluster whose workers were all refused fails at once with the same reason. The check guards against a mismatched deployment, not against an attacker: a worker declares its own build ([SECURITY.md](https://github.com/vyncint/oxidelake/blob/main/SECURITY.md)).
 
 ### DataFrame API
 
@@ -225,40 +225,42 @@ error, never a silent fallback.
 
 | Path | Purpose |
 |---|---|
-| [`crates/oxidelake-core`](crates/oxidelake-core) | `EngineError`, `BackendKind`, operator parameter types, `TelemetryHub` |
-| [`crates/oxidelake-memory`](crates/oxidelake-memory) | 64/128-byte-aligned buffers, pinned/UMA allocators, 3-tier `SpillManager` (a library: no query path registers batches with it in 0.x — see [architecture](docs/architecture.md#memory-model-and-spill-tiers)), Arrow IPC codec |
-| [`crates/oxidelake-device`](crates/oxidelake-device) | object-safe `GpuBackend`; CPU reference, CUDA (NVRTC) and Metal (MSL) backends; `HardwareDetector` |
-| [`crates/oxidelake-compute`](crates/oxidelake-compute) | the four `Gpu*Exec` operators, per-batch CPU fallback, `l2_distance`/`cosine_distance` UDFs, conformance suite |
-| [`crates/oxidelake-storage`](crates/oxidelake-storage) | Parquet writer/pruning config with *proofs*, Arrow IPC spill files, io_uring `ObjectStore` (Linux — implemented and conformance-tested, not yet used by sessions), `gen-data` generator |
-| [`crates/oxidelake-planner`](crates/oxidelake-planner) | `HardwarePlacementRule` (+ vector-distance lowering before projection pushdown), `OxidePhysicalCodec` |
-| [`crates/oxidelake-runtime`](crates/oxidelake-runtime) | `OxideSession` (embedded + Ballista cluster), scheduler/worker wrappers, the `oxide` CLI, dashboard builder |
-| [`crates/oxidelake-tui`](crates/oxidelake-tui) | ratatui dashboard, `TestBackend` snapshots and termlens PTY tests |
-| [`crates/oxidelake-api`](crates/oxidelake-api) | `OxideFrame` fluent DataFrame API and prelude |
-| [`crates/oxidelake-device/kernels/`](crates/oxidelake-device/kernels) | CUDA C (`.cu`, NVRTC at runtime) and MSL (`.metal`, `newLibraryWithSource`) sources — inside the device crate so the published crate is self-contained (`include_str!` cannot reach outside a crate's directory at publish time; ADR-0016) |
-| [`docs/`](docs) | [roadmap](docs/roadmap.md) · [architecture](docs/architecture.md) · [dependencies](docs/dependencies.md) · [verification](docs/verification.md) · [ADRs](docs/decisions/README.md) |
-| [`docs/SPEC.md`](docs/SPEC.md) | The executable spec the build agent executed, phase by phase |
-| [`STATUS.md`](STATUS.md) | What is done, how it was verified, what was deferred — the honesty ledger |
-| [`Makefile`](Makefile) · [`deny.toml`](deny.toml) | `make gate` and friends; supply-chain policy for `cargo deny` |
+| [`crates/oxidelake-core`](https://github.com/vyncint/oxidelake/tree/main/crates/oxidelake-core) | `EngineError`, `BackendKind`, operator parameter types, `TelemetryHub` |
+| [`crates/oxidelake-memory`](https://github.com/vyncint/oxidelake/tree/main/crates/oxidelake-memory) | 64/128-byte-aligned buffers, pinned/UMA allocators, 3-tier `SpillManager` (a library: no query path registers batches with it in 0.x — see [architecture](https://github.com/vyncint/oxidelake/blob/main/docs/architecture.md#memory-model-and-spill-tiers)), Arrow IPC codec |
+| [`crates/oxidelake-device`](https://github.com/vyncint/oxidelake/tree/main/crates/oxidelake-device) | object-safe `GpuBackend`; CPU reference, CUDA (NVRTC) and Metal (MSL) backends; `HardwareDetector` |
+| [`crates/oxidelake-compute`](https://github.com/vyncint/oxidelake/tree/main/crates/oxidelake-compute) | the four `Gpu*Exec` operators, per-batch CPU fallback, `l2_distance`/`cosine_distance` UDFs, conformance suite |
+| [`crates/oxidelake-storage`](https://github.com/vyncint/oxidelake/tree/main/crates/oxidelake-storage) | Parquet writer/pruning config with *proofs*, Arrow IPC spill files, io_uring `ObjectStore` (Linux — implemented and conformance-tested, not yet used by sessions), `gen-data` generator |
+| [`crates/oxidelake-planner`](https://github.com/vyncint/oxidelake/tree/main/crates/oxidelake-planner) | `HardwarePlacementRule` (+ vector-distance lowering before projection pushdown), `OxidePhysicalCodec` |
+| [`crates/oxidelake-runtime`](https://github.com/vyncint/oxidelake/tree/main/crates/oxidelake-runtime) | `OxideSession` (embedded + Ballista cluster), scheduler/worker wrappers, the `oxide` CLI, dashboard builder |
+| [`crates/oxidelake-tui`](https://github.com/vyncint/oxidelake/tree/main/crates/oxidelake-tui) | ratatui dashboard, `TestBackend` snapshots and termlens PTY tests |
+| [`crates/oxidelake-api`](https://github.com/vyncint/oxidelake/tree/main/crates/oxidelake-api) | `OxideFrame` fluent DataFrame API and prelude |
+| [`crates/oxidelake-device/kernels/`](https://github.com/vyncint/oxidelake/tree/main/crates/oxidelake-device/kernels) | CUDA C (`.cu`, NVRTC at runtime) and MSL (`.metal`, `newLibraryWithSource`) sources — inside the device crate so the published crate is self-contained (`include_str!` cannot reach outside a crate's directory at publish time; ADR-0016) |
+| [`docs/`](https://github.com/vyncint/oxidelake/tree/main/docs) | [roadmap](https://github.com/vyncint/oxidelake/blob/main/docs/roadmap.md) · [architecture](https://github.com/vyncint/oxidelake/blob/main/docs/architecture.md) · [dependencies](https://github.com/vyncint/oxidelake/blob/main/docs/dependencies.md) · [verification](https://github.com/vyncint/oxidelake/blob/main/docs/verification.md) · [ADRs](https://github.com/vyncint/oxidelake/blob/main/docs/decisions/README.md) |
+| [`docs/SPEC.md`](https://github.com/vyncint/oxidelake/blob/main/docs/SPEC.md) | The executable spec the build agent executed, phase by phase |
+| [`STATUS.md`](https://github.com/vyncint/oxidelake/blob/main/STATUS.md) | What is done, how it was verified, what was deferred — the honesty ledger |
+| [`Makefile`](https://github.com/vyncint/oxidelake/blob/main/Makefile) · [`deny.toml`](https://github.com/vyncint/oxidelake/blob/main/deny.toml) | `make gate` and friends; supply-chain policy for `cargo deny` |
 
 ## Verification
 
 Every change lands behind `required-green` and `commit-policy`. `make gate`
 runs formatting, feature-specific Clippy, the test suites, all-feature rustdoc,
 dependency-coherence and supply-chain checks, plus release and CI script tests.
-[CI](.github/workflows/ci.yml) separates the Linux feature tests and checks the
-MSRV; macOS runs Metal and PTY tests and executes conformance when a Metal
-device exists. Dependency caching reuses compilation while tests still run;
-release CI retains a clean full gate. Known documentation-only changes may
-skip Rust jobs under the tested [verification policy](docs/verification.md).
+[CI](https://github.com/vyncint/oxidelake/blob/main/.github/workflows/ci.yml)
+separates the Linux feature tests and checks the MSRV; macOS runs Metal and
+PTY tests and executes conformance when a Metal device exists. Dependency
+caching reuses compilation while tests still run; release CI retains a clean
+full gate. Known documentation-only changes may skip Rust jobs under the
+tested [verification policy](https://github.com/vyncint/oxidelake/blob/main/docs/verification.md).
 The honesty rule applies throughout: nothing is claimed as working unless it
 ran; GPU paths that only compiled are recorded as exactly that in
-[STATUS.md](STATUS.md). The 2026-09-02 security and performance audit, with
-every finding's status, is in [docs/audit-2026-09-02.md](docs/audit-2026-09-02.md).
+[STATUS.md](https://github.com/vyncint/oxidelake/blob/main/STATUS.md). The
+2026-09-02 security and performance audit, with every finding's status, is in
+[docs/audit-2026-09-02.md](https://github.com/vyncint/oxidelake/blob/main/docs/audit-2026-09-02.md).
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the workflow (`make help` lists every target), [SECURITY.md](SECURITY.md) for the trust model and how to report vulnerabilities, and [CHANGELOG.md](CHANGELOG.md) for what changed.
+See [CONTRIBUTING.md](https://github.com/vyncint/oxidelake/blob/main/CONTRIBUTING.md) for the workflow (`make help` lists every target), [SECURITY.md](https://github.com/vyncint/oxidelake/blob/main/SECURITY.md) for the trust model and how to report vulnerabilities, and [CHANGELOG.md](https://github.com/vyncint/oxidelake/blob/main/CHANGELOG.md) for what changed.
 
 ## License
 
-Apache-2.0 — see [LICENSE](LICENSE).
+Apache-2.0 — see [LICENSE](https://github.com/vyncint/oxidelake/blob/main/LICENSE).

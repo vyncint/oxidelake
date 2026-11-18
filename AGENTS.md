@@ -35,9 +35,9 @@ lockfile.
 ## Things that will bite you here
 
 - **The default build is pure CPU, and every optional capability is a
-  feature** (ADR-0006): `cuda`, `metal`, `io-uring`, `predict`. A feature that
-  no job builds is a feature that is already broken — add it to `make gate`
-  and to `ci.yml` in the same change that adds it.
+  feature** (ADR-0006): `cuda`, `metal`, `io-uring`, `predict`, `metrics`.
+  A feature that no job builds is a feature that is already broken — add it
+  to `make gate` and to `ci.yml` in the same change that adds it.
 - **The CPU backend is the reference, not a fallback of convenience.** If a
   GPU kernel and the CPU path disagree, the CPU path is right until proven
   otherwise, and the conformance suite is where that is settled.

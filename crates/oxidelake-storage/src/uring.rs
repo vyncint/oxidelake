@@ -96,8 +96,9 @@ fn submit_one(
         if let Err(e) = ring.submit_and_wait(1) {
             if e.kind() == io::ErrorKind::Interrupted {
                 // A signal, not a failure: the SQE is still in flight and the
-                // completion is still coming. This is the path the test in
-                // `tests/uring_signals.rs` drives.
+                // completion is still coming. This is the path
+                // `tests::a_signal_during_the_wait_does_not_abandon_the_completion`
+                // below drives (`make test-io-uring`).
                 continue;
             }
             if failure.is_none() {
