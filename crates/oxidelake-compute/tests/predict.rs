@@ -28,7 +28,8 @@ use datafusion::prelude::SessionContext;
 use oxidelake_compute::{ACTIVATION_KEY, predict_udf};
 use oxmera::Tensor;
 use oxmera::nn::{Linear, Module, Sequential};
-use safetensors::SafeTensors;
+use safetensors::tensor::TensorView;
+use safetensors::{Dtype, SafeTensors};
 
 const IN: usize = 4;
 const HIDDEN: usize = 3;
@@ -560,4 +561,298 @@ async fn four_arguments_are_refused_naming_the_shape() {
         Ok(df) => df.collect().await.expect_err("four arguments").to_string(),
     };
     assert!(err.contains("2 or 3 arguments"), "{err}");
+}
+
+// --- a malformed model file (#96) ------------------------------------------
+
+/// `run`, with the error kept as a value rather than a panic.
+///
+/// Owned arguments so it can be spawned: a panic inside the UDF then fails
+/// that one task, and the test still reaches the assertions that say which
+/// guard gave way.
+async fn try_run(sql: String, path: String) -> Result<Vec<RecordBatch>, String> {
+    let ctx = SessionContext::new();
+    ctx.register_udf(predict_udf());
+    ctx.register_batch("t", batch())
+        .map_err(|e| e.to_string())?;
+    let frame = ctx
+        .sql(&sql.replace("{model}", &path))
+        .await
+        .map_err(|e| e.to_string())?;
+    frame.collect().await.map_err(|e| e.to_string())
+}
+
+/// A model file whose one layer is `0.weight: [rows, 0]` and nothing else.
+///
+/// Zero elements means zero bytes of data, so safetensors accepts the file
+/// whatever `rows` is — the reviewer's was 136 bytes long. What made it
+/// dangerous is that `Linear::new(0, rows)` sizes a bias of `rows` f32s
+/// before a single value is read from the file.
+fn hollow_model(dir: &Path, name: &str, rows: usize) -> String {
+    let path = dir.join(name);
+    let view = TensorView::new(Dtype::F32, vec![rows, 0], &[]).expect("a zero-element view");
+    let metadata = HashMap::from([(ACTIVATION_KEY.to_owned(), "none".to_owned())]);
+    let bytes =
+        safetensors::serialize([("0.weight".to_owned(), view)], Some(metadata)).expect("serialize");
+    assert!(bytes.len() < 256, "the file is tiny: {} bytes", bytes.len());
+    std::fs::write(&path, bytes).expect("write");
+    path.to_string_lossy().into_owned()
+}
+
+const ONE_ROW: &str = "SELECT predict('{model}', features) AS y FROM t WHERE id = 0";
+
+/// Runs a hollow model, then the same path once the file is fixed, then a
+/// second valid model, and checks all three.
+///
+/// The order of the assertions is the point. "The path loads once the file
+/// is fixed" and "another model still loads" come first, because they are
+/// what a poisoned cache breaks — every later `predict` in the process
+/// answered `model cache poisoned` until a restart. "The malformed file is a
+/// clean error" comes last: it is what the shape check breaks, and checking
+/// it first would hide whether the cache survived.
+async fn malformed_then_valid(dir: &Path, rows: usize) {
+    let hollow = hollow_model(dir, &format!("hollow-{rows}.safetensors"), rows);
+    let first = tokio::spawn(try_run(ONE_ROW.to_owned(), hollow.clone())).await;
+
+    let fixed = two_layer_mlp();
+    save_with_activation(&fixed, Path::new(&hollow), Some("none"));
+    let again = try_run(ONE_ROW.to_owned(), hollow.clone()).await;
+    let (other, other_path) = model_on_disk_with(dir, "other.safetensors", Some("relu"));
+    let elsewhere = try_run(ONE_ROW.to_owned(), other_path).await;
+
+    let input = features()[0].expect("row 0 is not null");
+    for (what, result, model, activation) in [
+        (
+            "the same path, once the file is fixed",
+            &again,
+            &fixed,
+            "none",
+        ),
+        ("another model", &elsewhere, &other, "relu"),
+    ] {
+        let out = result
+            .as_ref()
+            .unwrap_or_else(|e| panic!("{what} must load after a malformed file: {e}"));
+        let got = row_values(&outputs(out, 0), 0);
+        let want = reference(model, &input, activation);
+        for (i, expected) in want.iter().enumerate() {
+            assert!((got[i] - expected).abs() < 1e-5, "{what}, output {i}");
+        }
+    }
+
+    let err = match first {
+        Ok(Err(e)) => e,
+        Ok(Ok(_)) => panic!("a model with [{rows}, 0] weights and no data ran"),
+        Err(e) => panic!("a malformed model file must be an error, not a panic: {e}"),
+    };
+    assert!(err.contains(&hollow), "the error names the file: {err}");
+    assert!(err.contains("cannot fill"), "{err}");
+}
+
+/// `[2^62, 0]`: the bias's byte count overflows `usize`, so nothing can be
+/// allocated even if the bound regresses — which is why this case runs
+/// in-process, on every platform.
+#[tokio::test]
+async fn a_layer_whose_size_overflows_is_an_error_and_predict_keeps_working() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    malformed_then_valid(dir.path(), 1 << 62).await;
+}
+
+/// Set in the child [`a_layer_larger_than_its_file_is_refused_before_allocating`]
+/// spawns, which is the process that may run the malformed load.
+#[cfg(target_os = "linux")]
+const CAPPED_CHILD: &str = "OXIDELAKE_TEST_CAPPED_CHILD";
+
+/// `[2^40, 0]`: a 4 TiB bias, which overflows nothing. Only a bound tied to
+/// the file's own size refuses it, so this is the case that proves there is
+/// one.
+///
+/// Run in a child whose address space is capped at 4 GiB, never in this
+/// process. If the bound ever regresses, `Linear::new` reserves 4 TiB and
+/// then writes zeros into it; on a host with `vm.overcommit_memory = 1` the
+/// reservation succeeds and the writes take the machine down. Inside the cap
+/// the reservation fails instead, and the test reports it. Linux only:
+/// macOS does not enforce `RLIMIT_AS`, so there is no cap to run it under.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_layer_larger_than_its_file_is_refused_before_allocating() {
+    const NAME: &str = "a_layer_larger_than_its_file_is_refused_before_allocating";
+    if std::env::var_os(CAPPED_CHILD).is_some() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        malformed_then_valid(dir.path(), 1 << 40).await;
+        return;
+    }
+    let exe = std::env::current_exe().expect("the test binary");
+    let out = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        // `ulimit -v` counts KiB: 4 GiB, ample for one test and a thousand
+        // times less than the bias.
+        .arg(r#"ulimit -v 4194304 && exec "$0" "$@""#)
+        .arg(exe)
+        .args([NAME, "--exact", "--test-threads=1"])
+        .env(CAPPED_CHILD, "1")
+        .output()
+        .expect("spawn the capped child");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "the capped child failed ({}):\n{stdout}\n{stderr}",
+        out.status
+    );
+    // A filter that matched nothing would pass too.
+    assert!(
+        stdout.contains("1 passed"),
+        "the child ran no test:\n{stdout}"
+    );
+}
+
+// --- NULL elements (#97) ----------------------------------------------------
+
+/// `id` and `features` from rows whose elements may each be NULL, as well as
+/// the row itself.
+fn batch_with_elements(rows: &[Option<[Option<f32>; IN]>]) -> RecordBatch {
+    let mut values = Vec::new();
+    let mut validity = Vec::new();
+    for row in rows {
+        match row {
+            Some(elements) => {
+                values.extend_from_slice(elements);
+                validity.push(true);
+            }
+            None => {
+                values.extend(std::iter::repeat_n(Some(0.0), IN));
+                validity.push(false);
+            }
+        }
+    }
+    let field = Arc::new(Field::new("item", DataType::Float32, true));
+    let list = FixedSizeListArray::new(
+        Arc::clone(&field),
+        IN as i32,
+        Arc::new(Float32Array::from(values)),
+        Some(validity.into()),
+    );
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("features", DataType::FixedSizeList(field, IN as i32), true),
+    ]);
+    RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(Int32Array::from((0..rows.len() as i32).collect::<Vec<_>>())),
+            Arc::new(list),
+        ],
+    )
+    .expect("batch")
+}
+
+/// A NULL element is as missing as a NULL row (#97).
+///
+/// Under a NULL element the values buffer holds whatever the builder left
+/// there — 0.0 from every Arrow builder — and the model used to read it as
+/// data: `[-1.0, NULL, 0.0, 2.0]` scored exactly like `[-1.0, 0.0, 0.0, 2.0]`.
+/// The rows after the NULL ones are checked too, so masking a row cannot
+/// shift where the next one is read from.
+#[tokio::test]
+async fn a_null_element_gives_a_null_output() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (model, path) = model_on_disk(dir.path());
+    let rows = [
+        Some([Some(-1.0), Some(0.0), Some(0.0), Some(2.0)]),
+        Some([Some(-1.0), None, Some(0.0), Some(2.0)]),
+        None,
+        Some([None, None, None, None]),
+        Some([Some(-1.0), Some(3.0), Some(0.0), Some(2.0)]),
+    ];
+    let ctx = SessionContext::new();
+    ctx.register_udf(predict_udf());
+    ctx.register_batch("t", batch_with_elements(&rows))
+        .expect("register");
+    let out = ctx
+        .sql(&format!(
+            "SELECT predict('{path}', features) AS y FROM t ORDER BY id"
+        ))
+        .await
+        .expect("plan")
+        .collect()
+        .await
+        .expect("execute");
+    let y = outputs(&out, 0);
+    assert_eq!(y.len(), rows.len());
+
+    for (row, input) in rows.iter().enumerate() {
+        let complete = input.and_then(|elements| {
+            let mut values = [0.0; IN];
+            for (value, element) in values.iter_mut().zip(elements) {
+                *value = element?;
+            }
+            Some(values)
+        });
+        let Some(values) = complete else {
+            assert!(
+                y.is_null(row),
+                "row {row} ({input:?}) has a NULL in it, so its output is NULL, got {:?}",
+                row_values(&y, row)
+            );
+            continue;
+        };
+        assert!(!y.is_null(row), "row {row} is complete and must score");
+        let want = reference(&model, &values, "relu");
+        let got = row_values(&y, row);
+        for (i, expected) in want.iter().enumerate() {
+            assert!(
+                (got[i] - expected).abs() < 1e-5,
+                "row {row}, output {i}: SQL gave {} and the model gives {expected}",
+                got[i]
+            );
+        }
+    }
+}
+
+// --- message text (#98) -----------------------------------------------------
+
+/// The error `sql` fails with, whether planning or execution refuses it.
+async fn error_of(sql: &str) -> String {
+    let ctx = SessionContext::new();
+    ctx.register_udf(predict_udf());
+    ctx.register_batch("t", batch()).expect("register");
+    match ctx.sql(sql).await {
+        Err(e) => e.to_string(),
+        Ok(df) => df.collect().await.expect_err(sql).to_string(),
+    }
+}
+
+/// Each of these four messages used to carry the source's indentation, runs
+/// of 14 to 22 spaces, where a string literal had lost its `\` line
+/// continuations (#98). Every test above matches a substring, and passed.
+#[tokio::test]
+async fn messages_read_as_written_with_no_runs_of_spaces() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (_, declared) = model_on_disk_with(dir.path(), "declared.safetensors", Some("relu"));
+    let (_, bare) = model_on_disk_with(dir.path(), "bare.safetensors", None);
+    let messages = [
+        error_of(&format!(
+            "SELECT predict('{declared}', features, 'gelu') FROM t"
+        ))
+        .await,
+        error_of(&format!("SELECT predict('{bare}', features) FROM t")).await,
+        error_of("SELECT predict('m', features, 'relu', 'extra') FROM t").await,
+        error_of("SELECT predict('m', features, 1) FROM t").await,
+    ];
+    for message in &messages {
+        assert!(!message.contains("  "), "a run of spaces in: {message}");
+    }
+    // One pinned whole, so the sentence itself is under test and not only
+    // its whitespace.
+    let contradiction = format!(
+        "predict: {declared} declares `{ACTIVATION_KEY}: relu` but the query asks for \
+         'gelu'; the model was trained with one of them, so change the query or the \
+         file rather than running the other"
+    );
+    assert!(
+        messages[0].contains(&contradiction),
+        "expected\n  {contradiction}\nin\n  {}",
+        messages[0]
+    );
 }

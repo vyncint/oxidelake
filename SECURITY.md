@@ -24,7 +24,9 @@ What the project does continuously, enforced by required CI on every change:
   drive the predicate evaluators arbitrarily deep (`MAX_PREDICATE_LEAVES`).
 - **Untrusted input is validated before it becomes a node.** The plan codec
   checks magic, version, column indices, types and dimensions; generated SQL
-  quotes every identifier; a model path given to `predict` must be a constant.
+  quotes every identifier; a model path given to `predict` must be a constant,
+  and the layer shapes in the file it names must fit the tensor data the file
+  holds before anything is allocated (#96).
 - **Dependency policy** (`deny` job): RUSTSEC advisories, a license allow-list,
   banned crates and crates.io-only sources on every PR; weekly grouped
   Dependabot updates that leave the DataFusion/Ballista chain's majors alone.

@@ -91,6 +91,12 @@ impl ExecConfig {
             backend = %backend,
         )
     }
+
+    /// This instance's hub entry, read back as a snapshot — the counters of
+    /// this operator alone, not of every operator that shares its name.
+    pub(crate) fn operator_stats(&self) -> Option<oxidelake_core::telemetry::OperatorSnapshot> {
+        self.stats.get().map(|stats| stats.snapshot())
+    }
 }
 
 pub(crate) fn plan_properties(

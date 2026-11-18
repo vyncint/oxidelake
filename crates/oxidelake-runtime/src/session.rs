@@ -9,10 +9,13 @@ use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::dataframe::DataFrame;
 use datafusion::execution::SessionStateBuilder;
-use datafusion::physical_plan::displayable;
+use datafusion::physical_plan::{ExecutionPlan, collect, displayable};
 use datafusion::prelude::{SessionConfig, SessionContext};
-use oxidelake_compute::{local_backend, oxide_udfs};
-use oxidelake_core::telemetry::{TelemetryHub, TierCapacity};
+use oxidelake_compute::{
+    GpuAggregateExec, GpuFilterExec, GpuHashJoinExec, GpuVectorDistanceExec, local_backend,
+    oxide_udfs,
+};
+use oxidelake_core::telemetry::{OperatorSnapshot, TelemetryHub, TierCapacity};
 use oxidelake_core::{BackendKind, EngineError};
 use oxidelake_planner::{HardwarePlacementRule, physical_optimizer_rules};
 use oxidelake_storage::{
@@ -272,9 +275,13 @@ impl OxideSession {
         let started = Instant::now();
         let frame = self.sql(query).await?;
         let schema = SchemaRef::from(frame.schema().clone());
-        let batches = frame.collect().await?;
+        // `DataFrame::collect` in its two steps, so the plan outlives the
+        // run: its `Gpu*Exec` nodes hold this query's counters.
+        let task_ctx = Arc::new(frame.task_ctx());
+        let plan = frame.create_physical_plan().await?;
+        let batches = collect(Arc::clone(&plan), task_ctx).await?;
         let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-        let operators = self.telemetry.snapshot().operators;
+        let operators = query_operators(&plan);
         let fallback_batches: u64 = operators.iter().map(|o| o.fallback_batches).sum();
         let accelerated = operators.iter().filter(|o| o.backend.is_gpu()).count();
         tracing::info!(
@@ -330,6 +337,34 @@ impl OxideSession {
         }
         out
     }
+}
+
+/// The counters of every `Gpu*Exec` in `plan` that executed, read from the
+/// nodes themselves: one query's operators and no other's (#102).
+///
+/// The session's hub holds every operator the session has run, so the
+/// `query finished` line, which summed it, logged twice the first run's
+/// numbers for the second run of the same query. Nor is a slice of the hub
+/// one query's: two queries running at once register into it interleaved.
+fn query_operators(plan: &Arc<dyn ExecutionPlan>) -> Vec<OperatorSnapshot> {
+    let mut found = Vec::new();
+    let mut pending = vec![Arc::clone(plan)];
+    while let Some(node) = pending.pop() {
+        let stats = if let Some(exec) = node.downcast_ref::<GpuFilterExec>() {
+            exec.operator_stats()
+        } else if let Some(exec) = node.downcast_ref::<GpuHashJoinExec>() {
+            exec.operator_stats()
+        } else if let Some(exec) = node.downcast_ref::<GpuAggregateExec>() {
+            exec.operator_stats()
+        } else if let Some(exec) = node.downcast_ref::<GpuVectorDistanceExec>() {
+            exec.operator_stats()
+        } else {
+            None
+        };
+        found.extend(stats);
+        pending.extend(node.children().into_iter().cloned());
+    }
+    found
 }
 
 impl std::fmt::Debug for OxideSession {
@@ -440,6 +475,92 @@ mod tests {
             capacity.device_bytes
         };
         assert_eq!(absent, None);
+    }
+
+    /// Collects what a `tracing` subscriber writes.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `name=value` out of one formatted log line.
+    fn field(line: &str, name: &str) -> u64 {
+        line.split_whitespace()
+            .find_map(|part| part.strip_prefix(name)?.strip_prefix('='))
+            .unwrap_or_else(|| panic!("no {name} in {line}"))
+            .parse()
+            .unwrap()
+    }
+
+    /// The `query finished` line describes its own query (#102).
+    ///
+    /// It used to sum every operator the session's hub had ever registered,
+    /// so the second run of one query logged twice what the first did:
+    /// `gpu_operators=4 fallback_batches=4` after `2` and `2`.
+    #[tokio::test]
+    async fn the_query_line_counts_only_its_own_operators() {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        // Two filters, each lowered to a `GpuFilterExec` on a GPU target and
+        // run on whatever backend this machine has.
+        let session = OxideSession::local_with_target(BackendKind::Cuda).unwrap();
+        session
+            .ctx()
+            .sql("CREATE TABLE a AS SELECT value AS k, value * 3 AS w FROM generate_series(0, 99)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let query = "SELECT x.k, y.w FROM (SELECT * FROM a WHERE k > 10) x \
+                     JOIN (SELECT * FROM a WHERE w > 30) y ON x.k = y.k";
+        for _ in 0..2 {
+            session.collect(query).await.unwrap();
+        }
+
+        let text = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("query finished"))
+            .collect();
+        let [first, second] = lines[..] else {
+            panic!("expected two query lines:\n{text}");
+        };
+        // The query's own operators are the `Gpu*Exec` nodes of its plan.
+        let plan = session.explain(query).await.unwrap();
+        let planned = plan
+            .lines()
+            .filter(|line| line.trim_start().starts_with("Gpu"))
+            .count();
+        assert!(planned > 0, "nothing was lowered:\n{plan}");
+        assert_eq!(
+            field(first, "gpu_operators"),
+            planned as u64,
+            "{first}\n{plan}"
+        );
+        for name in ["gpu_operators", "fallback_batches", "rows"] {
+            assert_eq!(
+                field(second, name),
+                field(first, name),
+                "{name} of the second run:\n{first}\n{second}"
+            );
+        }
     }
 
     /// The no-argument constructors and `SessionOptions::default()` are the

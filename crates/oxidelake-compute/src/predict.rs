@@ -49,6 +49,14 @@
 //! returned the answer of a linear one. See the module tests for what is
 //! pinned.
 //!
+//! ## NULLs
+//!
+//! A NULL feature vector gives a NULL output, and so does a vector with a
+//! NULL element (#97). A tensor has no NULL, so the only alternative is a
+//! number standing in for the missing value, and the model would turn that
+//! number into a confident score. A query that means a value fills the
+//! element in before calling `predict`.
+//!
 //! ## Cost model
 //!
 //! Models are loaded once per path and cached for the life of the process
@@ -59,7 +67,7 @@
 //! than one per row.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use arrow::array::{Array, FixedSizeListArray, Float32Array};
 use arrow::datatypes::{DataType, Field};
@@ -223,20 +231,33 @@ impl Model {
 /// Process-wide model cache, keyed by path.
 ///
 /// A UDF is invoked per batch, and a scan has many batches; reading and
-/// parsing a weights file each time would dominate every query. The lock is
-/// held across the load, so two batches racing on a cold path do the work
-/// once. It is never invalidated: a model file that changes under a running
-/// process keeps serving the old weights, which is the right default for a
-/// query engine (a plan should not change answers halfway) and the wrong one
-/// for a notebook, so it is stated rather than assumed.
+/// parsing a weights file each time would dominate every query. It is never
+/// invalidated: a model file that changes under a running process keeps
+/// serving the old weights, which is the right default for a query engine (a
+/// plan should not change answers halfway) and the wrong one for a notebook,
+/// so it is stated rather than assumed.
 ///
 /// Keyed by the path *and* the spec: two queries over the same file, one
 /// asserting an activation and one not, must both be checked against the
 /// header rather than the second silently inheriting the first's answer.
+///
+/// **One lock per model, not one for the cache** (#96). The map's lock is
+/// held only to find or add a key's slot, and the slot's lock across that
+/// key's load, so two batches racing on a cold path still do the work once.
+/// The load used to run under the map's lock: a file that made it panic
+/// poisoned the cache, and every later `predict` in the process failed with
+/// `model cache poisoned` until a restart, whatever model it named. Now a
+/// panic can only poison its own slot, which is still empty, so the next
+/// call clears the poison and loads again; and a slow load holds up only the
+/// queries waiting for the same model. A failed load leaves its slot empty,
+/// so a failure is never cached.
 static MODELS: OnceLock<Mutex<ModelCache>> = OnceLock::new();
 
-/// The cache's contents: a loaded model per path and asserted activation.
-type ModelCache = HashMap<(String, ModelSpec), Arc<Model>>;
+/// One model's slot: empty until its first successful load.
+type ModelSlot = Arc<Mutex<Option<Arc<Model>>>>;
+
+/// The cache's contents: a slot per path and asserted activation.
+type ModelCache = HashMap<(String, ModelSpec), ModelSlot>;
 
 fn cache() -> &'static Mutex<ModelCache> {
     MODELS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -247,18 +268,27 @@ fn cache() -> &'static Mutex<ModelCache> {
 /// # Errors
 ///
 /// [`DataFusionError::Execution`] when the file is missing, is not
-/// safetensors, or does not describe a shape [`ModelSpec`] recognizes.
+/// safetensors, does not describe a shape [`ModelSpec`] recognizes, or
+/// declares layers its own data cannot fill.
 pub fn model(path: &str, spec: ModelSpec) -> Result<Arc<Model>> {
-    let mut guard = cache()
-        .lock()
-        .map_err(|_| DataFusionError::Execution(format!("{PREDICT}: model cache poisoned")))?;
-    let key = (path.to_string(), spec);
-    if let Some(found) = guard.get(&key) {
+    // Nothing that can panic runs under the map's lock, so a poisoned guard
+    // would still hold a consistent map.
+    let slot = Arc::clone(
+        cache()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry((path.to_string(), spec))
+            .or_default(),
+    );
+    // A slot is poisoned only by a load that panicked before storing
+    // anything, so what the guard holds is still the truth: no model yet.
+    let mut loaded = slot.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(found) = loaded.as_ref() {
         return Ok(Arc::clone(found));
     }
-    let loaded = Arc::new(load(path, spec)?);
-    guard.insert(key, Arc::clone(&loaded));
-    Ok(loaded)
+    let model = Arc::new(load(path, spec)?);
+    *loaded = Some(Arc::clone(&model));
+    Ok(model)
 }
 
 /// Rebuild the architecture from the tensor names and shapes, then fill it.
@@ -311,12 +341,20 @@ fn resolve_activation(
     let declared = declared_activation(path, bytes)?;
     match (declared, asserted) {
         (Some(declared), Some(asserted)) if declared != asserted => Err(exec(format!(
-            "{PREDICT}: {path} declares `{ACTIVATION_KEY}: {declared}` but the query              asks for '{asserted}'; the model was trained with one of them, so              change the query or the file rather than running the other"
+            "{PREDICT}: {path} declares `{ACTIVATION_KEY}: {declared}` but the query \
+             asks for '{asserted}'; the model was trained with one of them, so \
+             change the query or the file rather than running the other"
         ))),
         (Some(declared), _) => Ok(declared),
         (None, Some(asserted)) => Ok(asserted),
         (None, None) => Err(exec(format!(
-            "{PREDICT}: {path} does not declare `{ACTIVATION_KEY}` in its              safetensors `__metadata__`, so the activation between its Linear              layers is unknown and assuming one would return confident wrong              numbers. Either save the file with that key (`safetensors::serialize`              takes a metadata map; `oxmera::nn::serialize::save` does not write              one as of oxmera 0.5), or state it in the query:              predict('{path}', features, 'relu'). Accepted values: {}",
+            "{PREDICT}: {path} does not declare `{ACTIVATION_KEY}` in its \
+             safetensors `__metadata__`, so the activation between its Linear \
+             layers is unknown and assuming one would return confident wrong \
+             numbers. Either save the file with that key (`safetensors::serialize` \
+             takes a metadata map; `oxmera::nn::serialize::save` does not write \
+             one as of oxmera 0.5), or state it in the query: \
+             predict('{path}', features, 'relu'). Accepted values: {}",
             Activation::names()
         ))),
     }
@@ -349,7 +387,10 @@ fn layer_shapes(path: &str, bytes: &[u8]) -> Result<Vec<(usize, usize)>> {
         .map_err(|e| exec(format!("{PREDICT}: {path} is not a safetensors file: {e}")))?;
 
     let mut by_index: HashMap<usize, (usize, usize)> = HashMap::new();
+    // Tensor ranges are disjoint slices of `bytes`, so the sum cannot overflow.
+    let mut held = 0usize;
     for (name, view) in file.tensors() {
+        held += view.data().len();
         let shape = view.shape();
         let Some((index, "weight")) = name.split_once('.') else {
             continue; // biases and anything else carry no shape information we need
@@ -390,7 +431,39 @@ fn layer_shapes(path: &str, bytes: &[u8]) -> Result<Vec<(usize, usize)>> {
             )));
         }
     }
+    check_parameters_fit(path, &shapes, held)?;
     Ok(shapes)
+}
+
+/// Refuses layers that need more memory than the file holds data for (#96).
+///
+/// `Linear::new(in, out)` allocates an `out × in` weight and an `out` bias
+/// before a single value is read from the file, sized by the header alone.
+/// safetensors checks each tensor's byte length against its shape, but a
+/// shape with a zero in it is zero bytes long whatever its other dimension
+/// says: a 136-byte file declaring `0.weight: [2^40, 0]` asked for a 4 TiB
+/// bias, and `[2^62, 0]` for one whose size overflows `usize` — a panic
+/// inside the model cache's lock until 0.3. A model can never need more
+/// parameters than its file fills, so the tensor data the file holds is the
+/// bound, computed with checked arithmetic before anything is built.
+fn check_parameters_fit(path: &str, shapes: &[(usize, usize)], held: usize) -> Result<()> {
+    let needed = shapes.iter().try_fold(0usize, |total, &(inputs, outputs)| {
+        outputs
+            .checked_mul(inputs)?
+            .checked_add(outputs)?
+            .checked_mul(size_of::<f32>())?
+            .checked_add(total)
+    });
+    let needed = match needed {
+        Some(needed) if needed <= held => return Ok(()),
+        Some(needed) => format!("{needed} bytes"),
+        None => "more bytes than a usize can count".to_owned(),
+    };
+    Err(exec(format!(
+        "{PREDICT}: {path}: its layers need {needed} for f32 parameters and the file \
+         holds {held} bytes of tensor data; a model its file cannot fill is refused \
+         before anything is allocated"
+    )))
 }
 
 fn exec(message: String) -> DataFusionError {
@@ -432,7 +505,8 @@ impl ScalarUDFImpl for PredictUdf {
             [path, features, activation] => (path, features, Some(activation)),
             other => {
                 return Err(DataFusionError::Plan(format!(
-                    "{PREDICT} takes 2 or 3 arguments (model path, features                      [, activation]), got {}",
+                    "{PREDICT} takes 2 or 3 arguments (model path, features \
+                     [, activation]), got {}",
                     other.len()
                 )));
             }
@@ -441,7 +515,8 @@ impl ScalarUDFImpl for PredictUdf {
             && !is_string(activation)
         {
             return Err(DataFusionError::Plan(format!(
-                "{PREDICT}: the third argument is the activation as a string                  ({}), got {activation:?}",
+                "{PREDICT}: the third argument is the activation as a string \
+                 ({}), got {activation:?}",
                 Activation::names()
             )));
         }
@@ -496,7 +571,7 @@ impl ScalarUDFImpl for PredictUdf {
         let activation = activation.as_deref().map(Activation::parse).transpose()?;
         let model = model(&path, ModelSpec::SequentialMlp { activation })?;
         let list = feature_list(features)?;
-        let (values, dim) = feature_values(&list)?;
+        let (elements, dim) = feature_values(&list)?;
         if dim != model.in_features {
             return Err(exec(format!(
                 "{PREDICT}: {path} expects {} features but the column has {dim}",
@@ -508,15 +583,24 @@ impl ScalarUDFImpl for PredictUdf {
         // fed zeros and masked afterwards: the shapes stay rectangular, which
         // is what makes the batched path worth having, and no null ever
         // reaches the model as a number a user could mistake for data.
+        //
+        // That includes a NULL *element* of a vector that is itself not NULL
+        // (#97). The row's validity said nothing about it, so the model read
+        // whatever the values buffer held under it — 0.0 from every Arrow
+        // builder — and `[1.0, NULL]` scored exactly like `[1.0, 0.0]`.
         let rows = args.number_rows;
+        let values = elements.values();
+        let element_nulls = elements.nulls().filter(|nulls| nulls.null_count() > 0);
         let mut flat = vec![0.0f32; rows * dim];
         let mut null = vec![false; rows];
         for row in 0..rows {
-            if list.is_null(row) {
+            let start = usize::try_from(list.value_offset(row)).unwrap_or(0);
+            if list.is_null(row)
+                || element_nulls.is_some_and(|nulls| nulls.slice(start, dim).null_count() > 0)
+            {
                 null[row] = true;
                 continue;
             }
-            let start = usize::try_from(list.value_offset(row)).unwrap_or(0);
             flat[row * dim..(row + 1) * dim].copy_from_slice(&values[start..start + dim]);
         }
 
@@ -603,7 +687,9 @@ fn feature_list(value: &ColumnarValue) -> Result<FixedSizeListArray> {
     }
 }
 
-fn feature_values(list: &FixedSizeListArray) -> Result<(&[f32], usize)> {
+/// The list's elements — the array, not only its values buffer, because the
+/// elements carry their own validity (#97) — and its fixed width.
+fn feature_values(list: &FixedSizeListArray) -> Result<(&Float32Array, usize)> {
     let values = list
         .values()
         .as_any()
@@ -616,7 +702,7 @@ fn feature_values(list: &FixedSizeListArray) -> Result<(&[f32], usize)> {
         })?;
     let dim = usize::try_from(list.value_length())
         .map_err(|_| exec(format!("{PREDICT}: negative list size")))?;
-    Ok((values.values(), dim))
+    Ok((values, dim))
 }
 
 /// The `predict` scalar UDF.

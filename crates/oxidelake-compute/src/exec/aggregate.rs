@@ -175,6 +175,17 @@ impl GpuAggregateExec {
     pub fn input(&self) -> &Arc<dyn ExecutionPlan> {
         &self.input
     }
+
+    /// The counters this instance has reported, or `None` before any of its
+    /// partitions has executed or when it was built without a telemetry hub.
+    ///
+    /// Read from the instance rather than looked up in the hub by name: two
+    /// operators of one name — a self-join's two filters — are two hub
+    /// entries, and only the instance knows which one is its own. The
+    /// dashboard used to merge them by name and show both the sum (#123).
+    pub fn operator_stats(&self) -> Option<oxidelake_core::telemetry::OperatorSnapshot> {
+        self.config.operator_stats()
+    }
 }
 
 /// The input's partitioning with the key renamed to the output column it

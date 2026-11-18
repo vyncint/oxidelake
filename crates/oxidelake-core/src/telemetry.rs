@@ -33,36 +33,89 @@ impl MemoryTier {
     }
 }
 
-/// Live counters for one physical operator instance.
-#[derive(Debug)]
-pub struct OperatorStats {
-    id: usize,
-    name: String,
-    backend: BackendKind,
+/// The counters an operator instance keeps, and that its label set keeps
+/// again for every instance registered under it.
+#[derive(Debug, Default)]
+struct Counters {
     rows_in: AtomicU64,
     rows_out: AtomicU64,
     batches: AtomicU64,
     elapsed_ns: AtomicU64,
     bytes_h2d: AtomicU64,
     bytes_d2h: AtomicU64,
-    memory_bytes: AtomicU64,
     fallback_batches: AtomicU64,
 }
 
+impl Counters {
+    fn record_batch(&self, rows_in: u64, rows_out: u64, elapsed_ns: u64) {
+        self.rows_in.fetch_add(rows_in, Ordering::Relaxed);
+        self.rows_out.fetch_add(rows_out, Ordering::Relaxed);
+        self.batches.fetch_add(1, Ordering::Relaxed);
+        self.elapsed_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+    }
+
+    fn record_transfer(&self, h2d: u64, d2h: u64) {
+        self.bytes_h2d.fetch_add(h2d, Ordering::Relaxed);
+        self.bytes_d2h.fetch_add(d2h, Ordering::Relaxed);
+    }
+
+    fn record_fallback(&self) {
+        self.fallback_batches.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Lifetime counters for one `{operator, backend}` label set (#102).
+///
+/// Every instance registered under the pair adds to them as well as to its
+/// own, and the hub never evicts them, so they only ever grow: an instance
+/// the hub has evicted is still a running operator, and what it records
+/// after that still counts here.
+#[derive(Debug)]
+struct LabelTotals {
+    name: String,
+    backend: BackendKind,
+    counters: Counters,
+}
+
+impl LabelTotals {
+    fn snapshot(&self) -> OperatorTotals {
+        let c = &self.counters;
+        OperatorTotals {
+            name: self.name.clone(),
+            backend: self.backend,
+            rows_in: c.rows_in.load(Ordering::Relaxed),
+            rows_out: c.rows_out.load(Ordering::Relaxed),
+            batches: c.batches.load(Ordering::Relaxed),
+            elapsed_ns: c.elapsed_ns.load(Ordering::Relaxed),
+            bytes_h2d: c.bytes_h2d.load(Ordering::Relaxed),
+            bytes_d2h: c.bytes_d2h.load(Ordering::Relaxed),
+            fallback_batches: c.fallback_batches.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Live counters for one physical operator instance.
+#[derive(Debug)]
+pub struct OperatorStats {
+    id: usize,
+    name: String,
+    backend: BackendKind,
+    counters: Counters,
+    memory_bytes: AtomicU64,
+    /// The totals of this instance's name and backend, which every record
+    /// below also adds to.
+    totals: Arc<LabelTotals>,
+}
+
 impl OperatorStats {
-    fn new(id: usize, name: String, backend: BackendKind) -> Self {
+    fn new(id: usize, totals: Arc<LabelTotals>) -> Self {
         Self {
             id,
-            name,
-            backend,
-            rows_in: AtomicU64::new(0),
-            rows_out: AtomicU64::new(0),
-            batches: AtomicU64::new(0),
-            elapsed_ns: AtomicU64::new(0),
-            bytes_h2d: AtomicU64::new(0),
-            bytes_d2h: AtomicU64::new(0),
+            name: totals.name.clone(),
+            backend: totals.backend,
+            counters: Counters::default(),
             memory_bytes: AtomicU64::new(0),
-            fallback_batches: AtomicU64::new(0),
+            totals,
         }
     }
 
@@ -83,17 +136,15 @@ impl OperatorStats {
 
     /// Records one processed batch.
     pub fn record_batch(&self, rows_in: u64, rows_out: u64, elapsed: Duration) {
-        self.rows_in.fetch_add(rows_in, Ordering::Relaxed);
-        self.rows_out.fetch_add(rows_out, Ordering::Relaxed);
-        self.batches.fetch_add(1, Ordering::Relaxed);
         let ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
-        self.elapsed_ns.fetch_add(ns, Ordering::Relaxed);
+        self.counters.record_batch(rows_in, rows_out, ns);
+        self.totals.counters.record_batch(rows_in, rows_out, ns);
     }
 
     /// Records bytes moved host→device and device→host.
     pub fn record_transfer(&self, h2d: u64, d2h: u64) {
-        self.bytes_h2d.fetch_add(h2d, Ordering::Relaxed);
-        self.bytes_d2h.fetch_add(d2h, Ordering::Relaxed);
+        self.counters.record_transfer(h2d, d2h);
+        self.totals.counters.record_transfer(h2d, d2h);
     }
 
     /// Sets the operator's currently allocated bytes.
@@ -109,28 +160,30 @@ impl OperatorStats {
     /// distinguishes "the GPU ran it" from "something ran it". A batch is
     /// counted once, where the decision is made.
     pub fn record_fallback(&self) {
-        self.fallback_batches.fetch_add(1, Ordering::Relaxed);
+        self.counters.record_fallback();
+        self.totals.counters.record_fallback();
     }
 
     /// Batches that took the CPU reference path.
     pub fn fallback_batches(&self) -> u64 {
-        self.fallback_batches.load(Ordering::Relaxed)
+        self.counters.fallback_batches.load(Ordering::Relaxed)
     }
 
     /// A point-in-time copy of the counters.
     pub fn snapshot(&self) -> OperatorSnapshot {
+        let c = &self.counters;
         OperatorSnapshot {
             id: self.id,
             name: self.name.clone(),
             backend: self.backend,
-            rows_in: self.rows_in.load(Ordering::Relaxed),
-            rows_out: self.rows_out.load(Ordering::Relaxed),
-            batches: self.batches.load(Ordering::Relaxed),
-            elapsed_ns: self.elapsed_ns.load(Ordering::Relaxed),
-            bytes_h2d: self.bytes_h2d.load(Ordering::Relaxed),
-            bytes_d2h: self.bytes_d2h.load(Ordering::Relaxed),
+            rows_in: c.rows_in.load(Ordering::Relaxed),
+            rows_out: c.rows_out.load(Ordering::Relaxed),
+            batches: c.batches.load(Ordering::Relaxed),
+            elapsed_ns: c.elapsed_ns.load(Ordering::Relaxed),
+            bytes_h2d: c.bytes_h2d.load(Ordering::Relaxed),
+            bytes_d2h: c.bytes_d2h.load(Ordering::Relaxed),
             memory_bytes: self.memory_bytes.load(Ordering::Relaxed),
-            fallback_batches: self.fallback_batches.load(Ordering::Relaxed),
+            fallback_batches: c.fallback_batches.load(Ordering::Relaxed),
         }
     }
 }
@@ -180,6 +233,36 @@ impl OperatorSnapshot {
             self.elapsed_ns as f64 / self.batches as f64 / 1_000_000.0
         }
     }
+}
+
+/// The lifetime totals of one operator name and backend: the sum over every
+/// instance the hub has registered under the pair, evicted or cleared ones
+/// included (#102).
+///
+/// These are what [`TelemetrySnapshot::to_prometheus`] exports, because a
+/// counter must never go backwards; the per-instance [`OperatorSnapshot`]s
+/// are what a dashboard pairs with plan nodes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorTotals {
+    /// Operator display name, e.g. `GpuFilterExec`.
+    pub name: String,
+    /// Planned backend.
+    pub backend: BackendKind,
+    /// Input rows.
+    pub rows_in: u64,
+    /// Output rows.
+    pub rows_out: u64,
+    /// Batches processed.
+    pub batches: u64,
+    /// Total processing time in nanoseconds.
+    pub elapsed_ns: u64,
+    /// Bytes copied host→device.
+    pub bytes_h2d: u64,
+    /// Bytes copied device→host.
+    pub bytes_d2h: u64,
+    /// Batches that ran on the CPU reference although the operator was
+    /// placed on a device.
+    pub fallback_batches: u64,
 }
 
 /// Bytes resident per memory tier.
@@ -336,13 +419,22 @@ pub const MAX_PLACEMENT_SKIPS: usize = 256;
 /// and every `Gpu*Exec` instance registers once, so without a bound a
 /// long-lived session would accumulate one entry per operator of every query
 /// it ever ran. Older entries are evicted first; live `OperatorStats` handles
-/// stay valid, they just stop appearing in snapshots.
+/// stay valid, they just stop appearing in [`TelemetrySnapshot::operators`].
+/// What they record still reaches [`TelemetrySnapshot::operator_totals`].
 pub const MAX_OPERATORS: usize = 4096;
 
 /// The engine-wide telemetry hub.
 #[derive(Debug, Default)]
 pub struct TelemetryHub {
     operators: RwLock<VecDeque<Arc<OperatorStats>>>,
+    /// One entry per `{operator, backend}` pair ever registered, in the order
+    /// of first registration, and never evicted (#102). Not bounded like
+    /// `operators`, because it does not grow with queries: the names are the
+    /// four `Gpu*Exec` type names and the backend is an enum, and neither a
+    /// query nor a decoded plan payload can add a pair. A caller that one day
+    /// registers user-supplied names must bound them before they get here,
+    /// as a Prometheus label would need anyway.
+    totals: RwLock<Vec<Arc<LabelTotals>>>,
     next_operator_id: AtomicUsize,
     tiers: TierGauges,
     spill: SpillCounters,
@@ -380,8 +472,9 @@ impl TelemetryHub {
         name: impl Into<String>,
         backend: BackendKind,
     ) -> Arc<OperatorStats> {
+        let totals = self.totals_for(name.into(), backend);
         let id = self.next_operator_id.fetch_add(1, Ordering::Relaxed);
-        let stats = Arc::new(OperatorStats::new(id, name.into(), backend));
+        let stats = Arc::new(OperatorStats::new(id, totals));
         let mut ops = self
             .operators
             .write()
@@ -393,8 +486,31 @@ impl TelemetryHub {
         stats
     }
 
+    /// The totals entry for `name` on `backend`, made on first use. Taken
+    /// and released before the operators lock, so the two locks are never
+    /// held together.
+    fn totals_for(&self, name: String, backend: BackendKind) -> Arc<LabelTotals> {
+        let mut totals = self.totals.write().unwrap_or_else(PoisonError::into_inner);
+        if let Some(found) = totals
+            .iter()
+            .find(|t| t.backend == backend && t.name == name)
+        {
+            return Arc::clone(found);
+        }
+        let fresh = Arc::new(LabelTotals {
+            name,
+            backend,
+            counters: Counters::default(),
+        });
+        totals.push(Arc::clone(&fresh));
+        fresh
+    }
+
     /// Forgets every registered operator (e.g. before running a new query
     /// whose dashboard should not show the previous one's counters).
+    ///
+    /// The lifetime totals stay: they are what `/metrics` exports, and a
+    /// counter a scraper has read must never go back (#102).
     pub fn clear_operators(&self) {
         self.operators
             .write()
@@ -469,6 +585,13 @@ impl TelemetryHub {
             .iter()
             .map(|o| o.snapshot())
             .collect();
+        let operator_totals = self
+            .totals
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(|t| t.snapshot())
+            .collect();
         let plan = self
             .plan
             .read()
@@ -476,6 +599,7 @@ impl TelemetryHub {
             .clone();
         TelemetrySnapshot {
             operators,
+            operator_totals,
             tiers: self.tiers.snapshot(),
             spill: self.spill.snapshot(),
             plan,
@@ -487,8 +611,13 @@ impl TelemetryHub {
 /// Everything the dashboard renders, captured at one instant.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct TelemetrySnapshot {
-    /// Per-operator counters, in registration order.
+    /// Per-operator counters, in registration order: the instances the hub
+    /// still holds (at most [`MAX_OPERATORS`]).
     pub operators: Vec<OperatorSnapshot>,
+    /// Lifetime totals per operator name and backend, in order of first
+    /// registration, unaffected by eviction and by
+    /// [`TelemetryHub::clear_operators`] (#102).
+    pub operator_totals: Vec<OperatorTotals>,
     /// Memory tier gauges.
     pub tiers: TierSnapshot,
     /// Spill counters.
@@ -507,6 +636,15 @@ impl TelemetrySnapshot {
     /// endpoint is not worth a dependency tree in a query engine. Operator
     /// counters carry `operator` and `backend` labels; the tier gauges and
     /// spill counters carry none.
+    ///
+    /// Each label set is one series, read from [`Self::operator_totals`]
+    /// (#102). The hub holds one entry per exec instance, a worker runs one
+    /// per task, and this used to print a line for each: several samples
+    /// under one name and labels, which the exposition format leaves
+    /// undefined and Prometheus settles by keeping one, so a scraped counter
+    /// stopped moving after the first query, then fell when its instance was
+    /// evicted. The totals only ever grow. The memory gauge, which may fall,
+    /// sums the instances in [`Self::operators`].
     ///
     /// Label values are escaped per the exposition format, because an
     /// operator name is `GpuFilterExec` today and a user-supplied string the
@@ -544,23 +682,27 @@ impl TelemetrySnapshot {
         ];
         for (name, help, value) in counters {
             out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} counter\n"));
-            for op in &self.operators {
+            for total in &self.operator_totals {
                 out.push_str(&format!(
                     "{name}{{operator=\"{}\",backend=\"{}\"}} {}\n",
-                    escape_label(&op.name),
-                    op.backend,
-                    value(op)
+                    escape_label(&total.name),
+                    total.backend,
+                    value(total)
                 ));
             }
         }
         out.push_str("# HELP oxide_operator_memory_bytes Currently allocated bytes.\n");
         out.push_str("# TYPE oxide_operator_memory_bytes gauge\n");
-        for op in &self.operators {
+        for total in &self.operator_totals {
+            let bytes = self
+                .operators
+                .iter()
+                .filter(|op| op.backend == total.backend && op.name == total.name)
+                .fold(0u64, |sum, op| sum.saturating_add(op.memory_bytes));
             out.push_str(&format!(
-                "oxide_operator_memory_bytes{{operator=\"{}\",backend=\"{}\"}} {}\n",
-                escape_label(&op.name),
-                op.backend,
-                op.memory_bytes
+                "oxide_operator_memory_bytes{{operator=\"{}\",backend=\"{}\"}} {bytes}\n",
+                escape_label(&total.name),
+                total.backend,
             ));
         }
         let gauges = [
@@ -592,8 +734,8 @@ impl TelemetrySnapshot {
 }
 
 /// One exported operator counter: metric name, HELP text, and how to read it
-/// off a snapshot.
-type OperatorCounter = (&'static str, &'static str, fn(&OperatorSnapshot) -> u64);
+/// off a label set's totals.
+type OperatorCounter = (&'static str, &'static str, fn(&OperatorTotals) -> u64);
 
 /// Escapes a Prometheus label value: backslash, double quote, newline.
 fn escape_label(value: &str) -> String {
@@ -610,6 +752,7 @@ fn escape_label(value: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -643,6 +786,126 @@ mod tests {
                 "{name} has no TYPE"
             );
         }
+    }
+
+    const FILTER_ROWS_IN: &str =
+        "oxide_operator_rows_in_total{operator=\"GpuFilterExec\",backend=\"cuda\"}";
+
+    /// Every value `text` holds for the series `series` (name and labels).
+    fn samples(text: &str, series: &str) -> Vec<u64> {
+        text.lines()
+            .filter_map(|line| line.strip_prefix(series)?.strip_prefix(' '))
+            .map(|value| value.parse().unwrap())
+            .collect()
+    }
+
+    /// One series per label set, carrying the sum over every instance
+    /// (#102). A worker registers an exec instance per task, and the
+    /// exposition printed a line for each: several samples under one name
+    /// and label set, which the format leaves undefined and Prometheus
+    /// settles by keeping one, so a scraped counter stopped moving after the
+    /// first query.
+    #[test]
+    fn instances_with_the_same_labels_are_one_series() {
+        let hub = TelemetryHub::new();
+        for (rows, memory) in [(100, 1_000), (50, 200), (7, 30)] {
+            let op = hub.register_operator("GpuFilterExec", BackendKind::Cuda);
+            op.record_batch(rows, 1, Duration::from_millis(1));
+            op.set_memory_bytes(memory);
+        }
+        hub.register_operator("GpuFilterExec", BackendKind::CpuSimd);
+        hub.register_operator("GpuAggregateExec", BackendKind::Cuda);
+        let text = hub.snapshot().to_prometheus();
+
+        assert_eq!(samples(&text, FILTER_ROWS_IN), [157], "{text}");
+        let filter_memory =
+            "oxide_operator_memory_bytes{operator=\"GpuFilterExec\",backend=\"cuda\"}";
+        assert_eq!(samples(&text, filter_memory), [1_230], "{text}");
+        let cpu_filter = "oxide_operator_rows_in_total{operator=\"GpuFilterExec\",backend=\"cpu\"}";
+        assert_eq!(samples(&text, cpu_filter), [0], "{text}");
+        let mut seen = std::collections::HashSet::new();
+        for line in text.lines().filter(|l| !l.starts_with('#')) {
+            let series = line.rsplit_once(' ').unwrap().0;
+            assert!(seen.insert(series), "{series} appears twice:\n{text}");
+        }
+    }
+
+    /// Counters never go backwards (#102). [`MAX_OPERATORS`] later
+    /// registrations evict the first, and its series used to fall from
+    /// 1000000 to 5: a counter decreasing, which a scraper reads as a
+    /// restart. An evicted handle is still a running operator, so what it
+    /// records afterwards counts too, and clearing the operators for a
+    /// dashboard takes nothing back either.
+    #[test]
+    fn counters_never_go_back_on_eviction_or_clear() {
+        let hub = TelemetryHub::new();
+        let first = hub.register_operator("GpuFilterExec", BackendKind::Cuda);
+        first.record_batch(1_000_000, 10, Duration::from_millis(1));
+        let text = hub.snapshot().to_prometheus();
+        assert_eq!(samples(&text, FILTER_ROWS_IN), [1_000_000], "{text}");
+
+        for _ in 0..MAX_OPERATORS {
+            let op = hub.register_operator("GpuFilterExec", BackendKind::Cuda);
+            op.record_batch(5, 1, Duration::from_millis(1));
+        }
+        assert!(
+            hub.snapshot().operators.iter().all(|o| o.id != first.id()),
+            "the first registration is evicted"
+        );
+        first.record_batch(1, 1, Duration::from_millis(1));
+        let expected = 1_000_000 + 5 * MAX_OPERATORS as u64 + 1;
+        let text = hub.snapshot().to_prometheus();
+        assert_eq!(samples(&text, FILTER_ROWS_IN), [expected], "{text}");
+
+        hub.clear_operators();
+        let text = hub.snapshot().to_prometheus();
+        assert_eq!(samples(&text, FILTER_ROWS_IN), [expected], "{text}");
+    }
+
+    /// One totals entry per name and backend, in the order each pair was
+    /// first registered, and every record of every instance reaches it.
+    #[test]
+    fn totals_sum_every_record_of_every_instance() {
+        let hub = TelemetryHub::new();
+        let a = hub.register_operator("GpuFilterExec", BackendKind::Cuda);
+        let b = hub.register_operator("GpuAggregateExec", BackendKind::Cuda);
+        let c = hub.register_operator("GpuFilterExec", BackendKind::Cuda);
+        hub.register_operator("GpuFilterExec", BackendKind::Metal);
+        a.record_batch(10, 4, Duration::from_nanos(7));
+        a.record_transfer(1, 2);
+        c.record_batch(20, 6, Duration::from_nanos(5));
+        c.record_transfer(64, 32);
+        c.record_fallback();
+        b.record_batch(1, 1, Duration::from_nanos(1));
+
+        let totals = hub.snapshot().operator_totals;
+        let pairs: Vec<_> = totals
+            .iter()
+            .map(|t| (t.name.as_str(), t.backend))
+            .collect();
+        assert_eq!(
+            pairs,
+            [
+                ("GpuFilterExec", BackendKind::Cuda),
+                ("GpuAggregateExec", BackendKind::Cuda),
+                ("GpuFilterExec", BackendKind::Metal),
+            ]
+        );
+        assert_eq!(
+            totals[0],
+            OperatorTotals {
+                name: "GpuFilterExec".into(),
+                backend: BackendKind::Cuda,
+                rows_in: 30,
+                rows_out: 10,
+                batches: 2,
+                elapsed_ns: 12,
+                bytes_h2d: 65,
+                bytes_d2h: 34,
+                fallback_batches: 1,
+            }
+        );
+        assert_eq!((totals[1].rows_in, totals[2].batches), (1, 0));
     }
 
     /// An operator name is a Rust type name today and could be anything

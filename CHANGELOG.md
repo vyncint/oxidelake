@@ -273,6 +273,41 @@ versions (0.x) may contain breaking changes; they are always listed under a
   DataFusion's exchange between them, and each `GpuAggregateExec` declares
   the partitioning of the node it replaces.
 
+- **Breaking: `TelemetrySnapshot` gained a public field, `operator_totals`**
+  (#102): the lifetime totals per operator name and backend, as the new
+  `oxidelake_core::telemetry::OperatorTotals`, which is what
+  `to_prometheus` exports now. A struct literal over `TelemetrySnapshot` no
+  longer compiles; add `operator_totals: Vec::new()`, as the TUI's demo
+  model does.
+
+### Fixed
+
+- **`predict` scores a feature vector with a NULL element as NULL** (#97).
+  Only the vector's own validity was checked, so a NULL element was read
+  from the values buffer as whatever lay there, 0.0 from every Arrow
+  builder: `[1.0, NULL]` scored exactly like `[1.0, 0.0]`. Such a row now
+  returns NULL, as a NULL vector always did. A query that relied on the old
+  number fills the element in before calling `predict`.
+
+- **Four `predict` error messages read as one sentence again** (#98): the
+  activation mismatch, the missing-activation refusal, the argument count
+  and the third argument's type. Their string literals had lost their `\`
+  line continuations, so runs of 14 to 22 spaces from the source's
+  indentation sat in the middle of each message. A script that matched one
+  of them with the runs in it matches single spaces now.
+
+- **`/metrics` reports one series per operator and backend, and its
+  counters never go backwards** (#102). It printed a line for every exec
+  instance, several under the same labels, and Prometheus kept one of them:
+  a scraped counter stopped moving after the first query, then fell (from
+  1000000 to 5 in the reproduction) once that instance was evicted. Each
+  label set is now one series holding the total over every instance the
+  process has run, so a graph or alert on it sees every operator's work.
+  The per-query `INFO` line (`query finished … gpu_operators=…
+  fallback_batches=…`) summed every operator the session had ever run, so
+  the second run of a query logged twice the first's numbers; it now counts
+  that query's operators only.
+
 ### Security
 
 - **thrift is out of the dependency graph** (#4, #54). parquet 59 decodes
@@ -313,6 +348,20 @@ versions (0.x) may contain breaking changes; they are always listed under a
   refuse any length whose padded size exceeds `isize::MAX` bytes with
   `EngineError::Allocation`, in every build profile. No query reached it;
   the public allocation API did.
+
+- **A malformed model file no longer takes `predict` down for the whole
+  process** (#96). A 136-byte safetensors file declaring
+  `0.weight: [2^40, 0]` holds zero bytes of data, which safetensors accepts,
+  and `predict` sized a 4 TiB bias from it before reading a value
+  (`[2^62, 0]` overflowed `usize` instead). Either way the load panicked in the
+  process-wide model-cache lock, and every later `predict` in that process
+  failed with `model cache poisoned` until a restart, whatever model it
+  named; the model path is a SQL argument, so anyone who could run a query
+  could do this to a long-lived worker. Layer shapes are now checked against
+  the tensor data the file holds before anything is allocated, and such a
+  file is refused with an error naming it. The cache also takes one lock per
+  model instead of one for all of them, so a load that fails or panics
+  affects only its own model and is tried again on the next call.
 
 ## [0.2.0] - 2026-09-21
 
