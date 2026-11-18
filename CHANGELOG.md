@@ -253,11 +253,14 @@ versions (0.x) may contain breaking changes; they are always listed under a
   skip `NaN`: an all-`NaN` group reported `MIN = inf`, `MAX = -inf`, values
   that are not in the data, and the sign of a zero result was unspecified.
   The CUDA kernel now reduces the same order on integer keys. **Visible
-  change:** for a group containing `NaN` or a signed zero, a GPU target's
-  answer can differ from `--target cpu`, because stock DataFusion's grouped
-  float `MIN`/`MAX` depends on row order (`MIN` of {1.0, NaN, 3.0} is 3.0
-  there) and lets its starting values through (`MAX` of {-inf} is
-  `f64::MIN`); the GPU target's answer is the order-independent one.
+  change:** for a group containing `NaN`, or both `-0.0` and `0.0`, a GPU
+  target's answer can differ from `--target cpu`, because stock
+  DataFusion's grouped float `MIN`/`MAX` depends on row order (`MIN` of
+  {1.0, NaN, 3.0} is 3.0 there, and of {0.0, -0.0} whichever zero it reads
+  first) and lets its starting values through (`MAX` of {-inf} is
+  `f64::MIN`); the GPU target's answer is the order-independent one, and the
+  one DataFusion's own ungrouped `MIN`/`MAX` gives. A group with one sign of
+  zero gets DataFusion's answer on every target.
 
 - **An `ORDER BY` over an aggregate of sorted input comes back in order
   under a GPU target** (#89). DataFusion aggregates input that is sorted on
