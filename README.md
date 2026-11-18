@@ -129,7 +129,7 @@ OXIDE_CLUSTER_BACKEND=cuda ./target/release/oxide-scheduler --port 50050 &
 
 The end-to-end test in `crates/oxidelake-runtime/tests/cli.rs` spawns exactly this topology on ephemeral ports and asserts the cluster output is byte-identical to embedded mode.
 
-A scheduler admits only workers of its own build: the same OxideLake release, built with `predict` if and only if the scheduler is. `cuda` and `metal` do not count, so a default-build scheduler with `--features cuda` workers is a supported cluster. A worker of another build is refused when it registers and exits non-zero naming both builds, and a query sent to a cluster whose workers were all refused fails at once with the same reason. The check guards against a mismatched deployment, not against an attacker: a worker declares its own build ([SECURITY.md](SECURITY.md)).
+A scheduler admits only workers of its own build: the same OxideLake release, built with `predict` if and only if the scheduler is. `cuda` and `metal` do not count, so a default-build scheduler with `--features cuda` workers is a supported cluster. A worker of another build is refused when it registers and exits non-zero naming both builds, and a query sent to a cluster whose workers were all refused fails at once with the same reason. The check guards against a mismatched deployment, not against an attacker: a worker declares its own build ([SECURITY.md](https://github.com/vyncint/oxidelake/blob/main/SECURITY.md)).
 
 ### DataFrame API
 
