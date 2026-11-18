@@ -106,11 +106,13 @@ test-metal: ## Metal package tests and macOS PTY tests with one dependency graph
 # `--skip termlens_cli` keeps this pass off the network: the graph includes
 # -p oxidelake-tui, whose `termlens_cli` tests are #[ignore]d (so `--ignored`
 # selects them) and install a tool from crates.io. Every test in that file is
-# named with the prefix for exactly this. The conformance suite is what this
-# target is for.
+# named with the prefix for exactly this. `--skip mixed_build` likewise: those
+# #[ignore]d cli tests need the other-build workers that only
+# `make test-mixed-build` builds (it runs them in CI), and fail loudly without
+# them. The conformance suite is what this target is for.
 test-metal-device: ## reuse the Metal test graph for on-device conformance
 	@if swift -e 'import Metal; exit(MTLCreateSystemDefaultDevice() == nil ? 1 : 0)' 2>/dev/null; then \
-	  OXIDE_BACKEND=metal $(CARGO) test $(METAL_TEST_ARGS) -- --ignored --skip termlens_cli; \
+	  OXIDE_BACKEND=metal $(CARGO) test $(METAL_TEST_ARGS) -- --ignored --skip termlens_cli --skip mixed_build; \
 	else \
 	  echo "No Metal device on this runner — on-device conformance skipped."; \
 	fi
