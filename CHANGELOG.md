@@ -332,6 +332,18 @@ versions (0.x) may contain breaking changes; they are always listed under a
   than written through. A process killed mid-write can leave the temporary
   file behind; delete it.
 
+- **The io_uring store's `put` is atomic and answers like
+  `LocalFileSystem`** (#111). `UringLocalFileSystem` truncated the object
+  and rewrote it in place, so a put that failed part way (a full disk, a
+  file size limit) destroyed the object it was replacing, and a put to a
+  path that was a symlink wrote through it to a file outside the store's
+  root. It now writes a staged `<name>#<n>` file beside the object and
+  renames it into place, as `LocalFileSystem` does: the old object stays
+  whole until the new one is, and a symlink is replaced. A put now returns
+  the e_tag `head` reports, where it returned none, and a put with
+  attributes is refused with `NotImplemented`, where they were accepted and
+  dropped.
+
 - **A failed spill-manager insert no longer leaves its batch behind**
   (#115). `SpillManager::insert_host` and `insert_device` registered the
   batch and counted its bytes before evicting to make room, and when the

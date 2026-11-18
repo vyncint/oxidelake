@@ -3,9 +3,11 @@
 //! A dedicated storage thread owns the ring: ranged reads and whole-object
 //! writes are submitted as `IORING_OP_READ` / `IORING_OP_WRITE` and their
 //! completions are bridged back to async callers through `oneshot` channels.
-//! Metadata operations (`list`, `head`, `delete`, `copy`, multipart uploads)
-//! delegate to the wrapped [`LocalFileSystem`], so both stores behave
-//! identically — the shared conformance test in `tests/` runs against both.
+//! A write goes to a staged file beside the object and is renamed over it,
+//! as `LocalFileSystem` does. Metadata operations (`list`, `head`, `delete`,
+//! `copy`, multipart uploads) delegate to the wrapped [`LocalFileSystem`], so
+//! both stores behave identically — the shared conformance test in `tests/`
+//! runs against both.
 //!
 //! Construction fails with a typed error where io_uring is unavailable
 //! (EPERM/ENOSYS in sandboxes, old kernels); callers fall back to
@@ -16,8 +18,10 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::ops::Range;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::UNIX_EPOCH;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -49,8 +53,9 @@ enum Job {
     },
     Write {
         path: PathBuf,
-        data: Bytes,
-        reply: oneshot::Sender<io::Result<()>>,
+        payload: PutPayload,
+        /// The new object's e_tag.
+        reply: oneshot::Sender<io::Result<String>>,
     },
 }
 
@@ -170,20 +175,18 @@ fn read_range(
     Ok(Bytes::from(buf))
 }
 
-fn write_all(ring: &mut IoUring, seq: &mut u64, path: &PathBuf, data: &Bytes) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(path)?;
+fn write_at(
+    ring: &mut IoUring,
+    seq: &mut u64,
+    file: &File,
+    data: &[u8],
+    offset: u64,
+) -> io::Result<()> {
     let mut done = 0usize;
     while done < data.len() {
         let chunk = u32::try_from(data.len() - done).unwrap_or(u32::MAX);
         let entry = opcode::Write::new(types::Fd(file.as_raw_fd()), data[done..].as_ptr(), chunk)
-            .offset(done as u64)
+            .offset(offset + done as u64)
             .build();
         let n = submit_one(ring, &entry, seq)?;
         if n == 0 {
@@ -197,6 +200,100 @@ fn write_all(ring: &mut IoUring, seq: &mut u64, path: &PathBuf, data: &Bytes) ->
     Ok(())
 }
 
+/// The e_tag `LocalFileSystem` reports for a file with this metadata: inode,
+/// modification time in microseconds and size, in hex (object_store 0.13's
+/// private `get_etag`). `head` and `get_opts` answer through
+/// `LocalFileSystem`, so a put must return this exact string for a caller's
+/// `if_match` to work; `a_put_returns_the_e_tag_head_reports` holds the two
+/// together.
+fn e_tag(metadata: &std::fs::Metadata) -> String {
+    let mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
+        .unwrap_or_default()
+        .as_micros();
+    format!("{:x}-{mtime:x}-{:x}", metadata.ino(), metadata.len())
+}
+
+/// Creates `<path>#<n>` for the first free `n`: the name `LocalFileSystem`
+/// stages an upload under, which its listing skips, so a half-written
+/// object never shows up in `list` whichever store is writing it.
+fn new_staged_upload(path: &std::path::Path) -> io::Result<(File, PathBuf)> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut n = 1u64;
+    loop {
+        let mut staged = path.as_os_str().to_owned();
+        staged.push(format!("#{n}"));
+        let staged = PathBuf::from(staged);
+        // `create_new` (O_EXCL) neither follows a symlink planted under the
+        // name nor opens a file another upload is still writing.
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&staged)
+        {
+            Ok(file) => return Ok((file, staged)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => n += 1,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Writes `payload` to a staged file beside `path` and renames it over
+/// `path`, as `LocalFileSystem` does, returning the new object's e_tag
+/// (#111).
+///
+/// The store used to truncate `path` and write it in place. A write that
+/// failed part way (a full disk, a file size limit) then left the first part
+/// of the new object where the old one had been, a reader could see a
+/// half-written object, and a symlink at `path` was written through, to
+/// wherever it pointed, outside the store's root. The rename replaces the
+/// directory entry instead: the old object stays whole until the new one
+/// is, and a link is replaced rather than followed.
+fn write_staged(
+    ring: &mut IoUring,
+    seq: &mut u64,
+    path: &std::path::Path,
+    payload: &PutPayload,
+) -> io::Result<String> {
+    let (file, staged) = new_staged_upload(path)?;
+    let written = publish_staged(ring, seq, file, &staged, path, payload);
+    if written.is_err() {
+        // Best effort, as `LocalFileSystem` does: the object at `path` is
+        // untouched either way.
+        let _ = std::fs::remove_file(&staged);
+    }
+    written
+}
+
+fn publish_staged(
+    ring: &mut IoUring,
+    seq: &mut u64,
+    file: File,
+    staged: &std::path::Path,
+    path: &std::path::Path,
+    payload: &PutPayload,
+) -> io::Result<String> {
+    let mut offset = 0u64;
+    for part in payload.iter() {
+        write_at(ring, seq, &file, part, offset)?;
+        offset += part.len() as u64;
+    }
+    // Taken from the descriptor before the rename, as `LocalFileSystem` does,
+    // so it is this write's e_tag even if another put replaces the object
+    // the moment it lands. The rename keeps inode, mtime and size.
+    let tag = e_tag(&file.metadata()?);
+    // Closed first, as `LocalFileSystem` does: some FUSE filesystems only
+    // publish a file's contents when it is closed.
+    drop(file);
+    std::fs::rename(staged, path)?;
+    Ok(tag)
+}
+
 fn worker(mut rx: mpsc::Receiver<Job>, mut ring: IoUring) {
     // Submission counter for the ring this thread owns. Every SQE is tagged
     // with the next value so its completion can be recognised rather than
@@ -207,8 +304,12 @@ fn worker(mut rx: mpsc::Receiver<Job>, mut ring: IoUring) {
             Job::Read { path, range, reply } => {
                 let _ = reply.send(read_range(&mut ring, &mut seq, &path, range));
             }
-            Job::Write { path, data, reply } => {
-                let _ = reply.send(write_all(&mut ring, &mut seq, &path, &data));
+            Job::Write {
+                path,
+                payload,
+                reply,
+            } => {
+                let _ = reply.send(write_staged(&mut ring, &mut seq, &path, &payload));
             }
         }
     }
@@ -280,11 +381,16 @@ impl UringLocalFileSystem {
         result.map_err(|e| Self::io_error(location, e))
     }
 
-    async fn write(&self, location: &Path, data: Bytes) -> Result<()> {
+    /// Writes `payload` as the object at `location` and returns its e_tag.
+    async fn write(&self, location: &Path, payload: PutPayload) -> Result<String> {
         let path = self.filesystem_path(location)?;
         let (reply, rx) = oneshot::channel();
         self.tx
-            .send(Job::Write { path, data, reply })
+            .send(Job::Write {
+                path,
+                payload,
+                reply,
+            })
             .await
             .map_err(|_| Error::Generic {
                 store: STORE,
@@ -320,12 +426,23 @@ impl ObjectStore for UringLocalFileSystem {
     ) -> Result<PutResult> {
         match opts.mode {
             PutMode::Overwrite => {
-                self.write(location, Bytes::from(payload)).await?;
+                // Refused the way `LocalFileSystem` refuses them: accepting
+                // attributes and then dropping them told the caller they
+                // were stored (#111).
+                if !opts.attributes.is_empty() {
+                    return Err(Error::NotImplemented {
+                        operation: "`put_opts` with `opts.attributes` specified".into(),
+                        implementer: self.to_string(),
+                    });
+                }
+                let e_tag = self.write(location, payload).await?;
                 Ok(PutResult {
-                    e_tag: None,
+                    e_tag: Some(e_tag),
                     version: None,
                 })
             }
+            // `Create` and `Update` stay `LocalFileSystem`'s, refusals and
+            // the order it checks mode and attributes in included.
             _ => self.inner.put_opts(location, payload, opts).await,
         }
     }
