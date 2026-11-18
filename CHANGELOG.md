@@ -8,6 +8,22 @@ versions (0.x) may contain breaking changes; they are always listed under a
 
 ## [Unreleased]
 
+### Added
+
+- **`operator_stats()` on `GpuFilterExec`, `GpuHashJoinExec`,
+  `GpuAggregateExec` and `GpuVectorDistanceExec`** returns the counters
+  that exec instance has reported to its telemetry hub (`None` before it
+  first executes, or without a hub). It is how a reader pairs a plan node
+  with its own counters: the hub's entries carry only a name (#123).
+- **`gpu.yml`: the CUDA suites on a real device, on demand** (#38). A
+  `workflow_dispatch` workflow for a self-hosted runner labelled `gpu` runs
+  the new `make test-cuda-device` (the device tests with the ignored ones,
+  the conformance suite under `OXIDE_BACKEND=cuda`, and `embedded.rs`) and
+  uploads its log; the target fails rather than skips without a GPU.
+  `docs/RELEASING.md` step 0 now requires a green run on the release
+  candidate. No such runner is registered yet, so it has never run: until
+  one is, a release says its CUDA paths are compiled-only.
+
 ### Changed
 
 - **Breaking: `query_literal` now returns a result and rejects empty query
@@ -409,6 +425,95 @@ versions (0.x) may contain breaking changes; they are always listed under a
   is refused. `oxidelake_planner::codec::PLAN_FINGERPRINT` and
   `build_description()` are public, and `make test-mixed-build` runs both
   cases with real binaries.
+
+### Fixed
+
+- **A crates.io error can no longer switch the release's semver check off.**
+  `release.yml` read every answer but HTTP 200 — a 429, a 503 — as "first
+  release, no baseline" and skipped `cargo-semver-checks` minutes before
+  `cargo publish`. Every crate has been published since 0.1.0, so the job
+  now fails unless crates.io confirms the baseline, after retrying a 429 or
+  a 5xx; a release that hits an outage is re-run rather than published
+  unchecked (#130).
+- **Re-running `binaries.yml` repairs a partly attached target.** The re-run
+  guard looked for a target's archive alone, so a run that uploaded the
+  archive and died before its `.sha256` or its unversioned alias left that
+  target skipped on every re-run — and the Homebrew formula job failing on
+  the missing checksum, without printing which. A target now counts as
+  attached only when all four of its files are; the missing ones are
+  recovered from the attached archive's own bytes, never rebuilt (#131).
+- **`oxide tui --table Trips=…` opens the dashboard.** A table name with an
+  upper-case letter is registered as DataFusion folds it, `trips`, but the
+  column-profile query asked for `"Trips"`, so the dashboard failed with
+  `table 'datafusion.public.Trips' not found` after the query itself had
+  run. The profile query now names the table as registration resolved it
+  (#120).
+- **The Describe panel shows min and max for every column DataFusion can
+  order.** It profiled `Int64`, `Float64` and `Utf8` only, and DataFusion
+  reads Parquet strings as `Utf8View`, so string columns read from Parquet
+  (the demo table's `s` among them), other integer widths, decimals, dates,
+  timestamps, booleans and lists showed blank min and max. Whether a type
+  applies is now asked of DataFusion's own `min`/`max` accumulators, so a
+  type they cannot order (a `Map`) is left out instead of failing the
+  profile; every numeric type now gets P25/P50/P99 too, not only `Int64`
+  and `Float64` (#121).
+- **The Inspector shows each operator its own counters.** `oxide tui
+  --query` merged the hub's counters by operator name, so two operators of
+  one name — a self-join's two filters — each showed the sum of both: a
+  filter emitting 129 rows and one emitting 1451 both read `6000 in / 1580
+  out`. Each plan node's counters are now read from the node itself
+  (#123).
+- **A dashboard whose refresh brings the plan can select all of it.**
+  `run_terminal` bounded the selection by the plan the model had before
+  the first refresh, so with a tick and a `refresh` that supplies the plan
+  or grows it, as its documentation invites, `↓` stopped at the old
+  length — on the first operator when the model started empty. The
+  selection now follows the plan's length after every refresh, and moves to
+  the last operator left when the plan shrinks under it. `oxide tui` never
+  refreshes and was not affected. A loop of your own around `AppState` and
+  `render` gets the same from the new `AppState::set_node_count` (#126).
+- **The dashboard no longer cuts numbers at 80x24 or 120x40.** The
+  Describe panel asked for 62 columns whatever it held, so in any terminal
+  narrower than 128 every cell was clipped without a mark: the README's own
+  `oxide tui` at 80x24 showed `id`'s largest value, 999999, as `9999` and
+  `k`'s 19880 nulls as `198`, and at 120x40 `Float64` read `Float6`. Each
+  column is now as wide as its widest value, and a column there is no room
+  for is left out whole and named in the title — at 80x24 the panel reads
+  `Describe (hidden: p99)` for the demo and `Describe (hidden: type p25
+  p99)` for the README table; widen the terminal to see them. A tiny value
+  no longer rounds to zero (`-0.000012345678` printed `-0` in seven
+  columns; it is `-1.2e-5`). At 24 rows the Inspector now keeps its
+  `H2D / D2H` and `cpu fallback` lines, which needed 28, and Telemetry the
+  line saying whether its gauges can move at all, which needed 26 (#122).
+- **CI's `msrv` job compiles with the declared minimum Rust.** It installed
+  1.94.1 and then ran a plain `cargo check`, which rustup resolved through
+  `rust-toolchain.toml` to 1.98.0, so the job could not fail on code that
+  needs a newer compiler; `rust-version` was checked only by a local `make
+  msrv`. The job now runs `make msrv` under `RUSTUP_TOOLCHAIN` and first
+  asserts which `rustc` is in use (#127).
+- **The `metrics` feature is linted and tested in CI.** No CI job and no
+  `make gate` target built the Prometheus endpoint; only rustdoc and
+  `cargo deny` saw it, through `--all-features`, and rustdoc does not
+  type-check function bodies. `make lint-metrics` and `make test-metrics`
+  are now in the gate and in CI's clippy and Linux test matrices (#128).
+- **Every link on the nine crates.io pages works.** Each crate's README is
+  the workspace README, and crates.io resolves a relative link against that
+  crate's own directory, so all 28 relative targets in it (`docs/SPEC.md`,
+  `CHANGELOG.md`, `crates/oxidelake-core`, …) were 404s on every page. The
+  README now links with absolute GitHub URLs, and `make crate-metadata` fails
+  on a relative link or on a link into this repository that names a path it
+  does not have (#129).
+- **The documentation describes the code that exists** (#132). The spill
+  manager has no watermarks, no background demotion and no throughput
+  metric: the call that takes a tier over its byte budget demotes its least
+  recently touched batches before it returns, and the counters are running
+  totals (`docs/SPEC.md`, `docs/architecture.md`, `docs/roadmap.md`; the
+  dashboard's PCIe/NVMe figures are totals too, not the rates SPEC
+  promised). `docs/verification.md` records the 2026-09-06 T4 session
+  instead of saying no CUDA machine had run anything. `oxidelake-api`'s
+  crates.io description no longer offers PyO3 bindings, which were
+  deferred and do not exist. An io_uring comment named a test file that does
+  not exist; it names the test that does.
 
 ### Security
 

@@ -26,8 +26,19 @@ Trusted Publishing.
   checksums; without the secret the job says so and the tap keeps the previous
   version. To refresh the formula for a tag whose release already ran (or ran
   from an older workflow): `gh workflow run binaries.yml --ref main -f tag=vX.Y.Z`
-  — targets whose archive is already on the release are skipped without
-  building, only the missing archives and the formula move.
+  — a target whose four files (archive, alias, and a `.sha256` for each) are
+  all attached is skipped, one with only some of them is completed from the
+  attached archive without rebuilding (a rebuild would not reproduce the
+  published bytes, #131), and only a target with no archive is built. A
+  checksum attached without any archive stops the job: delete it with
+  `gh release delete-asset` first.
+- A **self-hosted runner labelled `gpu`** for `gpu.yml` (#38): Linux, an
+  NVIDIA GPU with its driver and NVRTC, and a C toolchain (the workflow
+  installs rustup if it is missing). Register it to this repository only.
+  `gpu.yml` is dispatch-only because this repository is public: a runner
+  that took pull-request jobs would run a stranger's code on the GPU box.
+  **None is registered yet** (2026-11-18), so step 0's CUDA run cannot
+  happen until one is; see step 0 for what a release says meanwhile.
 - A **`release` GitHub environment** whose deployment branches are restricted
   to `v*` tags, so an OIDC publish token can never be minted from a branch.
 - **`v*` tags protected by a ruleset**, so only a repository admin can create
@@ -38,6 +49,15 @@ Trusted Publishing.
 ```sh
 # 0. Green main, and no flakes: run the stress workflow and wait for it.
 gh workflow run stress.yml && gh run watch
+#    Then execute CUDA on the same commit: CI only compiles it, and the one
+#    device run on record (2026-09-06, T4) found a kernel bug that CPU
+#    conformance had passed. gpu.yml runs `make test-cuda-device` on the
+#    self-hosted `gpu` runner. Required: put the run's GPU, driver and commit
+#    in STATUS.md's matrix in the release PR (step 3). release.yml does not
+#    check this; the checklist is the gate. With no `gpu` runner (the case
+#    until one is registered), the release PR and the release notes say the
+#    CUDA paths of this release are compiled-only, as ADR-0012 requires.
+gh workflow run gpu.yml --ref main && gh run watch
 
 # 1. Bump `version` in the workspace [workspace.package] AND every internal
 #    `version = "…"` in [workspace.dependencies], then refresh the lockfile.
@@ -68,8 +88,13 @@ The tag triggers `release.yml`, which:
 2. re-runs the full CI gate without build caches or documentation skips
    (`workflow_call` into `ci.yml`); ordinary main CI cancellation does not
    cancel this release gate;
-3. runs `cargo-semver-checks` against the last published release — skipped on
-   the first release, when there is no baseline;
+3. runs `cargo-semver-checks` against the last published release. It is never
+   skipped: every crate has been on crates.io since 0.1.0, so the job first
+   confirms the baseline is there and fails if crates.io cannot say so — a
+   429 or a 5xx is retried, then fails the job, and a 404 fails at once
+   (`.github/scripts/crates-io-baseline.sh`; it used to read either as "first
+   release" and skip the check, #130). Nothing has been published at that
+   point, so the remedy is a re-run;
 4. publishes the nine crates in dependency order (`core → memory → device →
    compute → storage → planner → tui → runtime → api`), skipping any already
    on the registry so a rate-limited run is resumable via `workflow_dispatch`;

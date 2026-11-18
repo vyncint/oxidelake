@@ -4,19 +4,21 @@
 
 Run after every phase; every command must pass before that phase's commit. `make gate` runs the checks below, including MSRV, plus the io_uring lane on Linux and the full Metal lane on macOS. [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) uses the same Make targets. `commit-policy` runs beside it. Keep the Makefile, this page and the workflow in sync.
 
-CI separates default, io_uring and predict tests into three Linux jobs. Clippy
-also has default / CUDA / predict jobs. macOS runs Metal lint, Metal package
+CI separates default, io_uring, predict and metrics tests into four Linux
+jobs. Clippy also has default / CUDA / predict / metrics jobs. macOS runs Metal lint, Metal package
 tests together with the PTY suite, then on-device conformance when a device is
 available. The remaining checks are MSRV, all-feature rustdoc, `cargo deny`,
-release scripts, crate metadata, CI policy tests, the vendored termlens
+release scripts, crate metadata (with the README's links: absolute only,
+since crates.io resolves a relative one against each crate's directory, and
+every path into this repository present, #129), CI policy tests, the vendored termlens
 skill's version and `zizmor`. The Linux and macOS test lanes run with
 `TERMLENS_ARTIFACT_DIR` set and, on failure, render every screen the PTY
 suite left behind into the job summary. `required-green`
 aggregates their results under the stable name required by branch protection.
 
 ```bash
-make fmt-check lint lint-cuda lint-predict
-make test test-predict
+make fmt-check lint lint-cuda lint-predict lint-metrics
+make test test-predict test-metrics
 make test-mixed-build                 # builds cuda and predict workers; CI: the predict lane
 make test-io-uring                    # Linux only
 make check-cuda check-predict-no-second-cuda
@@ -93,8 +95,22 @@ invalid classification fails the gate.
 
 `make ci-scripts` covers source deletion/rename handling, malformed results,
 each required job's failures, Metal build-argument reuse, and stress coverage.
-It also verifies the metadata checker under the platform's Bash and the MSRV
-target with a standalone Cargo ahead of the Rustup proxy on `PATH`.
+It checks that every `oxidelake-runtime` feature is compiled by a target
+`ci.yml` runs (`--all-features` in `doc` and `deny` does not count: rustdoc
+type-checks no function body), with `metrics` linted and tested and both
+targets in `make gate` (#128).
+It also verifies the metadata checker under the platform's Bash, its README
+link check on every form a link can take (#129), and the MSRV
+target with a standalone Cargo ahead of the Rustup proxy on `PATH`, checks
+that the `msrv` job compiles with the declared `rust-version` rather than
+`rust-toolchain.toml`'s 1.98.0 (every step that compiles sets
+`RUSTUP_TOOLCHAIN`, and the job's own assertion fails if the file wins,
+#127), and runs
+the release's crates.io baseline lookup against a local stand-in answering
+200, 404, 429 and 5xx: only a 200 lets `cargo-semver-checks` run, and nothing
+skips it. `binaries.yml`'s re-run steps run as they stand in the workflow
+against a fake `gh`: a target missing any of its four files is completed from
+the attached archive, never rebuilt.
 `make stress-tui` builds release test targets once per OS, then runs thread
 counts 1, 4 and 16 with 20/40/40 percent of `ITERS` (default 100), at least once
 per count. The first failing build or iteration fails the workflow.
@@ -109,28 +125,39 @@ Why the GPU gate is `-p oxidelake-runtime --features cuda`: the workspace root i
 
 ## What can and cannot be verified on the dev boxes
 
-Two dev boxes so far: Linux 7.0 x86_64 (2026-08-25, phases 0–6; no GPU, no
-CUDA toolkit, not macOS) and macOS on an Apple M4 Pro (since 2026-09-01,
-Metal 4, 24 GiB unified memory), where the whole default gate re-ran green
-and the Metal backend executes for real.
+Two dev boxes: Linux 7.0 x86_64 (2026-08-25, phases 0–6; no GPU, no CUDA
+toolkit, not macOS) and macOS on an Apple M4 Pro (since 2026-09-01, Metal 4,
+24 GiB unified memory), where the whole default gate re-ran green and the
+Metal backend executes for real. And one CUDA session: an AWS `g4dn.xlarge`
+with an NVIDIA Tesla T4 (2026-09-06, driver 595.71, CUDA 13.2, Rust 1.98.0),
+where the CUDA path executed for the first time and found the aggregation
+kernel bug [STATUS.md](../STATUS.md) records. It was a manual session:
+nothing on record has executed CUDA code since. `gpu.yml` can, on demand, on
+a self-hosted runner labelled `gpu`, but none is registered yet, so it has
+never run (#38).
 
 | Claim | Verifiable | How / where |
 |---|---|---|
-| Pure-CPU build, tests, clippy, docs | yes | the gate (both boxes) |
-| CUDA code compiles and lints | yes | `check` / `clippy -p oxidelake-runtime --features cuda` (no CUDA installed anywhere) |
+| Pure-CPU build, tests, clippy, docs | yes | the gate (both dev boxes) |
+| CUDA code compiles and lints | yes | `check` / `clippy -p oxidelake-runtime --features cuda` (no CUDA installed on either dev box or in CI) |
 | `metal` feature is a no-op on Linux | yes | `cargo check -p oxidelake-runtime --features metal` on Linux |
 | Metal compile, lint, **execution** | yes (macOS) | the Metal lane above; the conformance suite runs on the actual device |
 | Cluster mode (Ballista scheduler + executors, codec, placement) | yes | in-process scheduler + 2 executors, where every `Gpu*Exec` the cluster's `EXPLAIN` shows must also have run on an executor (the process-wide telemetry hub, #134); spawned binaries in the Phase 7 E2E — executors take the CPU path |
 | Embedded GPU-target ≡ CPU results | yes | `oxidelake-runtime/tests/embedded.rs` over cpu/cuda/metal targets |
 | Parquet pruning | yes | scan metrics + result equality against a pruning-disabled run |
-| CPU ↔ CUDA operator equivalence | **no** | conformance suite is `#[ignore]` for CUDA; run on a CUDA box |
-| CUDA kernel *execution* and performance | **no** | never claim; record as "compiled only" |
+| CPU ↔ CUDA operator equivalence | on a CUDA machine only | the conformance suite is `#[ignore]`d for CUDA; green on the T4 (2026-09-06), with the transfer-counter witness, and not run since |
+| CUDA kernel *execution* | on a CUDA machine only | executed on the T4 (2026-09-06): device tests, conformance, `embedded.rs` under the cuda target. A kernel or `ops.rs` change since then is "compiled only" until it runs on a device |
+| CUDA performance | **no** | no CUDA timing is on record; never claim a number |
 | io_uring object store | Linux only | skips with a logged reason when `io_uring_setup` returns EPERM/ENOSYS |
 
-On a CUDA machine (still unverified — no such box has run this yet):
+On a CUDA machine, what the T4 session ran (STATUS.md's matrix), and what
+`make test-cuda-device` runs, with `embedded.rs` under the cuda target after
+them; `gpu.yml` runs that target. It fails, rather than skips, when
+`nvidia-smi` shows no GPU, and it is not in `make gate`:
 
 ```bash
-cargo test -p oxidelake-compute --features cuda -- --ignored
+cargo test -p oxidelake-device --features cuda -- --include-ignored
+OXIDE_BACKEND=cuda cargo test -p oxidelake-compute --features cuda -- --ignored
 ```
 
 ## Honesty rule

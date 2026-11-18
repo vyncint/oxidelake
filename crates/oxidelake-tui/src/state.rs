@@ -101,6 +101,21 @@ impl AppState {
         self.selected
     }
 
+    /// Takes a new operator count for a plan that changed under the state —
+    /// a live model refreshed between frames can bring a plan, or a longer or
+    /// shorter one, after the state was created. Without this the selection
+    /// stayed bounded by the count the state started with, so `↓` could not
+    /// reach operators the refresh added (#126). The focused panel is kept,
+    /// and so is the selection, unless its row is gone: then the last
+    /// operator left is selected.
+    pub const fn set_node_count(&mut self, node_count: usize) {
+        self.node_count = node_count;
+        let last = node_count.saturating_sub(1);
+        if self.selected > last {
+            self.selected = last;
+        }
+    }
+
     /// The focused panel.
     pub const fn panel(&self) -> Panel {
         self.panel
@@ -165,6 +180,24 @@ mod tests {
         let mut s = AppState::new(0);
         s.on_key(KeyInput::Down);
         assert_eq!(s.selected(), 0);
+    }
+
+    #[test]
+    fn a_new_node_count_moves_the_bound_and_keeps_the_panel() {
+        let mut s = AppState::new(0);
+        s.on_key(KeyInput::Tab);
+        s.set_node_count(3);
+        s.on_key(KeyInput::Down);
+        s.on_key(KeyInput::Down);
+        s.on_key(KeyInput::Down);
+        assert_eq!((s.node_count(), s.selected()), (3, 2), "grown");
+        s.set_node_count(5);
+        assert_eq!(s.selected(), 2, "a longer plan keeps the selection");
+        s.set_node_count(2);
+        assert_eq!(s.selected(), 1, "a gone row moves to the last one left");
+        s.set_node_count(0);
+        assert_eq!(s.selected(), 0, "an emptied plan selects nothing past 0");
+        assert_eq!(s.panel(), Panel::Inspector, "the focus never moves");
     }
 
     #[test]

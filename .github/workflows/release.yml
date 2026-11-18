@@ -65,8 +65,11 @@ jobs:
     needs: verify-version
     uses: ./.github/workflows/ci.yml
 
-  # Breaking changes need a minor bump pre-1.0. Skipped gracefully on the first
-  # release, when there is no published baseline to compare against.
+  # Breaking changes need a minor bump pre-1.0. Never skipped: every crate has
+  # been published since 0.1.0, so the baseline exists, and a crates.io that
+  # cannot confirm it fails this job instead of switching the check off. The
+  # step this replaced read any answer but a 200 — a 429, a 503 — as "first
+  # release, no baseline" and skipped the check before publishing (#130).
   semver:
     name: cargo-semver-checks
     needs: verify-version
@@ -76,19 +79,9 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-      - name: Look for a published baseline on crates.io
-        id: published
-        env:
-          REPO: ${{ github.repository }}
-        run: |
-          status="$(curl -sS -o /dev/null -w '%{http_code}' -A "oxidelake-release (github.com/${REPO})" https://crates.io/api/v1/crates/oxidelake-core)"
-          echo "crates.io responded ${status}"
-          echo "found=$([ "$status" = "200" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
-      - name: Skip (first release, no baseline)
-        if: steps.published.outputs.found != 'true'
-        run: echo "oxidelake-core is not on crates.io yet; skipping semver checks gracefully."
+      - name: The published baseline is on crates.io
+        run: .github/scripts/crates-io-baseline.sh oxidelake-core
       - uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2.9
-        if: steps.published.outputs.found == 'true'
         with:
           package: oxidelake-core,oxidelake-memory,oxidelake-device,oxidelake-compute,oxidelake-storage,oxidelake-planner,oxidelake-tui,oxidelake-runtime,oxidelake-api
 

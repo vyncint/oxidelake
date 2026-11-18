@@ -71,7 +71,22 @@ jobs:
           ref: ${{ env.TAG }}
       # A re-run against an existing tag (docs/RELEASING.md) must not rebuild
       # what is already published: an archive is immutable once uploaded, and
-      # a macOS build of this graph is measured in hours.
+      # a macOS build of this graph is measured in hours. A target is four
+      # files, and it is done only when all four are attached: the step used
+      # to look for the archive alone, so a run that uploaded it and died
+      # before its checksum left the target unrepairable, and the formula job
+      # failing on the missing `.sha256` for good (#131).
+      #
+      #   complete  all four attached — nothing to do
+      #   repair    an archive (or its alias copy) is attached and something
+      #             else is not — recovered from the attached bytes, never
+      #             rebuilt, because a rebuild does not reproduce them
+      #   build     nothing attached — build, package, attach
+      #
+      # These steps are inline rather than scripts on purpose: the checkout is
+      # the tag, and a re-run dispatched from main against an older tag would
+      # not find a script the tag predates. `make ci-scripts` runs them as
+      # they stand here (BinariesRepairTests in test_ci.py).
       - name: Already on the release?
         id: published
         env:
@@ -79,21 +94,36 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          archive="oxidelake-${TAG#v}-${TARGET}.tar.gz"
+          version="${TAG#v}"
+          archive="oxidelake-${version}-${TARGET}.tar.gz"
+          alias="${archive/-${version}-/-}"
           assets="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' 2>/dev/null || true)"
-          if printf '%s\n' "$assets" | grep -qxF "$archive"; then
-            echo "$archive is already attached to $TAG — nothing to build"
-            echo "present=true" >> "$GITHUB_OUTPUT"
+          attached() { printf '%s\n' "$assets" | grep -qxF "$1"; }
+          missing=""
+          for file in "$archive" "${archive}.sha256" "$alias" "${alias}.sha256"; do
+            attached "$file" || missing="${missing} ${file}"
+          done
+          if [ -z "$missing" ]; then
+            echo "all four files for $TARGET are attached to $TAG — nothing to do"
+            echo "state=complete" >> "$GITHUB_OUTPUT"
+          elif attached "$archive" || attached "$alias"; then
+            echo "$TARGET is partly attached to $TAG; missing:${missing}"
+            echo "recovering them from the attached archive: a rebuild would not reproduce its bytes"
+            echo "state=repair" >> "$GITHUB_OUTPUT"
+          elif attached "${archive}.sha256" || attached "${alias}.sha256"; then
+            echo "::error::$TAG has a checksum for $TARGET but no archive, and a rebuilt archive cannot match a published checksum. Delete it (gh release delete-asset $TAG <name>) and re-run."
+            exit 1
           else
-            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "nothing for $TARGET is attached to $TAG yet — building"
+            echo "state=build" >> "$GITHUB_OUTPUT"
           fi
       - name: Add the target's standard library
-        if: steps.published.outputs.present != 'true'
+        if: steps.published.outputs.state == 'build'
         env:
           TARGET: ${{ matrix.target }}
         run: rustup target add "$TARGET"
       - name: musl linker (Linux)
-        if: steps.published.outputs.present != 'true' && contains(matrix.target, 'musl')
+        if: steps.published.outputs.state == 'build' && contains(matrix.target, 'musl')
         run: sudo apt-get update -q && sudo apt-get install -y -q musl-tools
       # One binary per invocation, on purpose. Linking a binary is an LTO pass
       # over Arrow, DataFusion and Ballista that peaks at 7.4 GB under the thin
@@ -106,7 +136,7 @@ jobs:
       # dependencies still compile in parallel during the first invocation;
       # the second and third only link.
       - name: Build
-        if: steps.published.outputs.present != 'true'
+        if: steps.published.outputs.state == 'build'
         env:
           TARGET: ${{ matrix.target }}
         run: |
@@ -115,7 +145,7 @@ jobs:
             cargo build --release --locked -p oxidelake-runtime --bin "$binary" --target "$TARGET"
           done
       - name: Package
-        if: steps.published.outputs.present != 'true'
+        if: steps.published.outputs.state == 'build'
         env:
           TARGET: ${{ matrix.target }}
         run: |
@@ -146,22 +176,46 @@ jobs:
           if ! printf '%s' "$got" | grep -qE "$want"; then
             echo "::error::built for $TARGET but the binary is: $got"; exit 1
           fi
-          echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
-          echo "ALIAS=$alias" >> "$GITHUB_ENV"
+      # The alias is a byte-for-byte copy of the archive, so whichever of the
+      # two is attached is the source for the other, and both checksums are
+      # computed from those published bytes.
+      - name: Recover the missing files from the attached archive
+        if: steps.published.outputs.state == 'repair'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          archive="oxidelake-${version}-${TARGET}.tar.gz"
+          alias="${archive/-${version}-/-}"
+          assets="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+          if printf '%s\n' "$assets" | grep -qxF "$archive"; then source="$archive"; else source="$alias"; fi
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$source" --dir .
+          [ -e "$archive" ] || cp "$source" "$archive"
+          [ -e "$alias" ] || cp "$source" "$alias"
+          sums() { if command -v sha256sum > /dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi; }
+          sums "$archive" > "${archive}.sha256"
+          sums "$alias" > "${alias}.sha256"
+          echo "recovered from the attached $source"
       # Uploaded only if absent, never clobbered: a published archive is
       # immutable, and rebuilding a tag yields a different checksum.
       - name: Attach to the release
-        if: steps.published.outputs.present != 'true'
+        if: steps.published.outputs.state != 'complete'
         env:
           GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          published="$(gh release view "$TAG" --json assets --jq '.assets[].name')"
-          for file in "$ARCHIVE" "${ARCHIVE}.sha256" "$ALIAS" "${ALIAS}.sha256"; do
+          version="${TAG#v}"
+          archive="oxidelake-${version}-${TARGET}.tar.gz"
+          alias="${archive/-${version}-/-}"
+          published="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+          for file in "$archive" "${archive}.sha256" "$alias" "${alias}.sha256"; do
             if printf '%s\n' "$published" | grep -qxF "$file"; then
               echo "already published, left alone: $file"
             else
-              gh release upload "$TAG" "$file"; echo "uploaded: $file"
+              gh release upload "$TAG" "$file" --repo "$GITHUB_REPOSITORY"; echo "uploaded: $file"
             fi
           done
 
@@ -242,7 +296,9 @@ jobs:
           for target in aarch64-apple-darwin x86_64-apple-darwin \
                         aarch64-unknown-linux-musl x86_64-unknown-linux-musl; do
             url="${base}/oxidelake-${version}-${target}.tar.gz.sha256"
-            sum="$(curl -fsSL "$url" | awk '{print $1}')"
+            # `|| sum=""`: under pipefail a 404 here ended the step before
+            # the error below could say which target it was.
+            sum="$(curl -fsSL "$url" | awk '{print $1}')" || sum=""
             if [ -z "$sum" ]; then
               echo "::error::no checksum for ${target}; the archive did not upload"
               exit 1

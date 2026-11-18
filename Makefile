@@ -15,7 +15,7 @@ UNAME := $(shell uname -s)
 # selecting compute alone rebuilt Arrow/DataFusion for the second pass in CI.
 METAL_TEST_ARGS := -p oxidelake-memory -p oxidelake-device -p oxidelake-compute -p oxidelake-runtime -p oxidelake-tui --features oxidelake-runtime/metal --locked --timings
 
-.PHONY: help fmt fmt-check lint lint-cuda lint-metal lint-predict test test-predict test-io-uring test-mixed-build test-termlens-cli test-metal test-metal-device check-cuda check-predict-no-second-cuda doc coherence deny gate metal msrv quickstart clean-data release-scripts crate-metadata skill-version zizmor ci-scripts stress-tui
+.PHONY: help fmt fmt-check lint lint-cuda lint-metal lint-predict lint-metrics test test-predict test-metrics test-io-uring test-mixed-build test-termlens-cli test-metal test-metal-device test-cuda-device check-cuda check-predict-no-second-cuda doc coherence deny gate metal msrv quickstart clean-data release-scripts crate-metadata skill-version zizmor ci-scripts stress-tui
 
 help: ## list targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-14s %s\n", $$1, $$2}'
@@ -40,6 +40,17 @@ lint-predict: ## clippy with the predict feature (in-database inference)
 
 test-predict: ## the `predict` UDF against the model it loaded
 	$(CARGO) test -p oxidelake-compute --features predict --test predict --locked --timings
+
+# `metrics` was compiled only by `doc` and `deny`, both --all-features, and
+# rustdoc does not type-check function bodies: a gated function that failed
+# `cargo check` passed the whole gate (#128).
+lint-metrics: ## clippy with the metrics feature (the Prometheus endpoint)
+	$(CARGO) clippy -p oxidelake-runtime --all-targets --features metrics --locked -- -D warnings
+
+# --bins builds `oxide-worker` and `oxide-scheduler`, whose `--metrics-port`
+# is the feature's whole surface; the endpoint's tests are in the library.
+test-metrics: ## the Prometheus endpoint's tests, with the binaries that serve it
+	$(CARGO) test -p oxidelake-runtime --features metrics --lib --bins --locked --timings
 
 # `cargo tree` prints an already-shown node again as `name ver (*)`, so a
 # bare `grep -c` counts tree references rather than crates and reports two
@@ -120,6 +131,22 @@ test-metal-device: ## reuse the Metal test graph for on-device conformance
 check-cuda: ## the GPU compile gate: cuda code builds with no CUDA installed
 	$(CARGO) check -p oxidelake-runtime --features cuda --locked
 
+# Not part of `make gate`: it executes CUDA, so it needs an NVIDIA GPU, its
+# driver and NVRTC, which no gate machine and no hosted runner has. gpu.yml
+# runs it on demand on a self-hosted runner labelled `gpu` (#38). The three
+# suites are the ones the 2026-09-06 T4 session ran (STATUS.md). Unlike
+# test-metal-device it fails, never skips, without a device: its whole
+# purpose is execution, and a skip would be a green run that executed
+# nothing. OXIDE_BACKEND=cuda makes the detector refuse to fall back to the
+# CPU backend; the conformance suite also proves bytes crossed to the device.
+test-cuda-device: ## execute the CUDA suites on an NVIDIA GPU (gpu.yml); fails without one
+	@nvidia-smi -L 2>/dev/null | grep -q '^GPU ' || { \
+	  echo "test-cuda-device: no NVIDIA GPU visible to nvidia-smi; this target executes CUDA and cannot pass without one"; \
+	  exit 1; }
+	$(CARGO) test -p oxidelake-device --features cuda --locked -- --include-ignored
+	OXIDE_BACKEND=cuda $(CARGO) test -p oxidelake-compute --features cuda --locked -- --ignored
+	OXIDE_BACKEND=cuda $(CARGO) test -p oxidelake-runtime --features cuda --locked --test embedded
+
 doc: ## rustdoc for the workspace, warnings are errors
 	RUSTDOCFLAGS="-D warnings" $(CARGO) doc --workspace --no-deps --all-features --locked
 
@@ -130,7 +157,7 @@ coherence: ## no duplicate arrow / parquet / datafusion / object_store / tonic /
 release-scripts: ## the changelog extractor's own tests (release.yml depends on it)
 	./.github/scripts/test-extract-changelog.sh
 
-crate-metadata: ## every published crate carries README, repository, keywords, categories, docs.rs link
+crate-metadata: ## every published crate carries README, repository, keywords, categories, docs.rs link; README links absolute
 	./.github/scripts/check-crate-metadata.sh
 
 ci-scripts: ## CI change detection, required results, Metal build reuse and stress coverage
@@ -148,7 +175,7 @@ zizmor: ## workflow security audit at the level CI enforces (cargo install --loc
 deny: ## advisories, licenses, bans and sources (cargo-deny)
 	$(CARGO) deny --all-features check
 
-gate: fmt-check lint lint-cuda lint-predict test test-predict test-mixed-build check-cuda check-predict-no-second-cuda doc coherence deny release-scripts crate-metadata ci-scripts skill-version zizmor msrv ## the whole quality gate — the same list CI runs
+gate: fmt-check lint lint-cuda lint-predict lint-metrics test test-predict test-metrics test-mixed-build check-cuda check-predict-no-second-cuda doc coherence deny release-scripts crate-metadata ci-scripts skill-version zizmor msrv ## the whole quality gate — the same list CI runs
 ifeq ($(UNAME),Linux)
 	$(MAKE) test-io-uring
 endif
@@ -159,8 +186,14 @@ endif
 
 metal: lint-metal test-metal test-metal-device ## Metal lane: lint, tests and conformance when a device is present
 
-msrv: ## build the workspace with the declared rust-version
+# `rustup run` and not a plain `cargo`: rust-toolchain.toml pins the
+# development toolchain, and rustup prefers that file to the default
+# toolchain, so a plain `cargo check` here compiles with 1.98.0 whatever is
+# installed and proves nothing about the MSRV (#127). The version line puts
+# the compiler that ran into the log.
+msrv: ## check the workspace with the declared rust-version, not rust-toolchain.toml's
 	rustup toolchain install $(MSRV) --profile minimal --no-self-update
+	rustup run $(MSRV) rustc --version
 	CARGO_TARGET_DIR=target/msrv rustup run $(MSRV) $(CARGO) check --workspace --all-targets --locked
 
 quickstart: ## release build, 1M-row demo table, one query

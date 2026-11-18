@@ -1,0 +1,5 @@
+# actionlint knows GitHub's hosted runner labels only. `gpu` is the custom
+# label gpu.yml's self-hosted CUDA runner must carry (#38).
+self-hosted-runner:
+  labels:
+    - gpu
