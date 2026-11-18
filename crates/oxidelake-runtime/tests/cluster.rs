@@ -137,6 +137,22 @@ async fn explained_gpu_operators(session: &OxideSession, sql: &str) -> BTreeSet<
     names
 }
 
+/// Held by every test here that runs queries on a cluster, for its whole run.
+///
+/// The witnesses below read the process-wide hub from an id on, and the
+/// tests run in parallel threads of this one process. So another test's
+/// `Gpu*Exec`, registered inside that window, used to be counted as this
+/// test's own. On a macOS runner, `the_static_planner_runs_lowered_nodes_correctly`
+/// saw two `GpuHashJoinExec` of 2019 rows where its query ran one:
+/// `distributed_results_equal_embedded_results` joins the same `t` and `r`.
+/// A `tokio` mutex, because the guard is held across `.await`s.
+async fn hub_window() -> tokio::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
+}
+
 /// The next registration id of the process-wide hub: operators registered
 /// from here on have an id at least this large.
 fn next_operator_id() -> usize {
@@ -186,6 +202,7 @@ fn assert_executed_on_an_executor(since: usize, names: &BTreeSet<String>, sql: &
 /// cluster, and every operator that names must then have run.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn distributed_results_equal_embedded_results() {
+    let _hub = hub_window().await;
     let dir = tempfile::tempdir().unwrap();
     let (t_path, r_path) = write_dataset(dir.path());
 
@@ -241,6 +258,7 @@ async fn distributed_results_equal_embedded_results() {
 /// needed. This pins the answer, not either mechanism.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn not_in_a_subquery_is_null_aware_on_a_cluster() {
+    let _hub = hub_window().await;
     let dir = tempfile::tempdir().unwrap();
     let (t_path, r_path) = write_dataset(dir.path());
 
@@ -325,6 +343,7 @@ async fn largest_batch(session: &OxideSession, path: &str) -> usize {
 /// "default means unset" rule would get wrong.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_batch_size_a_client_asks_for_reaches_a_gpu_cluster() {
+    let _hub = hub_window().await;
     let dir = tempfile::tempdir().unwrap();
     let path = write_rows(dir.path(), 20_000);
     let addr = start_standalone(BackendKind::Cuda, 2, 2).await.unwrap();
@@ -420,6 +439,7 @@ const PARTITIONED_JOINS: [&str; 2] = [
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn aggregates_keep_their_partitioning_on_a_cluster() {
+    let _hub = hub_window().await;
     let dir = tempfile::tempdir().unwrap();
     let (t_path, _) = write_dataset(dir.path());
 
@@ -528,6 +548,7 @@ fn ran_since(since: usize, name: &str) -> (usize, u64) {
 /// lowered node it is about ran on the executors.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_static_planner_runs_lowered_nodes_correctly() {
+    let _hub = hub_window().await;
     let dir = tempfile::tempdir().unwrap();
     let (t_path, r_path) = write_dataset(dir.path());
     let addr = start_standalone(BackendKind::Cuda, 2, 2).await.unwrap();

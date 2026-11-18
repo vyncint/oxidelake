@@ -111,7 +111,7 @@ Acceptance
 - [x] `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` clean
 - [x] Gate green
 
-## Phase 8 — production readiness (milestone `v0.2.0`)
+## Phase 8 — production readiness (milestones `v0.2.0` and `v0.3.0`)
 
 Phases 0–7 were the build. This is the list that stands between the
 published 0.1.x and something to run in production, and it is the one
@@ -132,6 +132,22 @@ Ten lines remain, and the three that matter most cannot be closed here: #28,
 what #25's real wiring waits for. Do not read 0.2.0 as "production ready";
 read it as "a running deployment can now tell whether its GPU is being used".
 
+**0.3.0 closed seven more**, and with them every line that waited for a CUDA
+device:
+- #28, #45 and #46 ran on a Tesla T4 on 2026-11-18, before they merged. So
+  did #29's streaming aggregate.
+- The chain bump (#40) retired the thrift advisory (#4, #54).
+- Worker loss and `SIGTERM` are handled (#31). A lost worker fails its query
+  rather than risk Ballista 55's rollback (#148).
+
+Three lines remain:
+- Double-buffered transfers (P6-rest).
+- TLS for the cluster ports (#30). Its enforced private-network half shipped.
+- A `gpu` runner for `gpu.yml` (#38).
+
+A cluster still belongs on a private network, behind an authenticating proxy
+for anything beyond it.
+
 ### Correctness
 
 - [x] io_uring worker reaps its CQE before returning (#27) — *Acceptance:* a
@@ -145,20 +161,28 @@ read it as "a running deployment can now tell whether its GPU is being used".
 - [x] `oxide sql` survives a closed pipe (#34) — *Acceptance:* `… | head -1`
       exits 0 with no panic, on an output larger than a pipe buffer.
       **0.1.4**
-- [ ] CUDA filter matches Arrow totalOrder float comparison (#28) —
+- [x] CUDA filter matches stock DataFusion's float comparison (#28) —
       *Acceptance:* NaN and `-0.0` rows in the conformance suite agree with
-      stock DataFusion on a CUDA device.
-- [ ] `GpuAggregateExec` streams and partitions instead of collecting the
-      whole input (#29, audit P4) — *Acceptance:* a input larger than device
-      memory completes. Both halves are in 0.3.0: each input partition is
-      aggregated on its own (#90), and a device is handed one batch at a
-      time while the operator keeps one accumulator per group (#29). Not yet
-      run on a GPU.
-- [ ] `SUM(Int64)` wraps on overflow on every backend, as stock DataFusion's
+      stock DataFusion on a CUDA device. `special_floats` passed on a Tesla
+      T4 (2026-11-18). The line first said Arrow's totalOrder, which was
+      DataFusion 54's order. DataFusion 55 reads `-0.0` as `+0.0` in a
+      comparison and orders the rest by totalOrder, and the device follows
+      DataFusion. **0.3.0**
+- [x] `GpuAggregateExec` streams and partitions instead of collecting the
+      whole input (#29, audit P4) — *Acceptance:* an input larger than device
+      memory completes. Each input partition is aggregated on its own (#90).
+      The device is handed one batch at a time while the operator keeps one
+      accumulator per group (#29): on the T4 (2026-11-18), 10M rows took 153
+      device calls. The acceptance holds by construction: the device never
+      holds more than one batch. No input larger than the T4's memory was
+      run. **0.3.0**
+- [x] `SUM(Int64)` wraps on overflow on every backend, as stock DataFusion's
       does (#46) — *Acceptance:* the conformance overflow fixture equals
       DataFusion's wrapped answer on a CUDA device. The line first asked for
       an error, on the premise that DataFusion raises one; it wraps, so the
-      CPU reference was the outlier and now wraps too (#100).
+      CPU reference was the outlier and now wraps too (#100). On a Tesla T4
+      (2026-11-18), `aggregate_wraps_int64_sums_like_the_reference` and the
+      conformance aggregate checks pass. **0.3.0**
 - [x] `SpillManager` and `MemoryInfo` reach the operators, or the docs and
       the TUI say they are library-only (#25) — *closed the second way*:
       tier capacities come from the backend's `MemoryInfo`, and the panel,
@@ -173,13 +197,18 @@ read it as "a running deployment can now tell whether its GPU is being used".
       measurement and the change are Phase 9. **0.1.4**
 - [ ] Double-buffered stream pipelines (audit P6-rest) — *Acceptance:*
       transfer and compute overlap for a multi-batch scan, measured.
-- [ ] CUDA join table persists across probe batches (#45) — *Acceptance:*
-      the build side is uploaded once per join, not once per batch. The
-      join half is in 0.3.0 (`GpuBackend::prepare_join_build`, compiled and
-      not yet run on a GPU), and so is the aggregate half: a batch's groups
-      are numbered on the device, so its accumulators and what is read back
-      hold one entry per group rather than two per row (compiled, and checked
-      on the CPU under a shim of the CUDA builtins; not yet run on a GPU).
+- [x] CUDA join table persists across probe batches (#45) — *Acceptance:*
+      the build side is uploaded once per join, not once per batch.
+      - **Join half:** `GpuBackend::prepare_join_build` indexes the build side
+        once per operator.
+      - **Aggregate half:** a batch's groups are numbered on the device, so
+        its accumulators, and what is read back, hold one entry per group
+        rather than two per row.
+      - **On a Tesla T4 (2026-11-18):** both passed the conformance joins
+        (the chunked one included), `join_timing`,
+        `aggregate_numbers_groups_like_the_reference` and `aggregate_timing`.
+
+      **0.3.0**
 - [x] io_uring store wired into sessions, or the claim stays demoted (#24,
       audit P12) — *the claim stays demoted*: no session constructs it, and
       every document says so. **0.1.4**
@@ -196,11 +225,20 @@ read it as "a running deployment can now tell whether its GPU is being used".
       `INFO` line per query from `OxideSession::collect`, and
       `--metrics-port` on the worker and scheduler behind the `metrics`
       feature. **0.2.0**
-- [ ] Worker loss, Ballista retry settings and `SIGTERM` handling (#31,
-      audit P13).
+- [x] Worker loss, Ballista retry settings and `SIGTERM` handling (#31,
+      audit P13):
+      - Scheduler and worker drain on `SIGTERM` within `--drain-timeout`.
+      - Ballista's retry and timeout limits are flags.
+      - A query that loses a worker fails, naming it, rather than risk Ballista
+        55's rollback, which can return rows twice. This holds until a Ballista
+        release carries apache/datafusion-ballista#2677 (#148).
+
+      **0.3.0**
 - [ ] TLS/auth for cluster mode, or an enforced private-network posture
       (#30) — *Acceptance:* the production cluster instructions do not
-      describe an unauthenticated listener.
+      describe an unauthenticated listener. 0.3.0 enforces the private-network
+      half: both binaries refuse a public or wildcard address unless given
+      `--allow-insecure-bind`. TLS is still open.
 - [x] Plan codec version fingerprint, failing fast on mixed builds (#42).
       **0.2.0**
 - [x] `--batch-size`, `--output table|json|csv`, worker `--backend` (#49) —
@@ -213,13 +251,17 @@ read it as "a running deployment can now tell whether its GPU is being used".
 
 ### Supply chain and release
 
-- [ ] Ballista 55 / DataFusion 55 / arrow 59 chain bump (#40) — blocks #4
-      and #54.
-- [ ] thrift advisory retired once parquet ≥ 59 lands (#4, #54).
+- [x] Ballista 55 / DataFusion 55 / arrow 59 chain bump (#40). **0.3.0**
+- [x] thrift advisory retired: parquet 59 has no `thrift` (#4, #54).
+      **0.3.0**
 - [x] Public enums `non_exhaustive`, DataFusion-coupling semver policy
       written (#41) — landed in a minor, with the plan vocabulary left
       exhaustive on purpose. **0.2.0**
 - [ ] On-demand CUDA execution job, made a release prerequisite (#38).
+      `gpu.yml` and `make test-cuda-device` are in 0.3.0, and
+      `docs/RELEASING.md` step 0 asks for them. No runner is registered, so
+      the job has never run; 0.3.0's CUDA paths ran in a manual T4 session
+      instead.
 - [x] CI build-cache policy decided and documented (#39). **0.1.4**
 - [x] termlens-cli installed prebuilt in CI (#48). **0.1.4**
 - [x] README, STATUS and CHANGELOG agree on CUDA execution and the
