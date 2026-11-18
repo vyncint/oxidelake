@@ -52,10 +52,11 @@ struct Cli {
     /// Times a stage may fail because a shuffle fetch failed, its input lost
     /// with a worker, before its query fails (Ballista's
     /// `stage_max_failures`). The default, 1, fails the query at the first
-    /// such failure, naming the worker; it does not cover a worker that is
-    /// stopped or goes silent (#148). Raising it turns on Ballista 55's re-run
-    /// of the stage, which can return duplicated rows with exit 0 or never
-    /// finish (fixed upstream by apache/datafusion-ballista#2677, unreleased).
+    /// such failure, naming the worker; a worker that is stopped or goes
+    /// silent fails its queries whatever this says (#148). Raising it turns
+    /// on Ballista 55's re-run of the stage, which can return duplicated rows
+    /// with exit 0 or never finish (fixed upstream by
+    /// apache/datafusion-ballista#2677, unreleased).
     #[arg(
         long,
         default_value_t = cluster::DEFAULT_STAGE_MAX_FAILURES,

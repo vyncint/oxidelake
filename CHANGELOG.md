@@ -22,8 +22,8 @@ versions (0.x) may contain breaking changes; they are always listed under a
   `--task-max-failures` and `--stage-max-failures` (Ballista's retry
   limits, 4 and 1) and `--worker-timeout` (seconds a silent worker still
   counts, 180), and worker flag `--heartbeat-interval` (60); the defaults
-  are Ballista's but for `--stage-max-failures`, which is 1 (#148, under
-  Changed).
+  are Ballista's but for `--stage-max-failures`, which is 1 so that a lost
+  worker fails its queries instead of being retried (#148, under Changed).
 
 - **`operator_stats()` on `GpuFilterExec`, `GpuHashJoinExec`,
   `GpuAggregateExec` and `GpuVectorDistanceExec`** returns the counters
@@ -460,20 +460,20 @@ versions (0.x) may contain breaking changes; they are always listed under a
   partition coalescing are therefore not available on an OxideLake cluster
   until the placement rule can run inside the adaptive planner.
 
-- **A cluster no longer retries a stage whose input was lost with a
-  worker** (#148). Ballista 55 recovers such a query by rolling back the
-  stages that read the lost worker's output and running them again, and in
-  55.0.0 that recovery is not safe: a self-join that lost a worker
-  mid-flight came back with 13 or 14 of its 100 groups twice, exit 0, in 12
-  runs of 15 (fixed upstream by apache/datafusion-ballista#2677,
-  unreleased), and a worker stopped with `SIGTERM` mid-query left it
-  hanging (apache/datafusion-ballista#2539, #2698). `--stage-max-failures`
-  now defaults to 1, so a failed fetch from a lost worker, what usually
-  happens first when a worker is killed, fails the query naming the worker.
-  It does not cover a worker that is stopped or goes silent mid-query:
-  Ballista rolls those back whatever the limit, so stop workers between
-  queries. **Migration:** a query that used to survive a killed worker now
-  fails; run it again. To get Ballista's stage retries back, pass
+- **A cluster no longer retries a query that loses a worker** (#148).
+  Ballista 55 recovers such a query by rolling back the stages that read the
+  lost worker's output and running them again, and in 55.0.0 that recovery
+  is not safe: a self-join that lost a worker mid-flight came back with 13
+  or 14 of its 100 groups twice, exit 0, in 12 runs of 15 (fixed upstream by
+  apache/datafusion-ballista#2677, unreleased), and a worker stopped with
+  `SIGTERM` mid-query left it hanging (apache/datafusion-ballista#2539,
+  #2698). `oxide-scheduler` now fails a query that held output on a worker
+  it loses, whether killed, stopped or silent past `--worker-timeout`, with
+  an error naming the worker, and `--stage-max-failures` defaults to 1, so
+  a failed fetch from a lost worker ends the query too; a query whose tasks
+  on that worker had not finished anything still runs them again elsewhere.
+  **Migration:** a query that used to survive losing a worker now fails;
+  run it again. To get Ballista's stage retries back, pass
   `--stage-max-failures 4`, which brings the bug back with them.
 
 ### Fixed

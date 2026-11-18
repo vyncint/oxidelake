@@ -15,6 +15,7 @@ pub mod metrics;
 pub mod output;
 pub mod session;
 pub mod shutdown;
+mod worker_loss;
 
 pub use output::OutputFormat;
 pub use oxidelake_compute::udf;

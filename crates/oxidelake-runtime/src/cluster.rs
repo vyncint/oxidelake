@@ -31,7 +31,7 @@ use ballista_executor::new_standalone_executor_from_builder;
 use ballista_scheduler::cluster::memory::InMemoryJobState;
 use ballista_scheduler::cluster::{BallistaCluster, JobState};
 use ballista_scheduler::config::SchedulerConfig;
-use ballista_scheduler::scheduler_process::start_server;
+use ballista_scheduler::scheduler_process::{create_scheduler, start_grpc_service};
 use ballista_scheduler::scheduler_server::SessionBuilder;
 use ballista_scheduler::standalone::new_standalone_scheduler_with_builder;
 use ballista_scheduler::state::session_manager::share_file_statistics_cache;
@@ -43,6 +43,7 @@ use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::session_state::SessionState;
 use datafusion::prelude::SessionConfig;
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
+use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
 use oxidelake_compute::oxide_udfs;
 use oxidelake_core::{BackendKind, EngineError};
 use oxidelake_planner::codec::build_description;
@@ -55,6 +56,7 @@ use crate::admission::{
     REFUSED, SameBuildClusterState, failing_without_a_usable_worker, tagged_executor_id,
 };
 use crate::shutdown::{ShutdownSignal, Stopped, drain, refusing_while_draining, unfinished_jobs};
+use crate::worker_loss::{ReportingJobState, WorkerLoss};
 
 fn ballista_error(err: impl std::fmt::Display) -> EngineError {
     EngineError::execution(format!("ballista: {err}"))
@@ -268,7 +270,8 @@ pub fn function_registry() -> BallistaFunctionRegistry {
 /// (apache/datafusion-ballista#2677, unreleased after 55.0.0, and #2539,
 /// #2698). At 1 the first failed fetch fails the query, naming the worker.
 /// Only a failed fetch counts: Ballista rolls back a worker that is stopped,
-/// or silent past its timeout, whatever this says.
+/// or silent past its timeout, whatever this says, which is why
+/// [`run_scheduler`] also fails a lost worker's queries itself.
 pub const DEFAULT_STAGE_MAX_FAILURES: usize = 1;
 
 /// Scheduler configuration with OxideLake's hooks installed, failing a query
@@ -323,10 +326,22 @@ impl Scheduler {
             .parse()
             .map_err(|e| EngineError::plan(format!("invalid scheduler bind address: {e}")))?;
         let draining = Arc::new(AtomicBool::new(false));
-        let cluster = same_build_cluster(&config, Arc::clone(&draining));
+        let loss = Arc::new(WorkerLoss::default());
+        let cluster = same_build_cluster(&config, Arc::clone(&draining), Arc::clone(&loss));
         let jobs = cluster.job_state();
+        // What Ballista's `start_server` does, keeping hold of the scheduler
+        // so a lost worker's queries can be failed through it (#148).
+        let serve = async move {
+            config.validate()?;
+            tracing::info!(%address, "Ballista scheduler listening");
+            let scheduler =
+                create_scheduler::<LogicalPlanNode, PhysicalPlanNode>(cluster, Arc::new(config))
+                    .await?;
+            loss.attach(scheduler.clone());
+            start_grpc_service(address, scheduler).await
+        };
         Ok(Self {
-            serve: Box::pin(start_server(cluster, address, Arc::new(config))),
+            serve: Box::pin(serve),
             jobs,
             draining,
         })
@@ -398,11 +413,16 @@ pub async fn run_scheduler_with_shutdown(
 }
 
 /// What `BallistaCluster::new_from_config` builds, in-memory cluster and job
-/// state, with the cluster state admitting only workers of this build, the
-/// session builder failing a query that no admitted worker can run, and,
-/// once `draining` is set, every new query (#31).
-fn same_build_cluster(config: &SchedulerConfig, draining: Arc<AtomicBool>) -> BallistaCluster {
-    let state = Arc::new(SameBuildClusterState::default());
+/// state, with the cluster state admitting only workers of this build and
+/// failing a lost worker's queries through `loss` (#148), the job state
+/// saying why, and the session builder failing a query that no admitted
+/// worker can run and, once `draining` is set, every new query (#31).
+fn same_build_cluster(
+    config: &SchedulerConfig,
+    draining: Arc<AtomicBool>,
+    loss: Arc<WorkerLoss>,
+) -> BallistaCluster {
+    let state = Arc::new(SameBuildClusterState::new(Arc::clone(&loss)));
     let session_builder = config
         .override_session_builder
         .clone()
@@ -419,7 +439,7 @@ fn same_build_cluster(config: &SchedulerConfig, draining: Arc<AtomicBool>) -> Ba
         )),
         config_producer,
     );
-    BallistaCluster::new(state, Arc::new(jobs))
+    BallistaCluster::new(state, Arc::new(ReportingJobState::new(jobs, loss)))
 }
 
 /// Executor configuration with OxideLake's hooks installed.

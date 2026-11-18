@@ -1285,6 +1285,71 @@ fn a_query_that_loses_a_worker_fails_naming_it() {
     assert_the_query_fails_naming(&cluster, "w2", query, &after);
 }
 
+/// A worker stopped with `SIGTERM` in the middle of a query (#31, #148):
+/// the worker exits 0, and the query fails at once naming it. Ballista
+/// would have rolled the query back and run the lost work again, which on
+/// 55.0.0 hung in both runs tried; OxideLake fails the query before that
+/// rollback can start.
+#[test]
+#[cfg(unix)]
+fn a_query_whose_worker_stops_fails_naming_it() {
+    let dir = tempfile::tempdir().unwrap();
+    gen_data(dir.path(), 600_000);
+    let table_arg = format!("t={}", dir.path().display());
+    let after = embedded_sql(QUERY, &table_arg);
+
+    let mut cluster = TestCluster::start(dir.path(), "cpu", &[]);
+    cluster.spawn_worker("w1", &this_worker(), &[]);
+    let stopped = cluster.spawn_worker("w2", &this_worker(), &[]);
+    cluster.wait_ready(2);
+
+    let query = cluster.spawn_sql("query", &slow_join(200_000), &table_arg);
+    cluster.wait_log(
+        "w2",
+        "a join task",
+        Duration::from_secs(120),
+        starts_stage(JOIN_STAGE),
+    );
+    cluster.signal(stopped, "TERM");
+    let status = wait_exit(&mut cluster.processes[stopped].1, Duration::from_secs(60))
+        .unwrap_or_else(|| panic!("the stopped worker did not exit\n{}", cluster.logs()));
+    assert_eq!(status.code(), Some(0), "{}", cluster.logs());
+    assert_the_query_fails_naming(&cluster, "w2", query, &after);
+    let stderr = cluster.log("query");
+    assert!(
+        stderr.contains("was lost while this query ran") && stderr.contains("#148"),
+        "OxideLake's reason, not Ballista's \"Cancelled\":\n{stderr}"
+    );
+}
+
+/// A worker that goes silent in the middle of a query (#31, #148): once
+/// `--worker-timeout` passes without its heartbeat the query fails naming
+/// it, here before any shuffle fetch from it has run out of retries. With
+/// Ballista's recovery the same run returned duplicated rows.
+#[test]
+#[cfg(unix)]
+fn a_query_whose_worker_goes_silent_fails_naming_it() {
+    let dir = tempfile::tempdir().unwrap();
+    gen_data(dir.path(), 600_000);
+    let table_arg = format!("t={}", dir.path().display());
+    let after = embedded_sql(QUERY, &table_arg);
+
+    let mut cluster = TestCluster::start(dir.path(), "cpu", &["--worker-timeout", "5"]);
+    cluster.spawn_worker("w1", &this_worker(), &["--heartbeat-interval", "1"]);
+    let lost = cluster.spawn_worker("w2", &this_worker(), &["--heartbeat-interval", "1"]);
+    cluster.wait_ready(2);
+
+    let query = cluster.spawn_sql("query", &slow_join(200_000), &table_arg);
+    cluster.wait_log(
+        "w2",
+        "a join task",
+        Duration::from_secs(120),
+        starts_stage(JOIN_STAGE),
+    );
+    cluster.signal(lost, "KILL");
+    assert_the_query_fails_naming(&cluster, "w2", query, &after);
+}
+
 /// What #31 asked for, and what Ballista 55.0.0 does not do: with stage
 /// retries raised to Ballista's own default of 4, a query that loses a
 /// worker should come back with exactly the rows it would have had. It
@@ -1386,10 +1451,17 @@ fn sigterm_stops_a_worker_within_its_drain_timeout_with_exit_zero() {
         "{}",
         cluster.log("busy")
     );
-    // The query has no worker left; it is not what this test is about.
-    let mut query = query;
-    let _ = query.kill();
-    let _ = query.wait();
+    // A worker draining in the middle of a query must not lead that query
+    // into Ballista's rollback (#148): the query fails at once, naming the
+    // worker, rather than waiting for one that is never coming back.
+    let (succeeded, stdout, stderr) = finish_sql(&cluster, "query", query, Duration::from_secs(60));
+    assert!(!succeeded, "{stderr}");
+    assert_eq!(stdout, "", "no rows are printed for a failed query");
+    let port = format!("127.0.0.1:{}", cluster.flight_port("busy"));
+    assert!(
+        stderr.contains("was lost while this query ran") && stderr.contains(&port),
+        "{stderr}"
+    );
 }
 
 /// `SIGTERM` stops a scheduler gracefully (#31): a query sent from then on
