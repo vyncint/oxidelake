@@ -70,6 +70,18 @@ versions (0.x) may contain breaking changes; they are always listed under a
   come back in build order, as the CPU reference returns them. Not yet run
   on a GPU (STATUS.md).
 
+- **`oxide sql --output json` keeps the key of a NULL and tells NaN from
+  NULL** (#124). Every object now carries every column, a NULL as `null`;
+  the key used to be left out, so a script could not tell a NULL from a
+  column that does not exist. NaN, infinity and negative infinity, which
+  JSON has no number for, are the strings `"NaN"`, `"Infinity"` and
+  `"-Infinity"` in every float type, inside lists, structs and
+  dictionaries too; all three used to be written `null`, like a NULL. A
+  script that took a missing key for NULL reads `null` instead, and one
+  that reads a float column accepts the three strings, which Python's
+  `float()` and JavaScript's `Number()` read back. `--help` and the README
+  say so.
+
 ### Fixed
 
 - **A LIMIT over a GPU-placed filter or join returns its row count again**
@@ -409,17 +421,7 @@ versions (0.x) may contain breaking changes; they are always listed under a
   is refused. `oxidelake_planner::codec::PLAN_FINGERPRINT` and
   `build_description()` are public, and `make test-mixed-build` runs both
   cases with real binaries.
-- **`oxide sql --output json` keeps the key of a NULL and tells NaN from
-  NULL** (#124). Every object now carries every column, a NULL as `null`;
-  the key used to be left out, so a script could not tell a NULL from a
-  column that does not exist. NaN, infinity and negative infinity, which
-  JSON has no number for, are the strings `"NaN"`, `"Infinity"` and
-  `"-Infinity"` in every float type, inside lists, structs and
-  dictionaries too; all three used to be written `null`, like a NULL. A
-  script that took a missing key for NULL reads `null` instead, and one
-  that reads a float column accepts the three strings, which Python's
-  `float()` and JavaScript's `Number()` read back. `--help` and the README
-  say so.
+
 
 - **`OxideFrame::show()` no longer panics when stdout closes** (#125). It
   was DataFusion's `DataFrame::show`, whose `println!` panics on a closed
