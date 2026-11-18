@@ -35,6 +35,67 @@ versions (0.x) may contain breaking changes; they are always listed under a
   grow without limit now spills, or fails with a resources-exhausted error.
   The `Gpu*Exec` operators do not reserve from it.
 
+### Fixed
+
+- **A LIMIT over a GPU-placed filter or join returns its row count again**
+  (#86). DataFusion pushes a LIMIT into the `FilterExec` or `HashJoinExec`
+  under it as that node's `fetch` and removes the limit node when the node
+  runs in one partition — every input smaller than one batch, and every
+  `target_partitions = 1` session. The placement rule replaced the node
+  without its `fetch`, so `SELECT … WHERE k > 3 LIMIT 5` returned every
+  matching row on `--target cuda|metal`, embedded and on a cluster. A
+  lowered node now keeps the limit as a `LocalLimitExec` directly above it,
+  which `oxide explain` shows.
+
+- **A WHERE with more than 64 comparisons runs on the CPU instead of
+  failing** (#133). The device filter takes at most 64 comparison leaves
+  (`MAX_PREDICATE_LEAVES`, a cap that guards plans decoded off the
+  network), and the placement rule turned that refusal into a planning
+  error, so such a query failed on `--target cuda|metal` and on a GPU
+  cluster. The filter now stays on the CPU, and `oxide explain` prints
+  `FilterExec: GpuFilterExec predicate has 65 comparisons; at most 64 are
+  supported` under the plan. Decoded plans are still refused.
+
+- **`COUNT(*)` over a GPU-placed filter or join plans again** (#87).
+  `COUNT(*)` reads no column, so DataFusion gives the filter or join under
+  it an empty projection; the device operators return at least one column,
+  the placement rule passed their refusal up, and `SELECT count(*) FROM t
+  WHERE k > 3` failed with `GpuFilterExec: projection must select at least
+  one column` on `--target cuda|metal` (the detected target on a CUDA
+  machine) and on a GPU cluster; the join form failed the same way. The
+  node now keeps one column it reads anyway (the first predicate column,
+  the probe key) and an empty `ProjectionExec: expr=[]` above it drops the
+  column again, so the filter and the join still run on the device.
+
+- **`oxide explain`'s placement notes are accurate for `!=` and present for
+  joins** (#94). The note for a `!=` filter listed `!=` among the
+  comparisons the device kernels implement, which have none for it; it now
+  lists `=, <, <=, >, >=`, read from the table the lowering itself uses. A
+  hash or merge join left on the CPU for its join type, a condition besides
+  its keys, NULL-matching keys, more than one key pair or a non-`Int64` key
+  printed no note at all; each now says which, e.g. ``HashJoinExec: a
+  `Left` join has no device kernel; the device join is inner only``.
+
+- **ORDER BY, merge joins and windows over a GPU-placed sort-merge join are
+  right again** (#88). Under `prefer_hash_join = false`, Ballista's session
+  default and so the usual join plan on a GPU cluster, DataFusion plans a
+  `SortMergeJoinExec` and leaves out the sorts that the operators above it
+  would otherwise need, because its output is already in key order. The
+  placement rule swapped in the device join, which has no order, so an
+  `ORDER BY` on a join key came back unsorted, a LEFT merge join above it
+  lost rows, and a window partitioned by a join key failed with an internal
+  "All partition by columns should have an ordering" error, on a GPU
+  cluster and on `--target cuda|metal` with the setting. The device join now
+  has a `SortExec` on the merge join's order directly above it, in place of
+  the sorts DataFusion put under the merge join, and `oxide explain` shows
+  it. A merge join with a second order a sort cannot restore (one over a
+  `row_number()`, for example) stays on the CPU, and `oxide explain` says
+  so: ``SortMergeJoinExec: the merge join's output is also ordered by
+  `rn@1 ASC NULLS LAST, bk@2 ASC`, an order a sort over the device join
+  would not promise``. The device join also declares its two keys equal,
+  which DataFusion plans on: a window partitioned by one key over a lowered
+  hash join, DataFusion's default join, failed with the same error.
+
 ### Security
 
 - **thrift is out of the dependency graph** (#4, #54). parquet 59 decodes

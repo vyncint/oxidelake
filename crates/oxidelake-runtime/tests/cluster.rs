@@ -14,6 +14,7 @@ use arrow::util::display::{ArrayFormatter, FormatOptions};
 use datafusion::physical_plan::displayable;
 use datafusion::prelude::SessionContext;
 use oxidelake_core::BackendKind;
+use oxidelake_core::telemetry::TelemetryHub;
 use oxidelake_runtime::cluster::{build_session_state, session_config, start_standalone};
 use oxidelake_runtime::{OxideSession, SessionMode};
 use oxidelake_storage::{Compression, ParquetWriteOptions, write_parquet};
@@ -191,6 +192,135 @@ fn binaries_print_help() {
         assert!(
             String::from_utf8_lossy(&out.stdout).contains("Usage"),
             "{bin}"
+        );
+    }
+}
+
+/// The next operator id the process-wide hub will hand out.
+fn next_operator_id() -> usize {
+    TelemetryHub::global()
+        .snapshot()
+        .operators
+        .iter()
+        .map(|o| o.id + 1)
+        .max()
+        .unwrap_or(0)
+}
+
+/// How many `name` operators registered on the process-wide hub from id
+/// `since` on, and the rows they produced. The codec attaches that hub to
+/// every `Gpu*Exec` an executor decodes, so this is what the executors of
+/// the in-process cluster actually ran.
+fn ran_since(since: usize, name: &str) -> (usize, u64) {
+    TelemetryHub::global()
+        .snapshot()
+        .operators
+        .iter()
+        .filter(|o| o.id >= since && o.name == name)
+        .fold((0, 0), |(count, rows), o| (count + 1, rows + o.rows_out))
+}
+
+/// The placement rule's own cases on a cluster that plans with it, against
+/// embedded mode.
+///
+/// Ballista 55's adaptive planner, on by default, rebuilds the scheduler's
+/// session with its own physical optimizer rules and never runs the
+/// placement rule, so these queries use the static planner, which does.
+/// Each query also checks, through the process-wide telemetry hub, that the
+/// lowered node it is about ran on the executors.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_static_planner_runs_lowered_nodes_correctly() {
+    let dir = tempfile::tempdir().unwrap();
+    let (t_path, r_path) = write_dataset(dir.path());
+    let addr = start_standalone(BackendKind::Cuda, 2, 2).await.unwrap();
+    let cluster = OxideSession::connect(&format!("df://{addr}"))
+        .await
+        .unwrap();
+    cluster
+        .sql("SET ballista.planner.adaptive.enabled = false")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    cluster.register_parquet("t", &t_path).await.unwrap();
+    cluster.register_parquet("r", &r_path).await.unwrap();
+    let embedded = OxideSession::local().unwrap();
+    embedded.register_parquet("t", &t_path).await.unwrap();
+    embedded.register_parquet("r", &r_path).await.unwrap();
+
+    // Which rows a LIMIT keeps is unspecified, so only the count is compared.
+    // Ballista does not round-robin a scan, so the single-file `t` is one
+    // partition and the limit lives only in the filter's `fetch` (#86).
+    let sql = "SELECT s, k FROM t WHERE k >= 2 LIMIT 3";
+    let since = next_operator_id();
+    let batches = cluster.sql(sql).await.unwrap().collect().await.unwrap();
+    assert_eq!(
+        batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        3,
+        "{sql}"
+    );
+    assert!(
+        ran_since(since, "GpuFilterExec").0 > 0,
+        "{sql}: no GpuFilterExec ran"
+    );
+
+    // COUNT(*) reads no column, so the filter and the join under it have
+    // nothing to project; the filter failed planning on the scheduler (#87).
+    // The lowered node ran and produced exactly the rows counted.
+    for (sql, lowered) in [
+        ("SELECT count(*) FROM t WHERE k >= 3", "GpuFilterExec"),
+        (
+            "SELECT count(*) FROM t JOIN r ON t.k = r.rk",
+            "GpuHashJoinExec",
+        ),
+    ] {
+        let since = next_operator_id();
+        let batches = cluster.sql(sql).await.unwrap().collect().await.unwrap();
+        let local = embedded.sql(sql).await.unwrap().collect().await.unwrap();
+        assert_eq!(sorted_rows(&batches), sorted_rows(&local), "{sql}");
+        let counted = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        let (ran, rows) = ran_since(since, lowered);
+        assert!(
+            ran > 0 && i64::try_from(rows) == Ok(counted),
+            "{sql}: {ran} {lowered} produced {rows} rows, {counted} counted"
+        );
+    }
+
+    // The scheduler plans these joins as sort-merge joins (Ballista's
+    // sessions do not prefer hash joins), and an ORDER BY that matches the
+    // merge join's own key order (ascending, NULLs first) loses its sort.
+    // Lowering the merge join must keep that order (#88): it came back
+    // unsorted.
+    for sql in [
+        "SELECT t.k, r.name FROM t JOIN r ON t.k = r.rk ORDER BY t.k NULLS FIRST",
+        "SELECT r.rk, t.s FROM t JOIN r ON t.k = r.rk ORDER BY r.rk NULLS FIRST",
+    ] {
+        let since = next_operator_id();
+        let batches = cluster.sql(sql).await.unwrap().collect().await.unwrap();
+        let keys: Vec<i64> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert!(keys.len() > 1000, "{sql}: {} rows", keys.len());
+        assert!(keys.is_sorted(), "{sql}: not in key order: {keys:?}");
+        let local = sorted_rows(&embedded.sql(sql).await.unwrap().collect().await.unwrap());
+        assert_eq!(sorted_rows(&batches), local, "{sql}");
+        assert!(
+            ran_since(since, "GpuHashJoinExec").0 > 0,
+            "{sql}: no GpuHashJoinExec ran"
         );
     }
 }
