@@ -1038,6 +1038,7 @@ async fn a_window_by_the_other_key_runs_over_a_lowered_hash_join() {
             .unwrap();
         assert_eq!(sorted_rows(&actual), sorted_rows(&expected), "{context}");
     }
+}
 
 // --- aggregates ------------------------------------------------------------
 
