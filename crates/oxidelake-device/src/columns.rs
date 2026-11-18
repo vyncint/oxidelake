@@ -3,7 +3,10 @@
 //! GPU backends move raw Arrow buffers: fixed-width values plus a packed
 //! validity bitmap. This module extracts them from any (possibly sliced)
 //! array of a supported type and rebuilds arrays from downloaded bytes. It
-//! is backend-independent, so it is unit-tested on the CPU.
+//! is backend-independent, so it is unit-tested on the CPU. The bitmap has
+//! one bit per row: a vector column's elements travel without validity of
+//! their own, so [`extract`] refuses a NULL element inside a valid row rather
+//! than return it as a number (#105).
 //!
 //! Extraction is zero-copy: values are [`Buffer`] slices of the array's own
 //! allocation and validity is the array's bitmap (re-packed only when a slice
@@ -98,7 +101,94 @@ fn slice_checked(
     Ok(buffer.slice_with_length(start, len))
 }
 
+/// The first row of a vector column that is valid but holds a NULL element,
+/// or `None`, which it always is for a column of any other type.
+///
+/// It is the one content of a device-eligible column that the device format
+/// cannot carry: the bitmap has one bit per *row*, so the element would come
+/// back from a device as a valid number (#105). [`extract`] refuses such a
+/// column, and the operator layer keeps it on the host instead of uploading
+/// it. NULL elements under a NULL row do not count: the row is NULL whatever
+/// they hold, and a nullable vector column built with `append_null` has
+/// exactly those, so counting them would keep every nullable vector column
+/// off the device.
+pub fn row_with_null_element(array: &dyn Array) -> Result<Option<usize>, EngineError> {
+    let DataType::FixedSizeList(field, size) = array.data_type() else {
+        return Ok(None);
+    };
+    if *field.data_type() != DataType::Float32 {
+        return Ok(None);
+    }
+    let size =
+        usize::try_from(*size).map_err(|_| EngineError::plan("negative FixedSizeList size"))?;
+    let data = array.to_data();
+    let child = data
+        .child_data()
+        .first()
+        .ok_or_else(|| EngineError::format("FixedSizeList array without child data"))?;
+    null_element_row(data.nulls(), child.nulls(), data.offset(), data.len(), size)
+}
+
+/// [`row_with_null_element`] over a list's parts: `len` rows of `size`
+/// elements from row `offset`, with `rows` and `elements` the list's and its
+/// child's validity.
+fn null_element_row(
+    rows: Option<&NullBuffer>,
+    elements: Option<&NullBuffer>,
+    offset: usize,
+    len: usize,
+    size: usize,
+) -> Result<Option<usize>, EngineError> {
+    let Some(elements) = elements.filter(|e| e.null_count() > 0) else {
+        return Ok(None);
+    };
+    let end = offset
+        .checked_add(len)
+        .and_then(|rows| rows.checked_mul(size));
+    if end.is_none_or(|end| end > elements.len()) {
+        return Err(EngineError::format(format!(
+            "vector column: rows {offset}..{} of {size} elements reach past its {} child values",
+            offset.saturating_add(len),
+            elements.len()
+        )));
+    }
+    let elements = elements.slice(offset * size, len * size);
+    let nulls = elements.null_count();
+    if nulls == 0 {
+        return Ok(None);
+    }
+    // A nullable column whose NULL rows hold NULL elements is the common
+    // shape, and every upload of one asks this. Counting the NULL elements
+    // under NULL rows (a popcount per NULL row) answers it without visiting
+    // each element of each valid row: if they are all of them, no valid row
+    // holds one.
+    if let Some(rows) = rows {
+        let bits = elements.inner();
+        let valid_in = |row: usize| {
+            bits.inner()
+                .count_set_bits_offset(bits.offset() + row * size, size)
+        };
+        let under_null_rows: usize = (0..len)
+            .filter(|&row| rows.is_null(row))
+            .map(|row| size - valid_in(row))
+            .sum();
+        if under_null_rows == nulls {
+            return Ok(None);
+        }
+    }
+    Ok(elements
+        .iter()
+        .enumerate()
+        .filter(|&(_, valid)| !valid)
+        .map(|(element, _)| element / size)
+        .find(|&row| rows.is_none_or(|r| r.is_valid(row))))
+}
+
 /// Extracts the raw bytes of a supported column without copying them.
+///
+/// A vector column with a NULL element inside a valid row
+/// ([`row_with_null_element`]) is refused as [`EngineError::Unsupported`]:
+/// this format cannot carry the element's NULL.
 pub fn extract(array: &ArrayRef) -> Result<ColumnBytes, EngineError> {
     let data = array.to_data();
     let len = data.len();
@@ -133,6 +223,16 @@ pub fn extract(array: &ArrayRef) -> Result<ColumnBytes, EngineError> {
                 .ok_or_else(|| EngineError::format("FixedSizeList child without a value buffer"))?;
             let start = (child.offset() + offset * size) * 4;
             let values = slice_checked(buffer, start, len * size * 4, "vector column")?;
+            if let Some(row) = null_element_row(data.nulls(), child.nulls(), offset, len, size)? {
+                return Err(EngineError::unsupported(
+                    "device.vector_null_element",
+                    format!(
+                        "row {row} of the vector column is valid but holds a NULL element, \
+                         which the device format (one validity bit per row) would return \
+                         as a number"
+                    ),
+                ));
+            }
             Ok(ColumnBytes {
                 data_type: dt.clone(),
                 len,
@@ -310,5 +410,111 @@ mod tests {
         let arr: ArrayRef = Arc::new(StringArray::from(vec!["a"]));
         let err = extract(&arr).unwrap_err();
         assert!(err.is_unsupported());
+    }
+
+    /// Two-element vectors over `elements`, with optional row validity.
+    fn vectors(elements: Vec<Option<f32>>, rows: Option<Vec<bool>>) -> ArrayRef {
+        Arc::new(
+            FixedSizeListArray::try_new(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                2,
+                Arc::new(Float32Array::from(elements)),
+                rows.map(NullBuffer::from),
+            )
+            .unwrap(),
+        )
+    }
+
+    /// #105: the rebuilt column used to hold `[1.0, 0.0]` where the original
+    /// held `[1.0, NULL]` — the element bitmap was dropped on extraction.
+    #[test]
+    fn a_null_element_in_a_valid_row_is_refused() {
+        let arr = vectors(
+            vec![Some(1.0), None, Some(3.0), Some(4.0)],
+            Some(vec![true, true]),
+        );
+        let err = extract(&arr).unwrap_err();
+        assert!(err.is_unsupported(), "{err}");
+        assert!(err.to_string().contains("row 0"), "{err}");
+    }
+
+    /// What a builder's `append_null` leaves: NULL elements under a NULL row.
+    /// The row is NULL whatever they hold, so the column stays eligible and
+    /// round-trips equal.
+    #[test]
+    fn null_elements_under_null_rows_round_trip() {
+        let arr = vectors(
+            vec![Some(1.0), Some(2.0), None, None, Some(5.0), Some(6.0)],
+            Some(vec![true, false, true]),
+        );
+        let back = rebuild(extract(&arr).unwrap()).unwrap();
+        assert_eq!(back.as_ref(), arr.as_ref());
+    }
+
+    /// Only the extracted rows are checked: a slice that leaves the NULL
+    /// element out extracts, and round-trips equal.
+    #[test]
+    fn only_the_extracted_rows_are_checked() {
+        let arr = vectors(
+            vec![Some(1.0), None, Some(3.0), Some(4.0), Some(5.0), Some(6.0)],
+            None,
+        );
+        assert!(extract(&arr).unwrap_err().is_unsupported());
+        assert!(extract(&arr.slice(0, 1)).unwrap_err().is_unsupported());
+        let tail = arr.slice(1, 2);
+        let back = rebuild(extract(&tail).unwrap()).unwrap();
+        assert_eq!(back.as_ref(), tail.as_ref());
+    }
+
+    /// The shapes that decide the check: a NULL element in a valid row is
+    /// found, NULL elements under NULL rows never are, and the counting
+    /// shortcut is not fooled when the counts match but the positions do not.
+    #[test]
+    fn null_elements_count_only_in_valid_rows() {
+        let found = |elements: Vec<Option<f32>>, rows: Option<Vec<bool>>| {
+            row_with_null_element(vectors(elements, rows).as_ref()).unwrap()
+        };
+        assert_eq!(
+            found(vec![Some(1.0), Some(2.0), Some(3.0), None], None),
+            Some(1)
+        );
+        assert_eq!(
+            found(
+                vec![None, None, Some(3.0), Some(4.0), Some(5.0), None],
+                Some(vec![false, true, false]),
+            ),
+            None
+        );
+        // Two NULL elements, and two elements under the NULL row — but one of
+        // the NULLs is in valid row 0.
+        assert_eq!(
+            found(
+                vec![Some(1.0), None, None, Some(4.0)],
+                Some(vec![true, false]),
+            ),
+            Some(0)
+        );
+        let ints: ArrayRef = Arc::new(Int64Array::from(vec![None, Some(1)]));
+        assert_eq!(row_with_null_element(ints.as_ref()).unwrap(), None);
+    }
+
+    /// arrow-rs lists always present offset 0 with a sliced child, so a
+    /// list's own offset only reaches the check through its parts.
+    #[test]
+    fn the_check_counts_rows_from_the_list_offset() {
+        let elements = NullBuffer::from(vec![true, false, true, true, false, false]);
+        // Rows 1 and 2 of a list of pairs: [valid, valid] and [NULL, NULL]
+        // under a NULL row; the NULL element in row 0 is outside.
+        let rows = NullBuffer::from(vec![true, false]);
+        assert_eq!(
+            null_element_row(Some(&rows), Some(&elements), 1, 2, 2).unwrap(),
+            None
+        );
+        assert_eq!(
+            null_element_row(None, Some(&elements), 0, 1, 2).unwrap(),
+            Some(0)
+        );
+        // Rows past the child are an error, not a panic.
+        assert!(null_element_row(None, Some(&elements), 2, 2, 2).is_err());
     }
 }

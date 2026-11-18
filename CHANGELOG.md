@@ -410,6 +410,19 @@ versions (0.x) may contain breaking changes; they are always listed under a
   `build_description()` are public, and `make test-mixed-build` runs both
   cases with real binaries.
 
+- **NULL elements inside a vector column survive a GPU filter or join**
+  (#105). The device transfer format carries one validity bit per row, so a
+  NULL element inside a valid `FixedSizeList<Float32>` row came back from a
+  CUDA or Metal filter, or a CUDA join, as a valid `0.0`, where the CPU path
+  kept it NULL. Such a column now stays on the host, as a `Utf8` column
+  does, and is gathered at the rows the device selected; the rest of the
+  batch still runs on the device. `columns::extract` refuses one as
+  `Unsupported`, so a vector distance over it, whose kernel has to read the
+  column, runs on the CPU reference, counted in `fallback_batches`, with the
+  same distances. NULL elements under a NULL row, which a builder's
+  `append_null` leaves, do not count. New:
+  `columns::row_with_null_element`.
+
 ### Security
 
 - **thrift is out of the dependency graph** (#4, #54). parquet 59 decodes

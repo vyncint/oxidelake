@@ -827,3 +827,389 @@ async fn join_collects_repartitioned_build_side_once() {
         .with_backend(cpu());
     assert_eq!(exec_rows(&ctx, Arc::new(join)).await, expected);
 }
+
+/// NULL elements inside vectors through the device transfer format (#105).
+///
+/// The format carries one validity bit per row, so a NULL element inside a
+/// valid row used to come back from a CUDA or Metal filter, or a CUDA join,
+/// as a valid `0.0`. The CPU backend never moves bytes, which is why the
+/// suite above could not see it: `TransferSim` can.
+mod vector_null_elements {
+    use arrow::array::AsArray;
+    use arrow::datatypes::Float32Type;
+    use oxidelake_compute::JoinBuild;
+    use oxidelake_core::{DeviceId, EngineError};
+    use oxidelake_device::cpu::kernels;
+    use oxidelake_device::{
+        AggregateArgs, DeviceBatch, DeviceBuffer, DeviceJoinMatches, DeviceJoinTable, DeviceStream,
+        FilterProjectArgs, HashJoinArgs, HostBuffer, JoinBuildArgs, JoinProbeArgs, MemoryInfo,
+        VectorDistanceArgs, columns,
+    };
+
+    use super::*;
+
+    /// A backend that claims to be CUDA and moves every batch through the
+    /// device byte format — `columns::extract_batch` on upload,
+    /// `columns::rebuild_batch` on download, what `CudaBackend` and
+    /// `MetalBackend` do around their copies — while the kernels run on the
+    /// CPU reference. On a machine with no GPU it is the closest thing to a
+    /// device: whatever the format cannot carry comes back as a wrong row.
+    #[derive(Debug)]
+    struct TransferSim(CpuBackend);
+
+    impl TransferSim {
+        fn shared() -> Arc<dyn GpuBackend> {
+            Arc::new(Self(CpuBackend::new()))
+        }
+
+        fn through_the_format(batch: &RecordBatch) -> Result<RecordBatch, EngineError> {
+            columns::rebuild_batch(&batch.schema(), columns::extract_batch(batch)?)
+        }
+    }
+
+    impl GpuBackend for TransferSim {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Cuda
+        }
+        fn device_id(&self) -> DeviceId {
+            DeviceId::new(BackendKind::Cuda, 0)
+        }
+        fn memory_info(&self) -> Result<MemoryInfo, EngineError> {
+            self.0.memory_info()
+        }
+        fn alloc_device(&self, bytes: usize) -> Result<DeviceBuffer, EngineError> {
+            self.0.alloc_device(bytes)
+        }
+        fn alloc_pinned_host(&self, bytes: usize) -> Result<HostBuffer, EngineError> {
+            self.0.alloc_pinned_host(bytes)
+        }
+        fn create_stream(&self) -> Result<DeviceStream, EngineError> {
+            self.0.create_stream()
+        }
+        fn copy_h2d(
+            &self,
+            stream: &DeviceStream,
+            src: &HostBuffer,
+            dst: &mut DeviceBuffer,
+        ) -> Result<(), EngineError> {
+            self.0.copy_h2d(stream, src, dst)
+        }
+        fn copy_d2h(
+            &self,
+            stream: &DeviceStream,
+            src: &DeviceBuffer,
+            dst: &mut HostBuffer,
+        ) -> Result<(), EngineError> {
+            self.0.copy_d2h(stream, src, dst)
+        }
+        fn synchronize(&self, stream: &DeviceStream) -> Result<(), EngineError> {
+            self.0.synchronize(stream)
+        }
+        fn upload(
+            &self,
+            stream: &DeviceStream,
+            batch: &RecordBatch,
+        ) -> Result<DeviceBatch, EngineError> {
+            self.0.upload(stream, &Self::through_the_format(batch)?)
+        }
+        fn download(
+            &self,
+            stream: &DeviceStream,
+            batch: &DeviceBatch,
+        ) -> Result<RecordBatch, EngineError> {
+            Self::through_the_format(&self.0.download(stream, batch)?)
+        }
+        fn filter_project(
+            &self,
+            stream: &DeviceStream,
+            args: FilterProjectArgs<'_>,
+        ) -> Result<DeviceBatch, EngineError> {
+            self.0.filter_project(stream, args)
+        }
+        fn hash_join(
+            &self,
+            stream: &DeviceStream,
+            args: HashJoinArgs<'_>,
+        ) -> Result<DeviceBatch, EngineError> {
+            self.0.hash_join(stream, args)
+        }
+        fn prepare_join_build(
+            &self,
+            stream: &DeviceStream,
+            args: JoinBuildArgs<'_>,
+        ) -> Result<DeviceJoinTable, EngineError> {
+            self.0.prepare_join_build(stream, args)
+        }
+        fn probe_join(
+            &self,
+            stream: &DeviceStream,
+            args: JoinProbeArgs<'_>,
+        ) -> Result<DeviceJoinMatches, EngineError> {
+            self.0.probe_join(stream, args)
+        }
+        fn aggregate(
+            &self,
+            stream: &DeviceStream,
+            args: AggregateArgs<'_>,
+        ) -> Result<DeviceBatch, EngineError> {
+            self.0.aggregate(stream, args)
+        }
+        fn vector_distance(
+            &self,
+            stream: &DeviceStream,
+            args: VectorDistanceArgs<'_>,
+        ) -> Result<DeviceBatch, EngineError> {
+            self.0.vector_distance(stream, args)
+        }
+    }
+
+    /// `id Int64`, `k Int64?`, `vec FixedSizeList<Float32, DIM>?` with a
+    /// nullable child. Every NULL row holds NULL elements, the way a
+    /// builder's `append_null` leaves it; with `holes`, about one valid row in
+    /// five holds a NULL element too — the shape the format cannot carry.
+    fn gen_null_elements(seed: u64, rows: usize, holes: bool) -> RecordBatch {
+        let mut rng = StdRng::seed_from_u64(seed ^ 0x0e1e_3e17);
+        let k: Vec<Option<i64>> = (0..rows)
+            .map(|_| (!rng.random_bool(0.1)).then(|| rng.random_range(0..10i64)))
+            .collect();
+        let valid: Vec<bool> = (0..rows).map(|_| !rng.random_bool(0.15)).collect();
+        let mut elements: Vec<Option<f32>> = Vec::with_capacity(rows * DIM);
+        for &row_valid in &valid {
+            let hole =
+                (holes && row_valid && rng.random_bool(0.2)).then(|| rng.random_range(0..DIM));
+            for e in 0..DIM {
+                elements
+                    .push((row_valid && hole != Some(e)).then(|| rng.random_range(-5.0f32..5.0)));
+            }
+        }
+        let vectors = FixedSizeListArray::try_new(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            DIM as i32,
+            Arc::new(Float32Array::from(elements)),
+            Some(NullBuffer::from(valid)),
+        )
+        .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("k", DataType::Int64, true),
+            Field::new("vec", vectors.data_type().clone(), true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..rows as i64)),
+                Arc::new(Int64Array::from(k)),
+                Arc::new(vectors),
+            ],
+        )
+        .unwrap()
+    }
+
+    async fn check_filter(backend: Arc<dyn GpuBackend>, seed: u64, rows: usize) {
+        let ctx = SessionContext::new();
+        let batch = gen_null_elements(seed, rows, true);
+        ctx.register_batch("t", batch.clone()).unwrap();
+        let expected = sql_rows(&ctx, "SELECT id, vec FROM t WHERE k >= 3").await;
+        let exec = GpuFilterExec::try_new(
+            physical_plan(&ctx, batch).await,
+            Predicate::compare(1, Comparison::GtEq, Literal::Int64(3)),
+            vec![0, 2],
+            backend.kind(),
+        )
+        .unwrap()
+        .with_backend(backend);
+        let actual = exec_rows(&ctx, Arc::new(exec)).await;
+        assert_eq!(actual, expected, "filter seed={seed} rows={rows}");
+    }
+
+    /// The vector column on the probe side, then on the build side.
+    async fn check_join(backend: Arc<dyn GpuBackend>, seed: u64, rows: usize) {
+        let ctx = SessionContext::new();
+        let vectors = gen_null_elements(seed, rows, true);
+        let names = gen_right(seed, rows / 2 + 1);
+        ctx.register_batch("v", vectors.clone()).unwrap();
+        ctx.register_batch("r", names.clone()).unwrap();
+        let expected = sql_rows(
+            &ctx,
+            "SELECT v.id, v.k, v.vec, r.rk, r.name FROM v INNER JOIN r ON v.k = r.rk",
+        )
+        .await;
+        let exec = GpuHashJoinExec::try_new(
+            physical_plan(&ctx, vectors.clone()).await,
+            physical_plan(&ctx, names.clone()).await,
+            1,
+            0,
+            backend.kind(),
+        )
+        .unwrap()
+        .with_backend(Arc::clone(&backend));
+        let actual = exec_rows(&ctx, Arc::new(exec)).await;
+        assert_eq!(actual, expected, "probe-side join seed={seed} rows={rows}");
+
+        let expected = sql_rows(
+            &ctx,
+            "SELECT r.rk, r.name, v.id, v.k, v.vec FROM r INNER JOIN v ON r.rk = v.k",
+        )
+        .await;
+        let exec = GpuHashJoinExec::try_new(
+            physical_plan(&ctx, names).await,
+            physical_plan(&ctx, vectors).await,
+            0,
+            1,
+            backend.kind(),
+        )
+        .unwrap()
+        .with_backend(backend);
+        let actual = exec_rows(&ctx, Arc::new(exec)).await;
+        assert_eq!(actual, expected, "build-side join seed={seed} rows={rows}");
+    }
+
+    /// Runs `run` on a `GpuOperator` over `backend` and returns what it
+    /// produced with the operator's `(fallback_batches, bytes_h2d)`: the
+    /// witness of which path it took.
+    fn witnessed<T>(
+        backend: Arc<dyn GpuBackend>,
+        run: impl FnOnce(&GpuOperator) -> T,
+    ) -> (T, u64, u64) {
+        let hub = TelemetryHub::new();
+        let stats = hub.register_operator("GpuOperator", backend.kind());
+        let operator = GpuOperator::new(backend, Some(Arc::clone(&stats))).unwrap();
+        let out = run(&operator);
+        let snapshot = stats.snapshot();
+        (out, snapshot.fallback_batches, snapshot.bytes_h2d)
+    }
+
+    /// One filter batch through a `GpuOperator` on `backend`, checked against
+    /// the CPU reference; returns its `(fallback_batches, bytes_h2d)`.
+    pub(super) fn filter_once(
+        backend: Arc<dyn GpuBackend>,
+        batch: &RecordBatch,
+        predicate: &Predicate,
+        projection: &[usize],
+    ) -> (u64, u64) {
+        let (out, fallbacks, h2d) = witnessed(backend, |op| {
+            op.filter_project(batch, predicate, projection).unwrap()
+        });
+        assert_eq!(
+            out,
+            kernels::filter_project(batch, predicate, projection).unwrap(),
+            "device path and CPU reference disagree"
+        );
+        (fallbacks, h2d)
+    }
+
+    /// One probe batch joined against `build`, checked against the CPU
+    /// reference; returns its `(fallback_batches, bytes_h2d)`. The output
+    /// comes out in pieces of at most `CHUNK` rows (#95), so a column kept on
+    /// the host is gathered at each piece's row ids, not once.
+    fn join_once(
+        backend: Arc<dyn GpuBackend>,
+        probe: &RecordBatch,
+        probe_key: usize,
+        build: &RecordBatch,
+        build_key: usize,
+    ) -> (u64, u64) {
+        const CHUNK: usize = 61;
+        let build = JoinBuild::new(build.clone(), build_key).unwrap();
+        let (pieces, fallbacks, h2d) = witnessed(backend, |op| {
+            let mut probed = op.hash_join(probe, &build, probe_key, None, CHUNK).unwrap();
+            let mut pieces = Vec::new();
+            while let Some(piece) = op.next_join_chunk(&mut probed, &build).unwrap() {
+                pieces.push(piece);
+            }
+            pieces
+        });
+        assert!(pieces.len() > 1, "{} piece(s)", pieces.len());
+        let reference =
+            kernels::hash_join_probe(probe, probe_key, build.batch(), build.table(), None).unwrap();
+        assert_eq!(
+            sorted_rows(&pieces),
+            sorted_rows(&[reference]),
+            "device path and CPU reference disagree"
+        );
+        (fallbacks, h2d)
+    }
+
+    /// Equal rows prove nothing if every batch quietly took the CPU path. A
+    /// filter or a join runs on the device whether or not a valid row holds a
+    /// NULL element: such a column is gathered on the host, not uploaded —
+    /// `extract`, and so `TransferSim`, would refuse it and count a fallback.
+    /// A vector distance has to read the column on the device, so over such
+    /// a batch it is the one that runs on the CPU reference, counted.
+    fn assert_device_path_witnessed(backend: &Arc<dyn GpuBackend>) {
+        let predicate = Predicate::compare(1, Comparison::GtEq, Literal::Int64(3));
+        let names = gen_right(5, 40);
+        let query = [0.5f32, -1.0, 2.0, 0.25];
+        for holes in [false, true] {
+            let batch = gen_null_elements(5, 300, holes);
+            let vectors = batch.column(2);
+            assert!(vectors.null_count() > 0, "the fixture has NULL rows");
+            assert_eq!(
+                columns::row_with_null_element(vectors.as_ref())
+                    .unwrap()
+                    .is_some(),
+                holes,
+                "the fixture's valid rows hold NULL elements"
+            );
+            let (fallbacks, h2d) = filter_once(Arc::clone(backend), &batch, &predicate, &[0, 2]);
+            assert_eq!(fallbacks, 0, "filter fell back (holes: {holes})");
+            assert!(h2d > 0, "filter uploaded nothing (holes: {holes})");
+            if backend.supports_hash_join() {
+                let probe = join_once(Arc::clone(backend), &batch, 1, &names, 0);
+                let build = join_once(Arc::clone(backend), &names, 0, &batch, 1);
+                for (side, (fallbacks, h2d)) in [("probe", probe), ("build", build)] {
+                    assert_eq!(fallbacks, 0, "{side}-side join fell back (holes: {holes})");
+                    assert!(h2d > 0, "{side}-side join uploaded nothing");
+                }
+            }
+            let (out, fallbacks, _) = witnessed(Arc::clone(backend), |op| {
+                op.vector_distance(&batch, 2, &query, DistanceMetric::L2, "d")
+                    .unwrap()
+            });
+            let expected = u64::from(holes);
+            assert_eq!(fallbacks, expected, "vector distance (holes: {holes})");
+            let reference =
+                kernels::vector_distance(&batch, 2, &query, DistanceMetric::L2, "d").unwrap();
+            let got = out.column(3).as_primitive::<Float32Type>();
+            let want = reference.column(3).as_primitive::<Float32Type>();
+            assert_eq!(got.nulls(), want.nulls(), "vector distance NULLs");
+            for (row, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                if let (Some(g), Some(w)) = (g, w) {
+                    assert!((g - w).abs() < 1e-4, "row {row}: {g} vs {w}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn null_vector_elements_survive_the_device_format() {
+        let backend = TransferSim::shared();
+        for &seed in &SEEDS {
+            for &rows in &SIZES {
+                check_filter(Arc::clone(&backend), seed, rows).await;
+                check_join(Arc::clone(&backend), seed, rows).await;
+            }
+        }
+        assert_device_path_witnessed(&backend);
+    }
+
+    /// The same on a real device. Run on a GPU box with
+    /// `OXIDE_BACKEND=cuda cargo test -p oxidelake-compute --features cuda -- --ignored`.
+    #[tokio::test]
+    #[ignore = "requires a GPU backend (CUDA or Metal) on this machine"]
+    async fn gpu_backend_keeps_null_vector_elements_when_available() {
+        let backend = HardwareDetector::select().unwrap();
+        assert!(
+            backend.kind().is_gpu(),
+            "no GPU backend detected: {:?}",
+            backend.kind()
+        );
+        for &seed in &SEEDS {
+            for &rows in &SIZES {
+                check_filter(Arc::clone(&backend), seed, rows).await;
+                check_join(Arc::clone(&backend), seed, rows).await;
+            }
+        }
+        assert_device_path_witnessed(&backend);
+    }
+}

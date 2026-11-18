@@ -11,7 +11,8 @@
 //!   leave the host: the device also compacts a synthetic row-id column and
 //!   the operator gathers those columns with Arrow `take` afterwards, so a
 //!   string column in the projection no longer forces a whole batch onto the
-//!   CPU path;
+//!   CPU path. A vector column with a NULL element inside a valid row stays
+//!   there too, since the transfer format cannot carry that NULL (#105);
 //! * a backend is asked whether it supports an operation *before* anything is
 //!   uploaded ([`GpuBackend::supports_predicate`] and friends);
 //! * a hash join's build side is hashed once ([`JoinBuild`]), then uploaded
@@ -45,6 +46,25 @@ const ROW_ID: &str = "__oxide_row";
 fn device_eligible(dt: &DataType) -> bool {
     matches!(dt, DataType::Int64 | DataType::Float64 | DataType::Float32)
         || vector_dimension(dt).is_some()
+}
+
+/// Whether a projected `column` is uploaded, rather than kept on the host and
+/// gathered at the row ids the device selected.
+///
+/// The type decides first. A vector column of a device type stays on the host
+/// as well when a valid row holds a NULL element: the transfer format has one
+/// validity bit per row, so a device filter or join would hand the element
+/// back as a valid number (#105). Gathered on the host it keeps its NULL, and
+/// the batch still runs on the device instead of falling back whole.
+fn travels(column: &ArrayRef) -> Result<bool, EngineError> {
+    Ok(device_eligible(column.data_type())
+        && oxidelake_device::columns::row_with_null_element(column.as_ref())?.is_none())
+}
+
+/// [`travels`] for column `index` of `batch`, which must exist.
+fn column_travels(batch: &RecordBatch, index: usize) -> Result<bool, EngineError> {
+    field(&batch.schema(), index)?;
+    travels(batch.column(index))
 }
 
 fn push_unique(cols: &mut Vec<usize>, index: usize) {
@@ -156,17 +176,38 @@ pub struct JoinBuild {
     /// partition produces it — carries them. A join whose probe side yields
     /// no batch at all records none, and so reports no build rows either.
     rows_counted: AtomicBool,
+    /// Per column, whether it [`travels`] to the device. Every probe batch's
+    /// [`JoinPlan`] asks; the build side never changes and is uploaded once
+    /// per operator (#45), so it is checked once here rather than once per
+    /// probe batch — for a nullable vector column, a pass over its rows.
+    uploadable: Vec<bool>,
 }
 
 impl JoinBuild {
     /// Hashes `batch` on its `Int64` column `key`.
     pub fn new(batch: RecordBatch, key: usize) -> Result<Self, EngineError> {
         let table = JoinTable::build(&batch, key)?;
+        let uploadable = batch
+            .columns()
+            .iter()
+            .map(travels)
+            .collect::<Result<_, _>>()?;
         Ok(Self {
             batch,
             key,
             table,
             rows_counted: AtomicBool::new(false),
+            uploadable,
+        })
+    }
+
+    /// Whether build column `index` [`travels`] to the device.
+    fn uploadable(&self, index: usize) -> Result<bool, EngineError> {
+        self.uploadable.get(index).copied().ok_or_else(|| {
+            EngineError::plan(format!(
+                "column index {index} out of range for a build side with {} columns",
+                self.uploadable.len()
+            ))
         })
     }
 
@@ -228,15 +269,18 @@ struct JoinPlan {
 }
 
 impl JoinPlan {
+    /// The plan for one probe batch `left` against `build`. Which columns
+    /// travel depends on what they hold, not only their type (#105): the
+    /// probe batch is checked here, each time; the build side was checked
+    /// once, when its [`JoinBuild`] was made.
     fn new(
-        left: &Schema,
-        right: &Schema,
+        left: &RecordBatch,
+        build: &JoinBuild,
         left_key: usize,
-        right_key: usize,
         projection: Option<&[usize]>,
     ) -> Result<Self, EngineError> {
-        let width = left.fields().len();
-        let all = width + right.fields().len();
+        let width = left.num_columns();
+        let all = width + build.batch().num_columns();
         let selected: Vec<usize> = match projection {
             Some(p) => p.to_vec(),
             None => (0..all).collect(),
@@ -247,18 +291,18 @@ impl JoinPlan {
             )));
         }
         let left_plan = GpuOperator::side_plan(
-            left,
             left_key,
             selected.iter().copied().filter(|&i| i < width),
+            |index| column_travels(left, index),
         )?;
         let right_plan = GpuOperator::side_plan(
-            right,
-            right_key,
+            build.key(),
             selected
                 .iter()
                 .copied()
                 .filter(|&i| i >= width)
                 .map(|i| i - width),
+            |index| build.uploadable(index),
         )?;
         Ok(Self {
             selected,
@@ -572,7 +616,7 @@ impl GpuOperator {
         let schema = batch.schema();
         let eligible: Vec<bool> = projection
             .iter()
-            .map(|&i| field(&schema, i).map(|f| device_eligible(f.data_type())))
+            .map(|&i| column_travels(batch, i))
             .collect::<Result<_, _>>()?;
         let mut device_cols = predicate.columns();
         device_cols.dedup();
@@ -752,15 +796,18 @@ impl GpuOperator {
         Ok(Some(out))
     }
 
+    /// One join side's plan: its key, then each `selected` column that
+    /// `travels`; any other selected column is gathered on the host at row
+    /// ids.
     fn side_plan(
-        schema: &Schema,
         key: usize,
         selected: impl Iterator<Item = usize>,
+        travels: impl Fn(usize) -> Result<bool, EngineError>,
     ) -> Result<SidePlan, EngineError> {
         let mut device_cols = vec![key];
         let mut row_ids = false;
         for index in selected {
-            if device_eligible(field(schema, index)?.data_type()) {
+            if travels(index)? {
                 push_unique(&mut device_cols, index);
             } else {
                 row_ids = true;
@@ -860,13 +907,7 @@ impl GpuOperator {
         left_key: usize,
         projection: Option<&[usize]>,
     ) -> Result<Probed, EngineError> {
-        let plan = JoinPlan::new(
-            &left.schema(),
-            &build.batch().schema(),
-            left_key,
-            build.key(),
-            projection,
-        )?;
+        let plan = JoinPlan::new(left, build, left_key, projection)?;
         let left_sub = plan.left.sub_batch(left)?;
         let key = plan
             .left
@@ -1321,6 +1362,58 @@ mod tests {
         assert!(build.table().matches(2).is_empty());
         assert_eq!(build.key(), 0);
         assert_eq!(build.batch().num_rows(), 4);
+    }
+
+    /// #105: a vector column whose valid rows hold a NULL element is planned
+    /// like a `Utf8` column — kept off the device and gathered at row ids —
+    /// on either side of a join, while the same column with NULL elements
+    /// only under its NULL row is uploaded.
+    #[test]
+    fn a_vector_column_with_null_elements_in_valid_rows_stays_on_the_host() {
+        use arrow::array::{Array, FixedSizeListArray, Float32Array};
+        use arrow::buffer::NullBuffer;
+
+        let with = |second: Option<f32>| {
+            let vectors = FixedSizeListArray::try_new(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                2,
+                Arc::new(Float32Array::from(vec![
+                    Some(1.0),
+                    second,
+                    None,
+                    None,
+                    Some(5.0),
+                    Some(6.0),
+                ])),
+                Some(NullBuffer::from(vec![true, false, true])),
+            )
+            .unwrap();
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("k", DataType::Int64, false),
+                    Field::new("vec", vectors.data_type().clone(), true),
+                ])),
+                vec![Arc::new(Int64Array::from(vec![1, 2, 3])), Arc::new(vectors)],
+            )
+            .unwrap()
+        };
+        let sides = |probe: &RecordBatch, build: &RecordBatch| {
+            let build = JoinBuild::new(build.clone(), 0).unwrap();
+            let plan = JoinPlan::new(probe, &build, 0, None).unwrap();
+            (plan.left, plan.right)
+        };
+        let uploaded = SidePlan {
+            device_cols: vec![0, 1],
+            row_ids: false,
+        };
+        let gathered = SidePlan {
+            device_cols: vec![0],
+            row_ids: true,
+        };
+        let (whole, holed) = (with(Some(2.0)), with(None));
+        assert_eq!(sides(&whole, &whole), (uploaded.clone(), uploaded.clone()));
+        assert_eq!(sides(&holed, &whole), (gathered.clone(), uploaded.clone()));
+        assert_eq!(sides(&whole, &holed), (uploaded, gathered));
     }
 
     // --- the CPU-fallback counter (#32) ------------------------------------
